@@ -153,3 +153,34 @@ Files changed:
 - tests/test_aristotle_tutoring.py (NEW — 22 behavior tests with fakes)
 - TECH_DEBT.md (appended ARISTOTLE-DEBT-006 — Vigil/SM-2 platform gap)
 
+
+---
+Task ID: 6
+Agent: Super Z (main)
+Task: ARISTOTLE CLI + API routes + full-session coordinator
+
+Work Log:
+- Oriented per Coding Cycle Protocol: read AIP_Brain CLI structure (click commands in src/aip/cli/main.py), API route pattern (APIRouter + Depends(get_container)), _db_path helper. Verified how existing CLI commands access stores directly (they're the composition root).
+- Architectural decision: ARISTOTLE's CLI and API routes live IN the ARISTOTLE repo (not AIP_Brain). The CLI is an HTTP client (talks to the running server); the API routes use request.app.state.container (standard FastAPI pattern, no aip.adapter import needed). This preserves the extension boundary.
+- Built aristotle/cli.py: click-based CLI with 4 commands (health, list-concepts, ingest, session). The CLI is an HTTP client that calls the server's API routes. Non-interactive mode (--answer flags) calls /session/run. Interactive mode calls /session/start + /session/step in a loop. Uses httpx.
+- Built aristotle/api.py: FastAPI APIRouter with 5 routes: GET /aristotle/concepts, POST /aristotle/ingest, POST /aristotle/session/start, POST /aristotle/session/step, POST /aristotle/session/run. Routes access the container via request.app.state.container (no aip.adapter import). Session serialization helpers (_session_to_dict / _session_from_dict) handle the SessionContext <-> JSON conversion.
+- Fixed the two-phase QUIZ logic: _step_quiz now has two phases — phase 1 generates the quiz question (sets quiz_generated=True), phase 2 (when student_input arrives) records the answer and advances to EVALUATE. Added quiz_generated + probe_generated flags to SessionContext. Updated the full-session coordinator + API /session/run + tests to use the two-phase logic.
+- Built tests/test_aristotle_cli_api.py: TestAPIRoutes (3 tests: list_concepts, session_start, session_run with fakes), TestFullSession (2 tests: mastered session completes with mastered=True; not-mastered session triggers REMEDIATE with retry_count > 0), TestCLI (2 tests: health command, list-concepts command with mocked HTTP client).
+- Added click, httpx, pyyaml to pyproject.toml dependencies.
+- Verified: 45 tests pass (all of them — SM-2 + actor behavior + API + full-session + CLI + boundary + conformance + workflow). No regression.
+
+Stage Summary:
+- ARISTOTLE Phase A is now testable end-to-end via CLI and API. The tutoring loop runs through the complete TEACH->PROBE->QUIZ->EVALUATE->REMEDIATE state machine with real model calls, SM-2 scheduling, and struggle_pattern tracking.
+- The CLI is an HTTP client: `python -m aristotle.cli ingest concepts_sample.yaml`, `python -m aristotle.cli session newton_first_law --answer "objects resist changes in motion"`. Requires the server running.
+- The API routes are FastAPI endpoints that the platform's app.py can include. Session state is serialized to JSON between step calls.
+- The full-session coordinator (/session/run) runs the complete loop in one call with pre-provided answers — useful for testing + non-interactive use.
+- The two-phase QUIZ logic is the key fix: the quiz question is generated first (no input), then the learner's answer is accepted on the next step call. This matches the interactive tutoring flow.
+- 45 tests pass. No regression. The extension is ready for Ramesh's first dogfood (once the API routes are mounted by the platform's FastAPI app).
+
+Files changed:
+- aristotle/cli.py (NEW — HTTP-client CLI with health/list-concepts/ingest/session commands)
+- aristotle/api.py (NEW — FastAPI APIRouter with 5 routes + session serialization)
+- aristotle/session.py (MODIFIED — two-phase QUIZ logic + quiz_generated/probe_generated flags)
+- pyproject.toml (MODIFIED — added click, httpx, pyyaml dependencies)
+- tests/test_aristotle_cli_api.py (NEW — 7 tests: API routes + full-session + CLI)
+

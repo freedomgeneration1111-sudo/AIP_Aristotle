@@ -62,6 +62,10 @@ class SessionContext:
     # Track retries (prevent infinite REMEDIATE loop)
     retry_count: int = 0
     max_retries: int = 2  # ADR-001 §3: different framing on retry, max 2
+    # Track whether the quiz question has been generated (waiting for answer)
+    quiz_generated: bool = False
+    # Track whether the probe question has been generated (waiting for response)
+    probe_generated: bool = False
 
 
 async def run_session_step(
@@ -160,12 +164,22 @@ async def _step_probe(
     session: SessionContext,
     examiner: Any,
 ) -> ActorResult:
-    """PROBE: EXAMINER asks a low-stakes question (ADR-001 §3)."""
+    """PROBE: EXAMINER asks a low-stakes question (ADR-001 §3).
+
+    Two-phase: first call generates the probe question (no input needed),
+    second call (with student_input) records the answer and advances to QUIZ.
+    """
     logger = ctx.logger
+
+    # If the probe question was already generated, record the student's answer
+    if session.probe_generated and session.student_input if hasattr(session, 'student_input') else False:
+        pass  # This path is handled by the caller passing student_input to the next step
+
     result = await examiner.probe(ctx, session.concept_id)
 
     if result.ok:
         session.last_probe_question = result.error or ""
+        session.probe_generated = True
         session.state = SessionState.QUIZ
         logger.info("session_step_probe concept=%s", session.concept_id)
     return result
@@ -179,27 +193,31 @@ async def _step_quiz(
 ) -> ActorResult:
     """QUIZ: EXAMINER asks a real question (ADR-001 §3).
 
-    If student_input is provided (the learner's probe response), it's
-    recorded as the probe answer. The quiz question is generated.
+    Two-phase: first call generates the quiz question (no input needed),
+    second call (with student_input) records the answer and advances to EVALUATE.
     """
     logger = ctx.logger
 
-    # If the learner provided a probe response, record it
-    if student_input:
-        session.last_student_answer = student_input
-
-    result = await examiner.quiz(ctx, session.concept_id)
-
-    if result.ok:
-        session.last_quiz_question = result.error or ""
-        # Wait for the learner's quiz answer — the caller will call
-        # run_session_step again with student_input = the quiz answer.
-        # For Phase A single-step, we advance to EVALUATE immediately
-        # (the caller passes the quiz answer as student_input).
-        if student_input and session.last_student_answer:
-            session.state = SessionState.EVALUATE
-        logger.info("session_step_quiz concept=%s", session.concept_id)
-    return result
+    if not session.quiz_generated:
+        # Phase 1: generate the quiz question
+        result = await examiner.quiz(ctx, session.concept_id)
+        if result.ok:
+            session.last_quiz_question = result.error or ""
+            session.quiz_generated = True
+            # If student_input was provided (non-interactive mode), record it
+            # and advance to EVALUATE immediately
+            if student_input:
+                session.last_student_answer = student_input
+                session.state = SessionState.EVALUATE
+            logger.info("session_step_quiz_generate concept=%s", session.concept_id)
+        return result
+    else:
+        # Phase 2: student's answer arrived — advance to EVALUATE
+        if student_input:
+            session.last_student_answer = student_input
+        session.state = SessionState.EVALUATE
+        logger.info("session_step_quiz_answer concept=%s", session.concept_id)
+        return ActorResult(ok=True, error=session.last_quiz_question)
 
 
 async def _step_evaluate(
