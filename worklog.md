@@ -69,3 +69,24 @@ Files created:
 - CONTRIBUTING.md (dev setup for extension)
 - tests/test_import_boundary.py (extension boundary test)
 - README.md (expanded from one-liner)
+
+---
+Task ID: 3
+Agent: Super Z (main)
+Task: Write AIP_Aristotle roadmap (Phase A/B/C)
+
+Work Log:
+- Created ROADMAP.md with three phases: Phase A (tutoring loop — in progress, foundation done, 6 near-term gates to dogfoodable), Phase B (teacher dashboard — planned, depends on Phase A + platform v1.1 GUI mount), Phase C (HERALD — planned, blocked on platform web/feed layer).
+- Verified Chunk 3 wiring status (Claude's flag): the platform's CorpusRegistry IS serving the live app via delegating properties. ARISTOTLE's actors get real stores. Not blocked.
+- Documented the 6 near-term gates for Phase A completion: real model calls in SOCRATES/EXAMINER/MENTOR, script handlers, content ingestor, SM-2 via VIGIL. After these, Ramesh can self-tutor (pilot protocol step 1).
+- Documented platform dependencies table: 8 capabilities shipped (all Phase A needs), 3 deferred (GUI mount for Phase B, MCP tools for Phase A+, web/feed layer for Phase C).
+- Documented pilot protocol gates: Ramesh (Phase A), Sameer (Phase A + C), Moses (Phase A + C), Freedom Generation (Phase A + B).
+
+Stage Summary:
+- The roadmap is clear: Phase A has 6 gates to dogfoodable, Phase B waits on platform v1.1 GUI, Phase C waits on platform web/feed layer.
+- The platform is verified ready — Chunk 3 is LIVE, ARISTOTLE's actors get real stores.
+- The DEFINER can test the platform now while ARISTOTLE development accelerates on the 6 Phase A gates.
+
+Files created:
+- ROADMAP.md (Phase A/B/C + pilot protocol + platform dependencies + version history)
+
