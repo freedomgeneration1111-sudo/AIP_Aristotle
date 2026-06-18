@@ -1,0 +1,124 @@
+# Sample concepts for Aristotle's first dogfood session.
+#
+# Ramesh (idea originator, ADR-001 §10) self-tutors a chapter he already
+# knows. He'll break it in the right ways first. This file provides concepts
+# he can ingest and test the tutoring loop against.
+#
+# Ingest via:
+#   python -c "
+#   import asyncio
+#   from aristotle.ingestor import ingest_concepts_from_yaml
+#   from aristotle.config import AristotleSettings
+#   from aip.foundation.protocols.actors import ActorContext
+#   # ... construct ctx with a real container ...
+#   result = asyncio.run(ingest_concepts_from_yaml(ctx, 'concepts_sample.yaml'))
+#   print(result)
+#   "
+#
+# These concepts cover Newton's Three Laws of Motion — a subject Ramesh
+# knows well, so he can focus on testing the tutoring loop itself rather
+# than learning new material. The bilingual content (English + Urdu) tests
+# the schema's bilingual columns (ADR-001 §7).
+
+concepts:
+  - id: "newton_first_law"
+    textbook_chapter: "Chapter 1: Newton's Laws of Motion"
+    topic: "Newton's First Law (Law of Inertia)"
+    subtopic: "Inertia and equilibrium"
+    bloom_target: 3  # Apply
+    content_primary: |
+      Newton's First Law of Motion states that an object at rest stays at rest,
+      and an object in motion stays in motion with the same speed and in the
+      same direction, unless acted upon by an unbalanced external force.
+
+      This is also called the Law of Inertia. Inertia is the tendency of an
+      object to resist changes in its state of motion. The greater the mass
+      of an object, the greater its inertia.
+
+      Key points:
+      - An object at rest stays at rest (no net force).
+      - An object in motion stays in motion at constant velocity (no net force).
+      - A net external force is required to change the object's state of motion.
+      - Mass is a measure of inertia.
+    content_alt: |
+      نیورٹن کا پہلا حرکت کا قانون کہتا ہے کہ ایک شیء جو سکون کی حالت میں ہے
+      سکون میں رہتی ہے، اور ایک شیء جو حرکت میں ہے ایک ہی رفتار اور ایک ہی
+      سمت میں حرکت کرتی رہتی ہے، جب تک کہ اس پر کوئی غیر متوازن بیرونی قوت
+      عمل نہ کرے۔
+
+      اسے قانونِ سکون (Law of Inertia) بھی کہا جاتا ہے۔ سکون وہ رجحان ہے
+      جس کی وجہ سے ایک شیء اپنی حرکت کی حالت میں تبدیلی کا مزاحمت کرتی ہے۔
+    content_alt_lang: "ur"
+    prerequisite_concept_id: null  # No prerequisites — this is the first concept
+
+  - id: "newton_second_law"
+    textbook_chapter: "Chapter 1: Newton's Laws of Motion"
+    topic: "Newton's Second Law (F = ma)"
+    subtopic: "Force, mass, and acceleration"
+    bloom_target: 4  # Analyze
+    content_primary: |
+      Newton's Second Law of Motion states that the acceleration of an object
+      is directly proportional to the net force acting on it and inversely
+      proportional to its mass. The direction of the acceleration is in the
+      direction of the net force.
+
+      Mathematical form: F = ma
+      where:
+      - F = net force (in Newtons, N)
+      - m = mass (in kilograms, kg)
+      - a = acceleration (in meters per second squared, m/s²)
+
+      Key points:
+      - Force and acceleration are in the same direction.
+      - Greater force → greater acceleration (for the same mass).
+      - Greater mass → smaller acceleration (for the same force).
+      - The unit of force (Newton) is defined as: 1 N = 1 kg × 1 m/s²
+    content_alt: |
+      نیورٹن کا دوسرا حرکت کا قانون کہتا ہے کہ کسی شیء کی اسراع اس پر عمل
+      کرنے والی کل قوت کے بالواسطہ متناسب اور اس کے کمیت کے بالعکس متناسب
+      ہے۔
+
+      ریاضیاتی صورت: F = ma
+      جہاں:
+      - F = کل قوت (نیوٹن میں)
+      - m = کمیت (کلوگرام میں)
+      - a = اسراع (میٹر فی سیکنڈ اسکوائر میں)
+    content_alt_lang: "ur"
+    prerequisite_concept_id: "newton_first_law"  # Requires understanding of inertia
+
+  - id: "newton_third_law"
+    textbook_chapter: "Chapter 1: Newton's Laws of Motion"
+    topic: "Newton's Third Law (Action-Reaction)"
+    subtopic: "Action and reaction pairs"
+    bloom_target: 4  # Analyze
+    content_primary: |
+      Newton's Third Law of Motion states that for every action, there is an
+      equal and opposite reaction. This means that forces always occur in
+      pairs — if object A exerts a force on object B, then object B exerts
+      an equal and opposite force on object A.
+
+      Key points:
+      - Forces always come in pairs (action-reaction pairs).
+      - The two forces are equal in magnitude but opposite in direction.
+      - The two forces act on DIFFERENT objects (not the same object).
+      - The forces are simultaneous (not sequential).
+
+      Examples:
+      - Walking: you push the ground backward, the ground pushes you forward.
+      - Rocket propulsion: hot gases pushed backward, rocket pushed forward.
+      - Jumping: you push the floor down, the floor pushes you up.
+
+      Common misconception: "If the forces are equal and opposite, why does
+      anything move?" Because the forces act on DIFFERENT objects. The floor
+      doesn't move (huge mass), but you do (small mass, so large acceleration
+      per F = ma).
+    content_alt: |
+      نیورٹن کا تیسرا حرکت کا قانون کہتا ہے کہ ہر عمل کے لیے ایک برابر اور
+      مخالف ردِعمل ہوتا ہے۔ اس کا مطلب ہے کہ قوتیں ہمیشہ جوڑوں میں آتی ہیں۔
+
+      اہم نکات:
+      - قوتیں ہمیشہ جوڑوں میں ہوتی ہیں (عمل-ردعمل کے جوڑے)۔
+      - دونوں قوتیں مقدار میں برابر لیکن سمت میں مخالف ہوتی ہیں۔
+      - دونوں قوتیں مختلف اشیاء پر عمل کرتی ہیں (ایک ہی شیء پر نہیں)۔
+    content_alt_lang: "ur"
+    prerequisite_concept_id: "newton_second_law"  # Requires understanding of F=ma

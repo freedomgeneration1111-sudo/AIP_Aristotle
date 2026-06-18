@@ -191,3 +191,47 @@ lives in code, not YAML).
 - ADR-001 §9 ("If anything here forces a reach into core internals, that is a
   Phase 0 gap to log")
 
+
+---
+
+## ARISTOTLE-DEBT-006 — Platform Gap: Vigil Has No SM-2 Spaced Repetition
+
+**Status:** Active — blocked by platform
+**Phase:** Phase A
+**Filed:** 2026-06-18
+
+**What was deferred:**
+ADR-001 §2 says "VIGIL is reused from core. SM-2; decides what comes due
+and when." But the platform's Vigil actor
+(`AIP_Brain/src/aip/orchestration/actors/vigil.py`) is a **quality evaluation
+actor** (faithfulness, consistency, source grounding, canonical drift
+detection), NOT a spaced repetition scheduler. It has no SM-2 methods.
+
+This means ARISTOTLE can't reuse VIGIL for spaced repetition. The
+`review_interval_seconds` config field (originally intended to be passed
+to VIGIL) is unused.
+
+**Why deferred:**
+This is a platform gap, not an ARISTOTLE gap. The fix would be either:
+1. The platform adds SM-2 to Vigil (or a new dedicated spaced-repetition
+   actor), OR
+2. ARISTOTLE implements SM-2 directly.
+
+For Phase A, option 2 is the pragmatic fix: SM-2 is ~20 lines of Python
+(`aristotle/sm2.py`) and doesn't belong in the platform anyway (it's
+pedagogy-specific, not platform infrastructure). The `aristotle_mastery`
+table (M002 migration) stores the SM-2 state per (student, concept) pair.
+
+**Remediation trigger:**
+If the platform later adds a spaced-repetition actor (SM-2 or otherwise),
+ARISTOTLE can migrate to reuse it. Until then, the local SM-2
+implementation works and is cleaner — ARISTOTLE owns its pedagogy.
+
+**Related work:**
+- `AIP_Brain/src/aip/orchestration/actors/vigil.py` (the actual Vigil — quality eval, not SM-2)
+- `aristotle/sm2.py` (the local SM-2 implementation)
+- `aristotle/migrations/M002_aristotle_mastery.sql` (the mastery table)
+- ADR-001 §2 (the original assumption that VIGIL had SM-2)
+- ADR-001 §9 ("If anything here forces a reach into core internals, that is
+  a Phase 0 gap to log")
+

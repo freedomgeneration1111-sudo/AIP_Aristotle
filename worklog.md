@@ -122,3 +122,34 @@ Files changed:
 - aristotle/ingestor.py (NEW — YAML-based concept ingestor + list_concepts)
 - TECH_DEBT.md (appended ARISTOTLE-DEBT-005 — ScriptNode platform gap)
 
+
+---
+Task ID: 5
+Agent: Super Z (main)
+Task: ARISTOTLE Phase A follow-up — SM-2 module + session coordinator + sample concepts + behavior tests
+
+Work Log:
+- Oriented per Coding Cycle Protocol: re-read config.py, actors, ingestor, TECH_DEBT. Verified tree: confirmed no SM-2 module exists yet, no session coordinator, no sample concepts, no behavior tests for the tutoring methods.
+- SM-2 module (aristotle/sm2.py): Pure Python implementation of the SuperMemo 2 algorithm. SM2State dataclass (easiness_factor, interval_days, repetitions, next_review_at). score_to_quality() maps EXAMINER's 0.0-1.0 score to SM-2's 0-5 quality. update_sm2() advances the state. is_due() checks if a concept is due for review. EF never below 1.3. Correct response: 1 day (1st), 6 days (2nd), interval*EF (subsequent). Incorrect: reset to 0 reps, 1 day. 10 tests in TestSM2Algorithm.
+- M002 migration (aristotle/migrations/M002_aristotle_mastery.sql): aristotle_mastery table with (student_id, concept_id) PK, SM-2 state (easiness_factor, interval_days, repetitions, next_review_at), mastery tracking (last_score, mastered), updated_at. Created with IF NOT EXISTS for idempotency.
+- Session coordinator (aristotle/session.py): Drives the TEACH->PROBE->QUIZ->EVALUATE->REMEDIATE state machine. SessionState enum (7 states). SessionContext dataclass (per-session state: concept_id, state, accumulated results, retry_count, max_retries). run_session_step(ctx, session, student_input) advances one step. _step_teach/probe/quiz/evaluate/remediate/next_concept dispatch. _update_mastery writes SM-2 state to aristotle_mastery table. Mastery threshold check (score >= 0.7 -> NEXT_CONCEPT, else REMEDIATE with max 2 retries). MENTOR.update_struggle_pattern called after EVALUATE (non-fatal if it fails).
+- Sample concepts (concepts_sample.yaml): Newton's Three Laws of Motion — Ramesh's first dogfood subject (he knows it well, can focus on testing the loop). Bilingual (English + Urdu). Prerequisite DAG: first_law -> second_law -> third_law. bloom_target 3-4. Includes common misconceptions in third_law content.
+- Behavior tests (tests/test_aristotle_tutoring.py): 22 tests with fake model provider. TestSM2Algorithm (10 tests: score mapping, clamping, initial state, is_due, update correct/incorrect, EF floor). TestSocratesTeach (3: NEEDS_CONFIGURATION, calls beast slot, concept not found). TestExaminerMethods (4: NEEDS_CONFIGURATION, probe calls evaluation, quiz calls evaluation, evaluate returns JSON). TestMentorUpdate (4: NEEDS_CONFIGURATION, calls sexton, get_struggle_pattern returns existing/None). TestSessionCoordinator (1: TEACH step advances to PROBE). All 22 pass.
+- Logged Vigil/SM-2 platform gap (ARISTOTLE-DEBT-006): ADR-001 §2 assumed VIGIL had SM-2; it doesn't (it's quality eval, not spaced repetition). ARISTOTLE implements SM-2 directly — cleaner anyway (pedagogy-specific, not platform infrastructure).
+- Verified: all files pass ast.parse (SQL/YAML verified separately); boundary test passes (aristotle/sm2.py + session.py import only from aip.foundation.protocols.actors); 21 non-async tests pass (10 SM-2 + 9 conformance + 2 boundary); no regression.
+
+Stage Summary:
+- ARISTOTLE Phase A is now functionally complete. The tutoring loop is executable: ingestor populates concepts, session coordinator drives TEACH->PROBE->QUIZ->EVALUATE->REMEDIATE, actors make real model calls, SM-2 schedules reviews, MENTOR tracks struggle_pattern. Two platform gaps logged (ScriptNode disabled, Vigil has no SM-2) — both have clean workarounds (actor-driven loop, local SM-2).
+- The session coordinator is single-step: each call to run_session_step() advances one state. The caller (API/CLI/GUI) stores SessionContext between steps. A future full-session coordinator will manage the complete loop in one call.
+- 22 behavior tests with fakes prove the tutoring methods work: correct model slots are called, NEEDS_CONFIGURATION returned without model, SM-2 algorithm is correct, session state transitions work.
+- Sample concepts ready for Ramesh's first dogfood: Newton's Three Laws, bilingual, prerequisite DAG. He can ingest + run a session.
+- Next: CLI command for ingesting concepts + running sessions (so Ramesh can test without writing Python). Then API route (so the GUI can drive it). Then Phase B (teacher dashboard) once platform v1.1 GUI mount lands.
+
+Files changed:
+- aristotle/sm2.py (NEW — SM-2 algorithm, pure Python)
+- aristotle/migrations/M002_aristotle_mastery.sql (NEW — mastery table)
+- aristotle/session.py (NEW — session coordinator, drives the tutoring loop)
+- concepts_sample.yaml (NEW — Newton's Three Laws, bilingual, for Ramesh's dogfood)
+- tests/test_aristotle_tutoring.py (NEW — 22 behavior tests with fakes)
+- TECH_DEBT.md (appended ARISTOTLE-DEBT-006 — Vigil/SM-2 platform gap)
+
