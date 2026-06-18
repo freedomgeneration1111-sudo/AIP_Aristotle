@@ -1,0 +1,37 @@
+[project]
+name = "aip-aristotle"
+version = "0.1.0"
+description = "Aristotle — Adaptive Tutor (AIP Brain extension)"
+license = {text = "BUSL-1.1"}
+requires-python = ">=3.11"
+classifiers = [
+    "License :: Other/Proprietary License",
+]
+dependencies = [
+    "aip>=0.1.0",
+    "pydantic>=2.0",
+]
+
+# ADR-014 §6.4: the entry point the platform's ExtensionHost discovers.
+# get_manifest() returns a Manifest instance (constructed in Python from
+# the packaged extension.yaml). The host resolves the extension's on-disk
+# root via importlib.resources.files("aristotle").
+[project.entry-points."aip.extensions"]
+aristotle = "aristotle.entrypoint:get_manifest"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aristotle"]
+
+# Include non-Python files (migrations, workflows, extension.yaml) in the wheel.
+[tool.hatch.build.targets.wheel.force-include]
+"aristotle/extension.yaml" = "aristotle/extension.yaml"
+"aristotle/migrations" = "aristotle/migrations"
+"aristotle/workflows" = "aristotle/workflows"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
