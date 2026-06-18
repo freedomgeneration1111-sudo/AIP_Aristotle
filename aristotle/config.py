@@ -35,3 +35,7 @@ class AristotleSettings:
     # SM-2 spaced repetition interval (seconds) — passed to core VIGIL
     # when ARISTOTLE records a review outcome. Pre-alpha: 24h default.
     review_interval_seconds: int = 86400
+
+    # Mastery threshold (0.0-1.0) — EXAMINER's evaluate() uses this to
+    # decide if a concept is mastered. Score >= threshold → mastered.
+    mastery_threshold: float = 0.7

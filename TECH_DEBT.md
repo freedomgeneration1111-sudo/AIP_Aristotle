@@ -141,3 +141,53 @@ alpha). At that point, MENTOR reads `student_id` from the session context
 - `aristotle/migrations/M001_aristotle.sql` (the student_id column)
 
 ---
+
+---
+
+## ARISTOTLE-DEBT-005 — Platform Gap: ScriptNode Disabled in Production
+
+**Status:** Active — blocked by platform
+**Phase:** Phase A
+**Filed:** 2026-06-18
+
+**What was deferred:**
+The tutoring state machine workflow (`tutoring_session_v1.yaml`) declares two
+`script` nodes: `evaluate` (run: `aristotle_evaluate`) and `next_concept`
+(run: `aristotle_next_concept`). The platform's `ScriptNode` (in
+`AIP_Brain/src/aip/orchestration/workflow/node.py:80`) is **hard-disabled in
+production** — it returns `success=False` with a DISABLED error. Only fixture
+mode works (no-op). The engine doesn't support registering real script handlers.
+
+This means the workflow can't drive the tutoring state machine. The `evaluate`
+and `next_concept` nodes would fail in production.
+
+**Why deferred:**
+This is a platform gap, not an ARISTOTLE gap. The platform's ScriptNode
+intentionally disables arbitrary code execution for safety (no sandbox). The
+fix would be either:
+1. The platform adds a registered-script-handler mechanism (safe named handlers,
+   not arbitrary code), OR
+2. ARISTOTLE converts the script nodes to agent nodes (model calls), which
+   works but means the deterministic logic (scoring, DAG traversal) goes
+   through a model — wrong for deterministic operations.
+
+For Phase A, ARISTOTLE uses an **actor-driven** approach instead: the actors
+(SOCRATES, EXAMINER, MENTOR) expose public tutoring methods (`teach()`,
+`probe()`, `quiz()`, `evaluate()`, `update_struggle_pattern()`) that a session
+coordinator calls directly. The workflow YAML stays as documentation of the
+state machine; execution is actor-driven.
+
+**Remediation trigger:**
+When the platform adds a registered-script-handler mechanism to ScriptNode
+(safe named handlers), ARISTOTLE can register `aristotle_evaluate` and
+`aristotle_next_concept` and the workflow becomes executable. Until then,
+the actor-driven approach works and is arguably cleaner (the state machine
+lives in code, not YAML).
+
+**Related work:**
+- `AIP_Brain/src/aip/orchestration/workflow/node.py:80` (ScriptNode — disabled)
+- `aristotle/workflows/tutoring_session_v1.yaml` (the workflow declaring script nodes)
+- `aristotle/actors/{socrates,examiner,mentor}.py` (the actor-driven approach)
+- ADR-001 §9 ("If anything here forces a reach into core internals, that is a
+  Phase 0 gap to log")
+
