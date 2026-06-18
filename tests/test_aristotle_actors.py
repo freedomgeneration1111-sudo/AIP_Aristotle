@@ -251,3 +251,64 @@ async def test_mentor_fails_without_corpus_registry():
 
     assert result.ok is False
     assert "corpus_registry" in result.error
+
+
+# --------------------------------------------------------------------------
+# Workflow engine-compatibility tests (moved from AIP_Brain — these test
+# ARISTOTLE's workflow, so they belong with ARISTOTLE, not the platform)
+# --------------------------------------------------------------------------
+
+
+def test_aristotle_workflow_yaml_parses():
+    """The tutoring_session_v1.yaml parses as valid YAML with the right structure."""
+    import yaml
+    from pathlib import Path
+    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+    with open(workflow_path) as f:
+        wf = yaml.safe_load(f)
+    assert wf["template_id"] == "tutoring_session_v1"
+    assert wf["name"] == "Tutoring Session v1"
+    assert "nodes" in wf
+    assert len(wf["nodes"]) == 7, f"expected 7 nodes, got {len(wf['nodes'])}"
+    node_ids = [n["id"] for n in wf["nodes"]]
+    assert node_ids == ["teach", "probe", "quiz", "evaluate", "check_mastery", "remediate", "next_concept"]
+
+
+def test_aristotle_workflow_uses_engine_compatible_node_types():
+    """Every node type is one the L5 engine's loader accepts."""
+    import yaml
+    from pathlib import Path
+    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+    with open(workflow_path) as f:
+        wf = yaml.safe_load(f)
+    allowed_types = {"script", "agent", "condition", "dialog", "parallel", "review", "re_synthesize"}
+    for node in wf["nodes"]:
+        assert node["type"] in allowed_types, f"Node {node['id']!r} has type {node['type']!r} not in {sorted(allowed_types)}"
+
+
+def test_aristotle_workflow_agent_nodes_have_model_slot():
+    """Every agent node has a model_slot (required by the loader's AgentNode)."""
+    import yaml
+    from pathlib import Path
+    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+    with open(workflow_path) as f:
+        wf = yaml.safe_load(f)
+    agent_nodes = [n for n in wf["nodes"] if n["type"] == "agent"]
+    assert len(agent_nodes) >= 3
+    for node in agent_nodes:
+        assert "model_slot" in node, f"Agent node {node['id']!r} must have model_slot"
+
+
+def test_aristotle_workflow_condition_node_has_branches():
+    """The check_mastery condition node has next_on_true + next_on_false."""
+    import yaml
+    from pathlib import Path
+    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+    with open(workflow_path) as f:
+        wf = yaml.safe_load(f)
+    condition_nodes = [n for n in wf["nodes"] if n["type"] == "condition"]
+    assert len(condition_nodes) == 1
+    cond = condition_nodes[0]
+    assert cond["id"] == "check_mastery"
+    assert cond["next_on_true"] == "next_concept"
+    assert cond["next_on_false"] == "remediate"
