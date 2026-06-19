@@ -33,7 +33,19 @@ except Exception:
 
 @pytest.fixture
 async def container(tmp_path: Path):
-    """Minimal container with a real CorpusRegistry backed by tmp_path DBs."""
+    """Minimal container with a real CorpusRegistry backed by tmp_path DBs.
+
+    Teardown (AIP_Brain DEBT-013 fix, ported): closes every corpus's
+    stores via `stores.close_all()` so aiosqlite's background worker
+    threads shut down cleanly before pytest closes the event loop.
+    Without this, the worker thread tries `call_soon_threadsafe` on a
+    closed loop and raises `RuntimeError: Event loop is closed`, surfaced
+    as a `PytestUnhandledThreadExceptionWarning`.
+
+    Note: the real ARISTOTLE extension registers `aristotle:textbook`
+    during host.start(), so the teardown must close EVERY registered
+    corpus — not just the `definer` corpus we explicitly registered here.
+    """
     from aip.adapter.corpus_registry import CorpusRegistry
     from aip.foundation.corpus_types import CorpusType
 
@@ -52,23 +64,87 @@ async def container(tmp_path: Path):
             self.sexton_actor = None
             self.model_provider = None
 
-    return _MinimalContainer()
+    container = _MinimalContainer()
+    try:
+        yield container
+    finally:
+        # Close every registered corpus's stores (idempotent — safe even
+        # if a test already closed them). This includes the
+        # aristotle:textbook corpus that ARISTOTLE registers during
+        # host.start(). Cancels the aiosqlite background worker threads
+        # cleanly while the event loop is still open.
+        for corpus_id in list(registry.corpora.keys()):
+            try:
+                stores = await registry.get_stores(corpus_id)
+                if stores is not None and hasattr(stores, "close_all"):
+                    await stores.close_all()
+            except Exception:
+                pass  # best-effort teardown — never mask a test failure
 
 
 @pytest.fixture
-def host(tmp_path: Path, container) -> ExtensionHost:
+async def host(tmp_path: Path, container):
     """Host pointed at an empty extensions/ dir.
 
     ARISTOTLE is discovered via the aip.extensions entry point (the
     production path), NOT via filesystem glob. The empty extensions_dir
     means the filesystem discovery path finds nothing; the entry-point
-    discovery path finds the installed ARISTOTLE package.
+    discovery path finds the installed ARISTOTLE package. Note: unlike
+    AIP_Brain's test_extension_lifecycle.py host fixture, we do NOT pass
+    discover_installed_packages=False — ARISTOTLE's tests rely on
+    entry-point discovery to find the real installed package.
+
+    Teardown (AIP_Brain DEBT-013 fix, ported): `await host.stop()` on
+    teardown cancels every actor scheduler task the test spawned via
+    `host.start()`. stop() is idempotent — returns early if the host was
+    never started or already stopped (test_aristotle_stop_cancels_actors
+    calls stop() itself).
+
+    Additionally, we patch `supervised_task` to track the inner coroutine
+    (`_actor_scheduler_loop(...)`) so we can explicitly close it on
+    teardown. Without this, if a task is cancelled while still PENDING
+    (before `_supervised_inner` reaches `await coro`), the inner
+    coroutine object is never touched — Python's GC flags it as
+    "never awaited" and emits `RuntimeWarning: coroutine
+    '_actor_scheduler_loop' was never awaited`. Closing the coroutine
+    explicitly marks it as "handled" and suppresses the warning.
     """
-    return ExtensionHost(
+    import aip.adapter.extensions.host as _host_mod
+
+    _tracked_coros: list = []
+    _orig_supervised = _host_mod.supervised_task
+
+    def _tracking_supervised(name, coro):
+        _tracked_coros.append(coro)
+        return _orig_supervised(name, coro)
+
+    _host_mod.supervised_task = _tracking_supervised
+
+    h = ExtensionHost(
         extensions_dir=tmp_path / "extensions",  # empty — no filesystem extensions
         container=container,
         manifest_version_range=(1, 1),
     )
+    try:
+        yield h
+    finally:
+        _host_mod.supervised_task = _orig_supervised  # restore
+        if h.is_running():
+            await h.stop()
+        # Explicitly close any inner coroutines that were never awaited
+        # (task was cancelled while PENDING, so _supervised_inner never
+        # reached `await coro`). coro.close() marks the coroutine as
+        # "handled" and suppresses the RuntimeWarning at GC time.
+        for coro in _tracked_coros:
+            # coro is a coroutine object (not a Task). Check cr_frame:
+            # if it's None, the coroutine already finished or was closed.
+            # If it's not None, the coroutine is still pending — close it
+            # to mark it as "handled" and suppress the RuntimeWarning.
+            if hasattr(coro, "cr_frame") and coro.cr_frame is not None:
+                try:
+                    coro.close()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------
