@@ -217,6 +217,137 @@ async def session_run_route(request: Request):
 
 
 # ------------------------------------------------------------------
+# Dashboard route (Phase B — teacher view, ADR-001 §8)
+# ------------------------------------------------------------------
+
+
+@router.get("/dashboard")
+async def dashboard_route(request: Request):
+    """Teacher dashboard — per-student mastery + struggle + due items (ADR-001 §8).
+
+    Returns:
+        {
+            "student_id": "definer",
+            "total_concepts": int,
+            "mastered_count": int,
+            "due_count": int,
+            "struggle_pattern": str | null,
+            "mastery_by_concept": [
+                {
+                    "concept_id": str,
+                    "topic": str,
+                    "mastered": bool,
+                    "last_score": float | null,
+                    "repetitions": int,
+                    "next_review_at": str | null,
+                    "updated_at": str
+                }
+            ]
+        }
+
+    Pulls from aristotle_mastery + aristotle_concept + aristotle_struggle_pattern
+    via corpus_registry.get_stores("aristotle:textbook"). student_id is always
+    "definer" (single-tenant pre-alpha).
+    """
+    container = _get_container(request)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"corpus access failed: {exc}")
+
+    conn = stores.connection_manager.write_conn
+    student_id = "definer"
+
+    # 1. Read struggle_pattern
+    cur = await conn.execute(
+        "SELECT pattern_text FROM aristotle_struggle_pattern WHERE student_id = ?",
+        (student_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    struggle_pattern = row[0] if row is not None else None
+
+    # 2. Read all concepts
+    cur = await conn.execute(
+        "SELECT id, topic FROM aristotle_concept ORDER BY id"
+    )
+    concept_rows = await cur.fetchall()
+    await cur.close()
+    concepts = {r[0]: r[1] for r in concept_rows}
+
+    # 3. Read mastery records
+    cur = await conn.execute(
+        "SELECT concept_id, mastered, last_score, repetitions, "
+        "next_review_at, updated_at "
+        "FROM aristotle_mastery WHERE student_id = ? ORDER BY next_review_at",
+        (student_id,),
+    )
+    mastery_rows = await cur.fetchall()
+    await cur.close()
+
+    # 4. Build mastery_by_concept (merge concept info + mastery state)
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    mastery_by_concept: list[dict] = []
+    mastered_count = 0
+    due_count = 0
+
+    for r in mastery_rows:
+        concept_id = r[0]
+        mastered = bool(r[1])
+        last_score = r[2]
+        repetitions = r[3]
+        next_review_at = r[4]
+        updated_at = r[5]
+
+        if mastered:
+            mastered_count += 1
+
+        # Check if due (next_review_at is null or in the past)
+        is_due = True
+        if next_review_at:
+            try:
+                next_review = datetime.fromisoformat(next_review_at)
+                if next_review.tzinfo is None:
+                    next_review = next_review.replace(tzinfo=timezone.utc)
+                is_due = datetime.now(timezone.utc) >= next_review
+            except (ValueError, TypeError):
+                is_due = True
+        if is_due:
+            due_count += 1
+
+        mastery_by_concept.append({
+            "concept_id": concept_id,
+            "topic": concepts.get(concept_id, concept_id),
+            "mastered": mastered,
+            "last_score": last_score,
+            "repetitions": repetitions,
+            "next_review_at": next_review_at,
+            "is_due": is_due,
+            "updated_at": updated_at,
+        })
+
+    # Sort by next_review_at ascending (nulls/due first), then by concept_id
+    mastery_by_concept.sort(
+        key=lambda m: (m["next_review_at"] or "0000", m["concept_id"])
+    )
+
+    return {
+        "student_id": student_id,
+        "total_concepts": len(concepts),
+        "mastered_count": mastered_count,
+        "due_count": due_count,
+        "struggle_pattern": struggle_pattern,
+        "mastery_by_concept": mastery_by_concept,
+    }
+
+
+# ------------------------------------------------------------------
 # Serialization helpers
 # ------------------------------------------------------------------
 
