@@ -85,9 +85,14 @@ class SessionContext:
     last_probe_question: str = ""
     last_quiz_question: str = ""
     last_student_answer: str = ""
-    last_evaluation: str = ""  # JSON from EXAMINER.evaluate()
+    last_evaluation: str = ""  # JSON from EXAMINER.evaluate() (legacy — kept for backward compat)
     last_score: float = 0.0
     mastered: bool = False
+    # Phase B.5 (error diagnosis): the structured diagnosis dict from
+    # EXAMINER.evaluate() when the answer is wrong. None when correct or
+    # when the model didn't return a diagnosis. Read by MENTOR's
+    # log_misconception() in _step_evaluate.
+    last_diagnosis: dict | None = None
     # Track retries (prevent infinite REMEDIATE loop)
     retry_count: int = 0
     max_retries: int = 2  # ADR-001 §3: different framing on retry, max 2
@@ -385,7 +390,15 @@ async def _step_evaluate(
     examiner: Any,
     mentor: Any,
 ) -> ActorResult:
-    """EVALUATE: EXAMINER scores + MENTOR updates struggle_pattern (ADR-001 §3)."""
+    """EVALUATE: EXAMINER scores + MENTOR updates struggle_pattern (ADR-001 §3).
+
+    Phase B.5 (error diagnosis): EXAMINER.evaluate() now returns a structured
+    dict via ActorResult.data (not error-as-payload). The dict has
+    {score, mastery_achieved, feedback, diagnosis}. When the answer is wrong,
+    diagnosis is a dict with {misconception, why_wrong, corrective}; when
+    correct, diagnosis is None. The diagnosis is stored on
+    session.last_diagnosis for MENTOR's log_misconception() call (TASK 2).
+    """
     logger = ctx.logger
 
     # EXAMINER scores the quiz answer
@@ -398,23 +411,38 @@ async def _step_evaluate(
     if not eval_result.ok:
         return eval_result
 
-    session.last_evaluation = eval_result.error or ""
+    # Phase B.5: read from result.data (the new structured return channel).
+    # Fallback to result.error + JSON parse for backward compat with any
+    # actor that hasn't migrated to data= yet.
+    if eval_result.data is not None and isinstance(eval_result.data, dict):
+        eval_data = eval_result.data
+        # Keep last_evaluation as a JSON string for backward compat
+        # (MENTOR.update_struggle_pattern still reads it, + the API
+        # serialization includes it for old clients).
+        import json
+        session.last_evaluation = json.dumps(eval_data)
+    else:
+        # Legacy path: actor returned error-as-payload (a JSON string).
+        session.last_evaluation = eval_result.error or ""
+        import json
+        try:
+            eval_data = json.loads(session.last_evaluation)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # If the model didn't return valid JSON, default to not mastered
+            session.last_score = 0.0
+            session.mastered = False
+            session.last_diagnosis = None
+            logger.warning(
+                "session_evaluate_parse_failed concept=%s raw=%s",
+                session.concept_id, session.last_evaluation[:200],
+            )
+            eval_data = None
 
-    # Parse the score from the evaluation JSON
-    # The model returns JSON with {score, mastery_achieved, feedback}
-    import json
-    try:
-        eval_data = json.loads(session.last_evaluation)
+    if eval_data is not None:
         session.last_score = float(eval_data.get("score", 0.0))
         session.mastered = bool(eval_data.get("mastery_achieved", False))
-    except (json.JSONDecodeError, ValueError, TypeError):
-        # If the model didn't return valid JSON, default to not mastered
-        session.last_score = 0.0
-        session.mastered = False
-        logger.warning(
-            "session_evaluate_parse_failed concept=%s raw=%s",
-            session.concept_id, session.last_evaluation[:200],
-        )
+        # Phase B.5: store the diagnosis dict (None when correct).
+        session.last_diagnosis = eval_data.get("diagnosis")
 
     # MENTOR updates the struggle_pattern
     mentor_result = await mentor.update_struggle_pattern(
@@ -459,8 +487,9 @@ async def _step_evaluate(
                 session.state = SessionState.NEXT_CONCEPT
 
     logger.info(
-        "session_step_evaluate concept=%s score=%.2f mastered=%s state=%s",
+        "session_step_evaluate concept=%s score=%.2f mastered=%s state=%s has_diagnosis=%s",
         session.concept_id, session.last_score, session.mastered, session.state.value,
+        session.last_diagnosis is not None,
     )
     return ActorResult(ok=True, error=session.last_evaluation)
 
@@ -542,21 +571,31 @@ async def _hint_phase2(
     if not eval_result.ok:
         return eval_result
 
-    session.last_evaluation = eval_result.error or ""
+    # Phase B.5: read from result.data (same migration as _step_evaluate).
+    # Fallback to result.error + JSON parse for backward compat.
+    if eval_result.data is not None and isinstance(eval_result.data, dict):
+        eval_data = eval_result.data
+        import json
+        session.last_evaluation = json.dumps(eval_data)
+    else:
+        session.last_evaluation = eval_result.error or ""
+        import json
+        try:
+            eval_data = json.loads(session.last_evaluation)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            session.last_score = 0.0
+            session.mastered = False
+            session.last_diagnosis = None
+            logger.warning(
+                "session_hint_eval_parse_failed concept=%s raw=%s",
+                session.concept_id, session.last_evaluation[:200],
+            )
+            eval_data = None
 
-    # Parse the new score (same logic as _step_evaluate).
-    import json
-    try:
-        eval_data = json.loads(session.last_evaluation)
+    if eval_data is not None:
         session.last_score = float(eval_data.get("score", 0.0))
         session.mastered = bool(eval_data.get("mastery_achieved", False))
-    except (json.JSONDecodeError, ValueError, TypeError):
-        session.last_score = 0.0
-        session.mastered = False
-        logger.warning(
-            "session_hint_eval_parse_failed concept=%s raw=%s",
-            session.concept_id, session.last_evaluation[:200],
-        )
+        session.last_diagnosis = eval_data.get("diagnosis")
 
     # MENTOR updates the struggle_pattern (non-fatal on failure).
     mentor_result = await mentor.update_struggle_pattern(

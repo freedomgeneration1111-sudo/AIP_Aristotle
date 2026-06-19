@@ -330,6 +330,7 @@ class TestExaminerMethods:
 
     @pytest.mark.asyncio
     async def test_evaluate_returns_json(self):
+        """evaluate() returns ok=True with data dict (Phase B.5: data, not error-as-payload)."""
         eval_json = json.dumps({"score": 0.8, "mastery_achieved": True, "feedback": "Good"})
         fake = _FakeModelProvider(responses={"evaluation": eval_json})
         conn = _FakeConn(rows=[("c1", "Force", None, "content", None, None, None, 4)])
@@ -337,9 +338,78 @@ class TestExaminerMethods:
         examiner = ExaminerActor()
         result = await examiner.evaluate(ctx, "c1", "1 Newton", "What is the SI unit of force?")
         assert result.ok
-        parsed = json.loads(result.error)
-        assert parsed["score"] == 0.8
-        assert parsed["mastery_achieved"] is True
+        # Phase B.5: read from result.data (not result.error)
+        assert result.data is not None
+        assert isinstance(result.data, dict)
+        assert result.data["score"] == 0.8
+        assert result.data["mastery_achieved"] is True
+        # When mastery_achieved is True, diagnosis is None
+        assert result.data["diagnosis"] is None
+
+    @pytest.mark.asyncio
+    async def test_evaluate_returns_diagnosis_on_wrong_answer(self):
+        """evaluate() returns a diagnosis dict with all three keys when score < threshold.
+
+        Phase B.5 (ADR-002 §3): when the answer is wrong, EXAMINER produces
+        a three-part diagnosis (misconception / why_wrong / corrective).
+        The fake model returns the full schema; we verify the data field
+        carries it through + all three keys are present.
+        """
+        eval_json = json.dumps({
+            "score": 0.3,
+            "mastery_achieved": False,
+            "feedback": "Not quite — see diagnosis.",
+            "diagnosis": {
+                "misconception": "You seem to think a force is needed to sustain motion",
+                "why_wrong": "Objects keep moving on their own — force changes motion, not sustains it",
+                "corrective": "No force is needed to keep something moving; force changes motion",
+            },
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(ctx, "c1", "a force keeps it going", "What is inertia?")
+        assert result.ok
+        assert result.data is not None
+        assert result.data["score"] == 0.3
+        assert result.data["mastery_achieved"] is False
+        # Diagnosis must be present with all three keys
+        assert result.data["diagnosis"] is not None
+        assert isinstance(result.data["diagnosis"], dict)
+        assert "misconception" in result.data["diagnosis"]
+        assert "why_wrong" in result.data["diagnosis"]
+        assert "corrective" in result.data["diagnosis"]
+        assert len(result.data["diagnosis"]["misconception"]) > 0
+        assert len(result.data["diagnosis"]["why_wrong"]) > 0
+        assert len(result.data["diagnosis"]["corrective"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_evaluate_no_diagnosis_on_correct_answer(self):
+        """evaluate() returns diagnosis=None when mastery_achieved is True.
+
+        Phase B.5: diagnosis is only populated for wrong answers. When the
+        learner masters the concept, diagnosis is None + feedback names
+        why the answer was right.
+        """
+        eval_json = json.dumps({
+            "score": 0.9,
+            "mastery_achieved": True,
+            "feedback": "Exactly — you identified that inertia resists change in motion.",
+            "diagnosis": None,
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(ctx, "c1", "objects resist changes in motion", "What is inertia?")
+        assert result.ok
+        assert result.data is not None
+        assert result.data["mastery_achieved"] is True
+        # Diagnosis must be None when correct
+        assert result.data["diagnosis"] is None
+        # Feedback should be present + non-empty
+        assert len(result.data["feedback"]) > 0
 
 
 # --------------------------------------------------------------------------
@@ -522,6 +592,59 @@ class TestSessionCoordinator:
         result = await run_session_step(ctx, session)
         assert result.ok
         assert session.state == SessionState.PROBE
+
+    @pytest.mark.asyncio
+    async def test_session_stores_diagnosis_on_wrong_answer(self):
+        """After a wrong EVALUATE step, session.last_diagnosis is populated.
+
+        Phase B.5 (error diagnosis): when EXAMINER returns a diagnosis dict
+        for a wrong answer, the session coordinator stores it on
+        session.last_diagnosis so MENTOR can read it in the next task
+        (misconception log wiring). This test pins the storage contract.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        eval_json = json.dumps({
+            "score": 0.3,
+            "mastery_achieved": False,
+            "feedback": "Not quite.",
+            "diagnosis": {
+                "misconception": "You seem to think a force is needed to sustain motion",
+                "why_wrong": "Objects keep moving on their own",
+                "corrective": "Force changes motion, not sustains it",
+            },
+        })
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+            "sexton": "Learner struggles with inertia.",
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.EVALUATE,
+            hint_count=0,
+            last_quiz_question="What is inertia?",
+            last_student_answer="a force keeps it going",
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        # The diagnosis must be stored on the session
+        assert session.last_diagnosis is not None
+        assert isinstance(session.last_diagnosis, dict)
+        assert "misconception" in session.last_diagnosis
+        assert "why_wrong" in session.last_diagnosis
+        assert "corrective" in session.last_diagnosis
+        assert session.last_diagnosis["misconception"] == "You seem to think a force is needed to sustain motion"
 
     @pytest.mark.asyncio
     async def test_session_routes_to_hint1_on_wrong_answer(self):

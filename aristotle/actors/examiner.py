@@ -106,15 +106,39 @@ class ExaminerActor:
         student_answer: str,
         quiz_question: str,
     ) -> ActorResult:
-        """Score the student's quiz answer (ADR-001 §3 EVALUATE).
+        """Score the student's quiz answer + produce error diagnosis if wrong.
+
+        Phase B.5 (ADR-002 Rev 2 §3 EVALUATE — error diagnosis): when the
+        answer is wrong, EXAMINER produces a three-part diagnosis
+        (misconception / why_wrong / corrective) instead of just a score.
+        When the answer is correct, diagnosis is None and feedback names
+        *why* it was right (not just "correct!").
 
         Calls the model to evaluate the answer. Returns ActorResult with:
-        - ok=True: scoring succeeded. `error` field contains a JSON string
-          with {score, mastery_achieved, feedback}.
-        - ok=False: scoring failed or model not configured.
+        - ok=True: scoring succeeded. `data` field contains a dict with:
+            {
+              "score": float,           # 0.0-1.0
+              "mastery_achieved": bool,  # True if score >= mastery_threshold
+              "feedback": str,           # one sentence; names why right/wrong
+              "diagnosis": dict | None   # None when correct; dict when wrong
+            }
+            When diagnosis is a dict, it has:
+            {
+              "misconception": str,  # what the learner likely thought
+              "why_wrong": str,      # jargon-free explanation of the error
+              "corrective": str      # one memorable corrective sentence
+            }
+        - ok=False: scoring failed or model not configured. `error` has the
+          reason; `data` is None.
 
         The score is 0.0-1.0. mastery_achieved is True if score >= the
-        config's mastery_threshold (default 0.7).
+        config's mastery_threshold (default 0.7). The model is asked to
+        populate diagnosis ONLY when mastery_achieved is False.
+
+        Phase B.5 migration: this method uses ActorResult.data (not
+        error-as-payload). It is the reference migration for all
+        ARISTOTLE actors — predict() and generate_hint() already use data;
+        teach()/probe()/quiz() can migrate when next touched.
 
         Governance: if no model provider, returns NEEDS_CONFIGURATION.
         """
@@ -133,18 +157,45 @@ class ExaminerActor:
 
         mastery_threshold = getattr(config, "mastery_threshold", 0.7) if config else 0.7
 
+        # Phase B.5: the prompt now requests a diagnosis block when the
+        # answer is wrong. Exact field names + structure — no ambiguity.
         system_prompt = (
             "You are Aristotle. Evaluate the learner's answer to the quiz "
-            "question. Respond as JSON with fields: score (0.0-1.0), "
-            "mastery_achieved (bool), feedback (one sentence). Be fair but "
-            "exact — partial credit for partial understanding."
+            "question. Respond as JSON with EXACTLY these fields:\n"
+            "  score: float (0.0-1.0)\n"
+            "  mastery_achieved: bool (true if score >= mastery_threshold)\n"
+            "  feedback: str (one sentence; when correct, name WHY it was "
+            "right; when wrong, brief acknowledgment)\n"
+            "  diagnosis: object or null\n"
+            "\n"
+            "When mastery_achieved is TRUE: set diagnosis to null. The "
+            "feedback should name why the answer was right (e.g. 'Exactly — "
+            "you identified that inertia resists the change in motion').\n"
+            "\n"
+            "When mastery_achieved is FALSE: set diagnosis to an object with "
+            "EXACTLY these three fields:\n"
+            "  misconception: str — what the learner likely thought (e.g. "
+            "'You seem to think a force is needed to sustain motion')\n"
+            "  why_wrong: str — jargon-free explanation of why that's wrong "
+            "(e.g. 'The issue is that objects keep moving on their own — a "
+            "force is only needed to change motion, not sustain it')\n"
+            "  corrective: str — one memorable corrective sentence (e.g. "
+            "'No force is needed to keep something moving; force changes "
+            "motion')\n"
+            "\n"
+            "Be fair but exact — partial credit for partial understanding. "
+            "Be warm — the diagnosis is for the learner, not a gradebook."
         )
         user_prompt = (
             f"Concept: {concept['topic']}\n"
             f"Quiz question: {quiz_question}\n"
             f"Learner's answer: {student_answer}\n"
             f"Mastery threshold: {mastery_threshold}\n"
-            f"Respond as JSON: {{\"score\": 0.0, \"mastery_achieved\": false, \"feedback\": \"...\"}}"
+            f"Respond as JSON:\n"
+            f'{{"score": 0.0, "mastery_achieved": false, "feedback": "...", '
+            f'"diagnosis": {{"misconception": "...", "why_wrong": "...", '
+            f'"corrective": "..."}}}}\n'
+            f"(Set diagnosis to null when mastery_achieved is true.)"
         )
 
         try:
@@ -156,11 +207,63 @@ class ExaminerActor:
                 ],
             )
             evaluation_text = result.get("content", "")
-            logger.info(
-                "examiner_evaluate_ok concept=%s response_len=%d",
-                concept_id, len(evaluation_text),
-            )
-            return ActorResult(ok=True, error=evaluation_text)
+
+            # Parse the model's JSON response + re-package as a dict in
+            # ActorResult.data. This is the Phase B.5 migration away from
+            # error-as-payload: the caller (session coordinator) reads
+            # result.data, not result.error.
+            import json
+            try:
+                eval_data = json.loads(evaluation_text)
+                # Normalize: ensure all four fields exist. diagnosis may be
+                # null/absent when correct — normalize to None.
+                if not isinstance(eval_data, dict):
+                    raise ValueError("model response is not a JSON object")
+                normalized = {
+                    "score": float(eval_data.get("score", 0.0)),
+                    "mastery_achieved": bool(eval_data.get("mastery_achieved", False)),
+                    "feedback": str(eval_data.get("feedback", "")),
+                    "diagnosis": eval_data.get("diagnosis") if eval_data.get("diagnosis") is not None else None,
+                }
+                # If diagnosis is present, ensure it has the three expected
+                # keys (defensive — the model may omit one). Missing keys
+                # default to empty string so downstream consumers don't
+                # KeyError.
+                if isinstance(normalized["diagnosis"], dict):
+                    d = normalized["diagnosis"]
+                    normalized["diagnosis"] = {
+                        "misconception": str(d.get("misconception", "")),
+                        "why_wrong": str(d.get("why_wrong", "")),
+                        "corrective": str(d.get("corrective", "")),
+                    }
+                elif normalized["diagnosis"] is not None:
+                    # Model returned a non-dict, non-null diagnosis — normalize to None.
+                    normalized["diagnosis"] = None
+
+                logger.info(
+                    "examiner_evaluate_ok concept=%s score=%.2f mastered=%s has_diagnosis=%s",
+                    concept_id, normalized["score"], normalized["mastery_achieved"],
+                    normalized["diagnosis"] is not None,
+                )
+                return ActorResult(ok=True, data=normalized)
+            except (json.JSONDecodeError, ValueError, TypeError) as parse_exc:
+                # Model didn't return valid JSON. Return a fallback dict
+                # with score=0.0 + a diagnosis noting the parse failure.
+                # This keeps the session moving (the coordinator treats
+                # score=0.0 as "not mastered" and routes to hints/remediate).
+                logger.warning(
+                    "examiner_evaluate_parse_failed concept=%s error=%s raw=%s",
+                    concept_id, parse_exc, evaluation_text[:200],
+                )
+                return ActorResult(
+                    ok=True,
+                    data={
+                        "score": 0.0,
+                        "mastery_achieved": False,
+                        "feedback": "[parse error — model did not return valid JSON]",
+                        "diagnosis": None,
+                    },
+                )
         except Exception as exc:
             logger.warning(
                 "examiner_evaluate_failed concept=%s error=%s:%s",
