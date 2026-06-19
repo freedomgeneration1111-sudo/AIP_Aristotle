@@ -47,6 +47,15 @@ def on_load(host) -> None:
         order=30,
     )
 
+    # Register teacher dashboard page (Phase B — ADR-001 §8)
+    host.register_page(
+        route="/dashboard",
+        title="Teach",
+        icon="school_outlined",
+        builder_fn=lambda: None,  # NiceGUI route registered by aristotle/gui.py
+        order=35,
+    )
+
     # Register API router (ADR-014 v1.1 — the platform includes it via
     # host.registered_api_routers() after host.start()). This preserves
     # the boundary: the platform never imports aristotle by name — the

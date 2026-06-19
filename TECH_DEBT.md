@@ -271,3 +271,53 @@ to use the Brain's retrieval pipeline, not raw SQL.
 - `AIP_Brain/src/aip/adapter/api/routes/_augmented_context.py` (the Brain's retrieval pipeline)
 - ADR-001 §4 (concept-aware retrieval via the graph store)
 
+
+---
+
+## ARISTOTLE-DEBT-008 — GUI Coupling to Brain's gui/ Package
+
+**Status:** Active — revisit when third-party extensions need the same components
+**Phase:** Phase B
+**Filed:** 2026-06-18
+
+**What was deferred:**
+`aristotle/gui.py` imports from the Brain's `gui/` package:
+- `gui.components.layout` (`build_top_bar`, `build_left_nav`)
+- `gui.state` (`GuiState`)
+- `gui.theme` (color + font constants: `C_AMBER`, `C_CREAM`, `C_SURFACE`, etc.)
+
+This is tight GUI coupling — the extension depends on the platform's GUI
+package, not just its API. It works because ARISTOTLE is installed in the
+same venv as the Brain and both run as the same NiceGUI app. But it means:
+1. ARISTOTLE can't render its GUI without the Brain's gui/ package present.
+2. A third-party extension that doesn't know about the Brain's theme
+   constants can't reuse the layout components.
+3. The boundary test (which scans for `aip.*` imports) doesn't catch this
+   because `gui.*` is not an `aip.*` import — it's a separate top-level
+   package.
+
+**Why deferred:**
+For pre-alpha single-tenant (one install, one learner), the coupling is
+acceptable — ARISTOTLE is always co-installed with the Brain. Fixing it
+requires either:
+1. The Brain exports its theme/layout as a pip-installable package
+   (e.g. `aip-gui-kit`), OR
+2. Extensions ship their own theme/layout, OR
+3. The Brain's gui/ package becomes an `aip.adapter.extensions.gui_kit`
+   module that extensions import through the allowlist.
+
+Option 1 is the cleanest for a multi-extension future. Options 2 and 3
+are simpler but either duplicate theme constants or expand the boundary.
+
+**Remediation trigger:**
+When a second extension (LOOM, CodeForge, or a third-party extension)
+needs to reuse the Brain's layout components, extract the theme +
+layout into a shared package. Until then, the coupling is a known
+pre-alpha trade-off.
+
+**Related work:**
+- `aristotle/gui.py` (imports `gui.components.layout`, `gui.state`, `gui.theme`)
+- `AIP_Brain/gui/components/layout.py` (the layout module)
+- `AIP_Brain/gui/theme.py` (the theme constants)
+- `tests/test_import_boundary.py` (doesn't catch this — `gui.*` isn't `aip.*`)
+

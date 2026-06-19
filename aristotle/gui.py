@@ -238,3 +238,151 @@ def learn_page():
 
         # Schedule concept loading
         ui.timer(0.1, load_concepts, once=True)
+
+
+# ============================================================
+# Teacher Dashboard (Phase B — ADR-001 §8)
+# ============================================================
+
+
+@ui.page("/dashboard")
+def dashboard_page():
+    """Aristotle teacher dashboard — mastery overview + struggle pattern (ADR-001 §8).
+
+    Three panels:
+    1. Header: total concepts, mastered count, due count
+    2. Struggle pattern sentence (from MENTOR, prominent)
+    3. Mastery table: concept | topic | mastered | last score | next due date
+       Sorted by due date ascending — what needs attention is at the top.
+
+    This is the ONE place the actor decomposition is visible (ADR-001 §8):
+    the teacher sees what MENTOR tracks, what SM-2 schedules, what's due.
+    The learner never sees this page — it's for Komal (the teacher).
+    """
+    state = GuiState()
+    state.active_page = "/dashboard"
+
+    build_top_bar(state)
+    build_left_nav(state, active_page="/dashboard")
+
+    with ui.column().classes("w-full flex-1").style(f"padding:{SP_MD}; gap:{SP_MD};"):
+        ui.label("Aristotle — Teacher Dashboard").style(
+            f"font-family:{F_SANS}; font-size:24px; font-weight:700; color:{C_CREAM};"
+        )
+        ui.label("Leverage, not surveillance — the tutor's memory of who this learner is.").style(
+            f"font-family:{F_SANS}; font-size:14px; color:{C_MUTED}; font-style:italic;"
+        )
+
+        # Data will be loaded async into these containers
+        stats_row = ui.row().classes("w-full").style(f"gap:{SP_MD};")
+        struggle_card = ui.column().classes("w-full").style(f"gap:{SP_SM};")
+        table_card = ui.column().classes("w-full").style(f"gap:{SP_SM};")
+        status_label = ui.label("").style(
+            f"font-family:{F_MONO}; font-size:11px; color:{C_MUTED};"
+        )
+
+    async def load_dashboard():
+        """Fetch dashboard data from the backend and render it."""
+        try:
+            async with httpx.AsyncClient(base_url=_BACKEND_URL, timeout=10.0) as client:
+                resp = await client.get("/aristotle/dashboard")
+                if resp.status_code != 200:
+                    status_label.text = f"Backend error: {resp.status_code}"
+                    return
+                data = resp.json()
+
+                # Panel 1: Stats header
+                stats_row.clear()
+                with stats_row:
+                    _stat_card("Total Concepts", str(data["total_concepts"]), C_CREAM)
+                    _stat_card("Mastered", str(data["mastered_count"]), "#4A9B8E")
+                    _stat_card("Due Now", str(data["due_count"]), C_AMBER)
+
+                # Panel 2: Struggle pattern
+                struggle_card.clear()
+                with struggle_card:
+                    ui.label("Struggle Pattern").style(
+                        f"font-family:{F_SANS}; font-size:14px; font-weight:700; "
+                        f"color:{C_AMBER}; letter-spacing:1px; text-transform:uppercase;"
+                    )
+                    pattern = data.get("struggle_pattern")
+                    if pattern:
+                        ui.label(pattern).style(
+                            f"font-family:{F_SANS}; font-size:16px; color:{C_CREAM}; "
+                            f"background:{C_RAISED}; padding:{SP_MD}; border-radius:{R_SM}; "
+                            f"line-height:1.5; border-left:3px solid {C_AMBER};"
+                        )
+                    else:
+                        ui.label("No struggle pattern recorded yet — the tutor is still learning who this learner is.").style(
+                            f"font-family:{F_SANS}; font-size:14px; color:{C_MUTED}; "
+                            f"font-style:italic; background:{C_RAISED}; padding:{SP_MD}; border-radius:{R_SM};"
+                        )
+
+                # Panel 3: Mastery table
+                table_card.clear()
+                with table_card:
+                    ui.label("Mastery by Concept").style(
+                        f"font-family:{F_SANS}; font-size:14px; font-weight:700; "
+                        f"color:{C_AMBER}; letter-spacing:1px; text-transform:uppercase;"
+                    )
+
+                    mastery = data.get("mastery_by_concept", [])
+                    if not mastery:
+                        ui.label("No mastery records yet. Run a tutoring session first.").style(
+                            f"font-family:{F_SANS}; font-size:14px; color:{C_MUTED}; font-style:italic;"
+                        )
+                    else:
+                        # Build a table using NiceGUI's ui.table
+                        columns = [
+                            {"name": "concept", "label": "Concept", "field": "concept", "align": "left"},
+                            {"name": "topic", "label": "Topic", "field": "topic", "align": "left"},
+                            {"name": "mastered", "label": "Mastered", "field": "mastered", "align": "center"},
+                            {"name": "score", "label": "Last Score", "field": "score", "align": "center"},
+                            {"name": "due", "label": "Next Due", "field": "due", "align": "left"},
+                        ]
+                        rows = []
+                        for m in mastery:
+                            mastered_text = "✓" if m["mastered"] else "—"
+                            score_text = f"{m['last_score']:.0%}" if m.get("last_score") is not None else "—"
+                            due_text = m.get("next_review_at") or "Due now"
+                            if m.get("is_due"):
+                                due_text = f"⚠ {due_text}"
+                            rows.append({
+                                "concept": m["concept_id"],
+                                "topic": m["topic"],
+                                "mastered": mastered_text,
+                                "score": score_text,
+                                "due": due_text,
+                            })
+
+                        ui.table(
+                            columns=columns,
+                            rows=rows,
+                        ).style(
+                            f"background:{C_RAISED}; color:{C_CREAM}; "
+                            f"font-family:{F_SANS}; font-size:13px; border-radius:{R_SM};"
+                        )
+
+                status_label.text = f"Loaded {len(data.get('mastery_by_concept', []))} concept records for {data.get('student_id', 'definer')}."
+
+        except httpx.ConnectError:
+            status_label.text = "Backend not reachable. Start it with ./start.sh"
+        except Exception as exc:
+            status_label.text = f"Error: {exc}"
+
+    ui.timer(0.1, load_dashboard, once=True)
+
+
+def _stat_card(label: str, value: str, color: str) -> None:
+    """Render a small stat card (label + big number) in the dashboard header."""
+    with ui.column().style(
+        f"background:{C_RAISED}; padding:{SP_MD}; border-radius:{R_SM}; "
+        f"min-width:120px; align-items:center; gap:4px;"
+    ):
+        ui.label(value).style(
+            f"font-family:{F_SANS}; font-size:28px; font-weight:700; color:{color};"
+        )
+        ui.label(label).style(
+            f"font-family:{F_MONO}; font-size:10px; color:{C_MUTED}; "
+            f"letter-spacing:1px; text-transform:uppercase;"
+        )
