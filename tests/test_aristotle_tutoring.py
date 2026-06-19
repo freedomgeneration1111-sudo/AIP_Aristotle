@@ -215,6 +215,84 @@ class TestSocratesTeach:
 
 
 # --------------------------------------------------------------------------
+# SOCRATES predict tests (Phase B.5)
+# --------------------------------------------------------------------------
+
+
+class TestSocratesPredict:
+    """Phase B.5: SocratesActor.predict() generates the pre-teach prompt.
+
+    The generation effect (ADR-002 Rev 2 §3): asking the learner to guess
+    before teaching improves retention regardless of guess correctness.
+    predict() does NOT call a model — it's a fixed template with the
+    concept name interpolated. Uses the new ActorResult.data field (not
+    error-as-payload).
+    """
+
+    @pytest.mark.asyncio
+    async def test_predict_returns_prompt(self):
+        """SocratesActor.predict() returns ok=True with data.prompt as a string.
+
+        Uses the new data field (Brain commit ce44e53), not error-as-payload.
+        The prompt should mention the concept topic so it's specific, not
+        generic.
+        """
+        # predict() does NOT need a model provider (unlike teach()) — it's a
+        # fixed template. Provide one anyway to confirm it's not called.
+        fake = _FakeModelProvider()
+        conn = _FakeConn(rows=[("c1", "Newton's First Law", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        socrates = SocratesActor()
+        result = await socrates.predict(ctx, "c1")
+        assert result.ok
+        # The prompt is in result.data["prompt"], not result.error
+        assert result.data is not None
+        assert isinstance(result.data, dict)
+        assert "prompt" in result.data
+        assert isinstance(result.data["prompt"], str)
+        assert len(result.data["prompt"]) > 0
+        # The prompt should reference the concept topic (specific, not generic)
+        assert "Newton's First Law" in result.data["prompt"]
+        # predict() must NOT call the model — it's a fixed template
+        assert len(fake.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_predict_concept_not_found(self):
+        """SocratesActor.predict() returns ok=False with 'not found' in error."""
+        fake = _FakeModelProvider()
+        conn = _FakeConn(rows=None)  # no rows → concept not found
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        socrates = SocratesActor()
+        result = await socrates.predict(ctx, "nonexistent")
+        assert not result.ok
+        assert "not found" in result.error
+        # data should be None on failure (error-as-payload is for errors only)
+        assert result.data is None
+
+    @pytest.mark.asyncio
+    async def test_predict_prompt_is_warm_and_low_pressure(self):
+        """The predict prompt uses warm framing ('a wrong guess is fine').
+
+        ADR-002 §3: the prediction step must reduce affective filter, not
+        increase it. The prompt explicitly tells the learner a wrong guess
+        is fine. This test pins the framing so a future refactor can't
+        accidentally make it intimidating.
+        """
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=None, stores=_FakeStores(conn))
+        socrates = SocratesActor()
+        result = await socrates.predict(ctx, "c1")
+        assert result.ok
+        prompt = result.data["prompt"].lower()
+        # Warm framing — at least one of these phrases should appear
+        assert any(phrase in prompt for phrase in [
+            "wrong guess is fine",
+            "just say what comes to mind",
+            "what do you think",
+        ]), f"prompt should use warm framing, got: {result.data['prompt']}"
+
+
+# --------------------------------------------------------------------------
 # EXAMINER probe/quiz/evaluate tests
 # --------------------------------------------------------------------------
 
@@ -314,6 +392,22 @@ class TestMentorUpdate:
 
 
 class TestSessionCoordinator:
+    @pytest.mark.asyncio
+    async def test_session_starts_in_predict_state(self):
+        """A fresh SessionContext's initial state is PREDICT, not TEACH.
+
+        Phase B.5 (ADR-002 Rev 2 §3): sessions start at PREDICT (the
+        generation effect — learner guesses before teaching). Was TEACH
+        in Phase A. This test pins the default so a future refactor
+        can't silently revert it.
+        """
+        from aristotle.session import SessionContext, SessionState
+
+        session = SessionContext(concept_id="c1")
+        assert session.state == SessionState.PREDICT
+        assert session.predict_generated is False
+        assert session.last_prediction == ""
+
     @pytest.mark.asyncio
     async def test_session_teach_step_advances_to_probe(self):
         """run_session_step with state=TEACH advances to PROBE."""

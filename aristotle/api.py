@@ -128,7 +128,12 @@ async def session_start_route(request: Request):
     """Start a new tutoring session.
 
     Request body: {"concept_id": "newton_first_law"}
-    Returns: the initial SessionContext (state=TEACH).
+    Returns: the initial SessionContext (state=PREDICT).
+
+    Phase B.5: sessions now start at PREDICT (the generation effect —
+    learner guesses before teaching). The caller's first /session/step
+    call generates the predict prompt; the next call with the learner's
+    prediction text in student_input records it + advances to TEACH.
     """
     container = _get_container(request)
     body = await request.json()
@@ -136,7 +141,7 @@ async def session_start_route(request: Request):
     if not concept_id:
         raise HTTPException(status_code=400, detail="concept_id required")
 
-    session = SessionContext(concept_id=concept_id, state=SessionState.TEACH)
+    session = SessionContext(concept_id=concept_id, state=SessionState.PREDICT)
     return _session_to_dict(session)
 
 
@@ -183,18 +188,27 @@ async def session_run_route(request: Request):
     if not concept_id:
         raise HTTPException(status_code=400, detail="concept_id required")
 
-    session = SessionContext(concept_id=concept_id, state=SessionState.TEACH)
+    # Phase B.5: start at PREDICT. The first answer (if provided) is the
+    # learner's prediction; subsequent answers are for QUIZ as before.
+    session = SessionContext(concept_id=concept_id, state=SessionState.PREDICT)
     ctx = _make_ctx(container)
     answer_idx = 0
     steps: list[dict] = []
-    max_steps = 20  # safety limit
+    max_steps = 25  # safety limit (was 20 — +5 for PREDICT two-phase + HINT ladder headroom)
 
     for _ in range(max_steps):
         if session.state.value == "SESSION_COMPLETE":
             break
 
         student_input = ""
-        if session.state == SessionState.QUIZ and session.quiz_generated and answer_idx < len(answers):
+        # PREDICT phase: consume the first answer as the prediction.
+        # The predict step is two-phase: first call generates the prompt
+        # (no input), second call records the prediction (needs input).
+        if session.state == SessionState.PREDICT and session.predict_generated and answer_idx < len(answers):
+            student_input = answers[answer_idx]
+            answer_idx += 1
+        # QUIZ phase: consume an answer for the quiz (same as Phase A).
+        elif session.state == SessionState.QUIZ and session.quiz_generated and answer_idx < len(answers):
             student_input = answers[answer_idx]
             answer_idx += 1
 
@@ -393,6 +407,7 @@ def _session_to_dict(session: SessionContext) -> dict:
         "student_id": session.student_id,
         "concept_id": session.concept_id,
         "state": session.state.value,
+        "last_prediction": session.last_prediction,
         "last_explanation": session.last_explanation,
         "last_probe_question": session.last_probe_question,
         "last_quiz_question": session.last_quiz_question,
@@ -404,6 +419,7 @@ def _session_to_dict(session: SessionContext) -> dict:
         "max_retries": session.max_retries,
         "quiz_generated": session.quiz_generated,
         "probe_generated": session.probe_generated,
+        "predict_generated": session.predict_generated,
     }
 
 
@@ -412,7 +428,8 @@ def _session_from_dict(d: dict) -> SessionContext:
     return SessionContext(
         student_id=d.get("student_id", "definer"),
         concept_id=d.get("concept_id", ""),
-        state=SessionState(d.get("state", "TEACH")),
+        state=SessionState(d.get("state", "PREDICT")),
+        last_prediction=d.get("last_prediction", ""),
         last_explanation=d.get("last_explanation", ""),
         last_probe_question=d.get("last_probe_question", ""),
         last_quiz_question=d.get("last_quiz_question", ""),
@@ -424,4 +441,5 @@ def _session_from_dict(d: dict) -> SessionContext:
         max_retries=d.get("max_retries", 2),
         quiz_generated=d.get("quiz_generated", False),
         probe_generated=d.get("probe_generated", False),
+        predict_generated=d.get("predict_generated", False),
     )

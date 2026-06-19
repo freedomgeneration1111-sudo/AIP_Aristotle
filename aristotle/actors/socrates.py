@@ -153,6 +153,66 @@ class SocratesActor:
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
 
+    async def predict(
+        self,
+        ctx: ActorContext,
+        concept_id: str,
+    ) -> ActorResult:
+        """Generate the pre-teach prediction prompt (ADR-002 Rev 2 §3 PREDICT).
+
+        The generation effect: asking the learner to guess before teaching
+        improves retention — regardless of whether the guess was right or
+        wrong. This method fetches the concept's name/topic from the corpus
+        and builds a warm, low-pressure prompt asking the learner to predict
+        what the concept means.
+
+        Does NOT evaluate correctness — the prediction is always accepted.
+        Does NOT call a model — the prompt is a fixed template with the
+        concept name interpolated in. No model_provider needed (unlike
+        teach()).
+
+        Uses ActorResult(ok=True, data={"prompt": ...}) — the new `data`
+        field (Brain commit ce44e53, DEFINER decision ADR-002 §16 #4).
+        The session coordinator reads result.data["prompt"] to display to
+        the learner.
+
+        Args:
+            ctx: ActorContext with container + logger.
+            concept_id: the concept to ask about (must exist in
+                aristotle_concept).
+
+        Returns:
+            ActorResult with ok=True + data={"prompt": <warm prompt str>}.
+            ok=False + error if the concept is not found or the corpus is
+            unreachable.
+        """
+        logger = ctx.logger
+
+        # Fetch the concept (same query pattern as teach()).
+        concept = await self._fetch_concept(ctx, concept_id)
+        if concept is None:
+            return ActorResult(
+                ok=False,
+                error=f"concept {concept_id!r} not found in aristotle_concept",
+            )
+
+        # Build the warm, low-pressure prediction prompt. The framing is
+        # deliberate: "a wrong guess is fine" reduces affective filter and
+        # encourages engagement. The concept name (topic) is interpolated
+        # so the prompt is specific, not generic.
+        topic = concept.get("topic", concept_id)
+        prompt = (
+            f"Before I explain this, what do you think \"{topic}\" means? "
+            f"A wrong guess is fine — just say what comes to mind."
+        )
+
+        logger.info(
+            "socrates_predict_ok concept=%s prompt_len=%d",
+            concept_id, len(prompt),
+        )
+        # Phase B.5: use the new `data` field, not error-as-payload.
+        return ActorResult(ok=True, data={"prompt": prompt})
+
     async def _fetch_concept(self, ctx: ActorContext, concept_id: str) -> dict | None:
         """Fetch a concept from the aristotle_concept table.
 

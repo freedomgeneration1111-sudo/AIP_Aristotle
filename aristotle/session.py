@@ -32,7 +32,18 @@ from aip.foundation.protocols.actors import ActorContext, ActorResult
 
 
 class SessionState(str, Enum):
-    """The tutoring state machine states (ADR-001 §3)."""
+    """The tutoring state machine states (ADR-001 §3 + ADR-002 Rev 2 §3).
+
+    Phase B.5 adds PREDICT as the initial state (the generation effect —
+    the learner commits to a guess before seeing the explanation). The
+    full Phase B.5 flow is:
+      PREDICT → TEACH → PROBE → QUIZ → EVALUATE → [HINT_1 → HINT_2 →]
+      REMEDIATE
+    The HINT ladder (HINT_1, HINT_2) slots between EVALUATE and
+    REMEDIATE and comes in a later commit — leave a TODO marker where
+    they will slot in (see _step_evaluate's branch + the dispatch below).
+    """
+    PREDICT = "PREDICT"
     TEACH = "TEACH"
     PROBE = "PROBE"
     QUIZ = "QUIZ"
@@ -47,11 +58,18 @@ class SessionContext:
     """Per-session state (passed between steps).
 
     The caller persists this between `run_session_step()` calls.
+
+    Phase B.5: the default initial state is now PREDICT (was TEACH).
+    The PREDICT step asks the learner to guess before teaching — the
+    generation effect. `last_prediction` records the learner's
+    prediction text so it can be logged to aristotle_predict_event.
     """
     student_id: str = "definer"
     concept_id: str = ""
-    state: SessionState = SessionState.TEACH
+    # Phase B.5: default initial state is PREDICT (was TEACH).
+    state: SessionState = SessionState.PREDICT
     # Accumulated results from each step
+    last_prediction: str = ""  # Phase B.5: learner's pre-TEACH prediction
     last_explanation: str = ""
     last_probe_question: str = ""
     last_quiz_question: str = ""
@@ -66,6 +84,9 @@ class SessionContext:
     quiz_generated: bool = False
     # Track whether the probe question has been generated (waiting for response)
     probe_generated: bool = False
+    # Phase B.5: track whether the predict prompt has been generated
+    # (waiting for learner's prediction response)
+    predict_generated: bool = False
 
 
 async def run_session_step(
@@ -88,10 +109,14 @@ async def run_session_step(
         - ok=False: step failed. `error` field contains the error message.
 
     The caller checks session.state after each step to know what to do next:
+    - PREDICT → display the predict prompt, wait for learner's prediction
+      (Phase B.5: the generation effect — learner guesses before teaching)
     - TEACH → display the explanation, wait for learner to continue
     - PROBE → display the probe question, wait for learner's response
     - QUIZ → display the quiz question, wait for learner's answer
     - EVALUATE → display the evaluation, session.state advances automatically
+      (Phase B.5 TODO: HINT_1/HINT_2 will slot here on a failed quiz,
+      before REMEDIATE — see _step_evaluate's branch below)
     - REMEDIATE → display the re-teaching, session.state advances to PROBE
     - NEXT_CONCEPT → session complete for this concept
     - SESSION_COMPLETE → no more concepts
@@ -127,7 +152,9 @@ async def run_session_step(
     mentor = MentorActor()
 
     # Dispatch based on session state
-    if session.state == SessionState.TEACH:
+    if session.state == SessionState.PREDICT:
+        return await _step_predict(ctx, session, socrates, student_input)
+    elif session.state == SessionState.TEACH:
         return await _step_teach(ctx, session, socrates)
     elif session.state == SessionState.PROBE:
         return await _step_probe(ctx, session, examiner)
@@ -141,6 +168,113 @@ async def run_session_step(
         return await _step_next_concept(ctx, session)
     else:
         return ActorResult(ok=False, error="session already complete")
+
+
+async def _step_predict(
+    ctx: ActorContext,
+    session: SessionContext,
+    socrates: Any,
+    student_input: str,
+) -> ActorResult:
+    """PREDICT: SOCRATES asks the learner to guess before teaching (ADR-002 Rev 2 §3).
+
+    Two-phase (like QUIZ):
+      Phase 1 (predict_generated=False): call socrates.predict() to get the
+        warm prompt ("Before I explain this, what do you think [concept]
+        means?..."). Display the prompt, wait for the learner's prediction.
+      Phase 2 (predict_generated=True, student_input non-empty): record the
+        learner's prediction to aristotle_predict_event, advance to TEACH.
+
+    The prediction is ALWAYS accepted — never scored. The generation
+    effect works regardless of whether the prediction was right or wrong.
+    We log it for analysis (which concepts students guess well vs. poorly),
+    not for the mastery model.
+
+    ADR-002 §10.4: aristotle_predict_event has no correctness column by
+    design. The ADR's `finding` column (set by PLACER in Phase D) is also
+    omitted — Phase B.5 only records the raw prediction.
+    """
+    logger = ctx.logger
+
+    if not session.predict_generated:
+        # Phase 1: generate the predict prompt.
+        result = await socrates.predict(ctx, session.concept_id)
+        if result.ok:
+            # The prompt is in result.data["prompt"] (Phase B.5: use the new
+            # data field, not error-as-payload). Fall back to error for
+            # backward compat with any actor that hasn't migrated yet.
+            if result.data is not None and isinstance(result.data, dict):
+                prompt = result.data.get("prompt", "")
+            else:
+                prompt = result.error or ""
+            session.predict_generated = True
+            # If student_input was provided (non-interactive mode), record
+            # the prediction immediately + advance to TEACH in the same step.
+            if student_input:
+                session.last_prediction = student_input
+                await _log_predict_event(ctx, session)
+                session.state = SessionState.TEACH
+                logger.info(
+                    "session_step_predict_generate_and_record concept=%s",
+                    session.concept_id,
+                )
+            else:
+                logger.info(
+                    "session_step_predict_generate concept=%s",
+                    session.concept_id,
+                )
+        return result
+    else:
+        # Phase 2: learner's prediction arrived — record it + advance to TEACH.
+        if student_input:
+            session.last_prediction = student_input
+        await _log_predict_event(ctx, session)
+        session.state = SessionState.TEACH
+        logger.info(
+            "session_step_predict_record concept=%s prediction_len=%d",
+            session.concept_id, len(session.last_prediction),
+        )
+        return ActorResult(
+            ok=True,
+            data={"prediction_recorded": True, "concept_id": session.concept_id},
+        )
+
+
+async def _log_predict_event(ctx: ActorContext, session: SessionContext) -> None:
+    """Write the learner's prediction to aristotle_predict_event (ADR-002 §10.4).
+
+    Best-effort: a DB failure here is non-fatal. The session still advances
+    to TEACH — the prediction is logged for analysis, not for the tutoring
+    loop's control flow.
+    """
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        # session_id: use a stable identifier. For Phase B.5 pre-alpha
+        # (single-tenant, no session table yet), derive from student_id +
+        # concept_id + a timestamp so multiple sessions per concept are
+        # distinguishable. A real session_id comes in Phase D with the
+        # aristotle_intake_session table.
+        from datetime import datetime, timezone
+        session_id = f"{session.student_id}:{session.concept_id}:{datetime.now(timezone.utc).isoformat()}"
+        await conn.execute(
+            "INSERT INTO aristotle_predict_event (session_id, concept_id, prediction_text) "
+            "VALUES (?, ?, ?)",
+            (session_id, session.concept_id, session.last_prediction),
+        )
+        await conn.commit()
+    except Exception as exc:
+        # Non-fatal — log + continue. The prediction is for analysis, not
+        # for the tutoring loop's control flow.
+        ctx.logger.warning(
+            "session_predict_log_failed concept=%s error=%s:%s",
+            session.concept_id, type(exc).__name__, exc,
+        )
 
 
 async def _step_teach(
@@ -272,6 +406,13 @@ async def _step_evaluate(
     await _update_mastery(ctx, session)
 
     # Branch: mastered → next concept; struggling → remediate
+    # Phase B.5 TODO: HINT_1/HINT_2 will slot here. On a failed quiz (score
+    # below mastery_threshold), the next state should be HINT_1 (not
+    # REMEDIATE directly). HINT_1 → HINT_2 → REMEDIATE gives the learner a
+    # 2-rung hint ladder before the full re-teaching. The HINT states +
+    # EXAMINER.generate_hint() + the dispatch branches come in a later
+    # Phase B.5 commit (B.5 item 2). For now, the flow stays:
+    # EVALUATE (failed) → REMEDIATE, same as Phase A.
     config = ctx.config
     mastery_threshold = getattr(config, "mastery_threshold", 0.7) if config else 0.7
     if session.last_score >= mastery_threshold:

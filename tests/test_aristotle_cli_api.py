@@ -156,7 +156,11 @@ class TestAPIRoutes:
 
     @pytest.mark.asyncio
     async def test_session_start_route(self):
-        """POST /aristotle/session/start returns a SessionContext with state=TEACH."""
+        """POST /aristotle/session/start returns a SessionContext with state=PREDICT.
+
+        Phase B.5: sessions now start at PREDICT (the generation effect —
+        learner guesses before teaching). Was state=TEACH in Phase A.
+        """
         from aristotle.api import session_start_route
 
         container = _make_container()
@@ -176,7 +180,7 @@ class TestAPIRoutes:
 
         result = await session_start_route(request)
         assert result["concept_id"] == "newton_first_law"
-        assert result["state"] == "TEACH"
+        assert result["state"] == "PREDICT"
 
     @pytest.mark.asyncio
     async def test_session_run_route(self):
