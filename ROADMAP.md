@@ -97,26 +97,24 @@ data is available once Phase A is complete; the GUI surface is the platform depe
 ---
 
 ## Phase B.5 — Research-Grounded Pedagogical Improvements
-*Tutoring loop upgrade from ADR-002 Rev 2. No external dependencies — can start immediately.*
-*Status: 🔲 PLANNED (spec committed 2026-06-19; awaiting DEFINER review of ADR-002)*
+*Tutoring loop upgrade from ADR-002 Rev 2. No external dependencies — shipped immediately.*
+*Status: ✅ COMPLETE — all 9 deliverables shipped (2026-06-19)*
 
-Phase B.5 layers the ADR-002 Rev 2 pedagogical upgrades onto the existing
-TEACH → PROBE → QUIZ → EVALUATE → REMEDIATE state machine. The state
-machine gains a PREDICT step and a hint ladder; SOCRATES gains faded
-worked examples; EXAMINER gains error diagnosis, transfer questions, and
-a cold-start check; MENTOR graduates from a single diagnostic sentence to
-a structured misconception log; the mastery model gets a BKT-inspired
-extension on top of SM-2.
+Phase B.5 layered the ADR-002 Rev 2 pedagogical upgrades onto the existing
+tutoring loop. The state machine now has PREDICT (generation effect) +
+HINT_1/HINT_2 (2-rung hint ladder); SOCRATES has mastery-adaptive faded
+worked examples; EXAMINER has error diagnosis, transfer questions, and a
+cold-start check; MENTOR writes a structured misconception log; the
+mastery model has a BKT-inspired `mastery_probability()` extension on top
+of SM-2; the session coordinator interleaves due review concepts.
 
-Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
-(Part A — §§2–8). Build order: ADR-002 §15 (9 items, listed in
-PLANNED_FEATURES.md → Phase B.5 table).
+All 9 ADR-002 §15 deliverables shipped across 8 commits. See
+PLANNED_FEATURES.md → Phase B.5 table for the commit map.
 
-**Gate:** None. Phase B.5 can ship incrementally alongside Phase D.
-
-**Open DEFINER decision blocking B.5:** ADR-002 §16 #4 — add
-`ActorResult.data` field to the platform Protocol (breaking change) or
-keep the error-as-payload pattern.
+**DEFINER decision resolved:** ADR-002 §16 #4 — `ActorResult.data` field
+added to the platform Protocol (Brain commit `ce44e53`). All ARISTOTLE
+actors migrated to `data=` (error-as-payload eliminated — see
+ARISTOTLE-DEBT-011).
 
 ---
 
@@ -201,6 +199,7 @@ ARISTOTLE depends on these platform capabilities (all in AIP_Brain `feat/multi-c
 |------|--------|--------|
 | 2026-06-18 | Created roadmap. Seeded with Phase A/B/C from ADR-001 §11. Phase A foundation done; near-term gates identified. | Super Z (main) |
 | 2026-06-19 | ADR-002 Rev 2 committed. Phase A and Phase B marked COMPLETE (verified via 2026-06-19 dogfood run). Phase B.5 added (research-grounded pedagogical improvements — no external dependencies). Phase D added (intake, placement, long-arc plan, OCR, voice — no external dependencies for core; web search unlocks material sourcing). Phase C unchanged (still gated on platform web/feed layer). | Super Z (main) |
+| 2026-06-19 | **Phase B.5 ✅ COMPLETE.** All 9 deliverables shipped: PREDICT step, HINT ladder, error diagnosis, faded worked examples, session interleaving, transfer questions, misconception log wiring, extended mastery model (mastery_probability), cold-start check. ActorResult.data migration complete for all actors. 89 tests, 0 warnings. Phase C unchanged (still gated on platform web/feed layer). | Super Z (main) |
 
 ---
 

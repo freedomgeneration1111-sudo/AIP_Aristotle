@@ -116,36 +116,35 @@ built. The tutoring loop ships without it; HERALD layers on when feeds land.
 
 ---
 
-## Status: Planned (Phase B.5 — Research-Grounded Pedagogical Improvements)
+## Status: ✅ COMPLETE (Phase B.5 — Research-Grounded Pedagogical Improvements)
 
 Phase B.5 is the ADR-002 Rev 2 pedagogical upgrade to the existing tutoring
-loop. **It is net-new and can start immediately** — none of its deliverables
-depend on the platform web/feed layer (Phase C gate) or on the
-intake/placement system (Phase D). The improvements land in the existing
-TEACH → PROBE → QUIZ → EVALUATE → REMEDIATE state machine and the existing
-SOCRATES / EXAMINER / MENTOR actors.
+loop. **All 9 deliverables shipped.** The improvements landed in the
+existing PREDICT → TEACH → PROBE → QUIZ → EVALUATE → [HINT_1 → HINT_2 →]
+REMEDIATE state machine and the existing SOCRATES / EXAMINER / MENTOR
+actors.
 
 Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
 (Part A — Pedagogical Core, §§2–8).
 
-Internal build order (from ADR-002 §15):
+Build order (from ADR-002 §15) — all COMPLETE:
 
-| # | Deliverable | Why it matters | Dependencies |
-|---|-------------|----------------|--------------|
-| 1 | **PREDICT step** in `session.py` + `aristotle_predict_event` table (M003 partial) | Pre-teaches a prediction; commits the learner before exposure. New SessionState, new schema, new EXAMINER method. | None beyond Phase A. |
-| 2 | **HINT_1 / HINT_2** SessionStates + `EXAMINER.generate_hint()` | Replaces the "give up and remediate" cliff with a 2-rung hint ladder before REMEDIATE. | None. |
-| 3 | **Error diagnosis** in `EXAMINER.evaluate()` | EVALUATE returns a structured error type (procedural vs. conceptual vs. misread), not just a score. Feeds MENTOR. | None. |
-| 4 | **Faded worked examples** in `SOCRATES.teach()` | Worked example → partially completed → learner completes. Reduces cognitive load on first exposure. | None. |
-| 5 | **Session interleaving** in the session coordinator | Mix new concepts with review of due concepts (SM-2 schedule), not blocked-by-prerequisite linear. | Existing SM-2 + concept DAG (built). |
-| 6 | **Transfer question type** in `EXAMINER.quiz()` | Recognition vs. transfer — different quiz types for different Bloom levels. | None. |
-| 7 | **`aristotle_misconception_log`** table (M003) + MENTOR misconception tracking | MENTOR stops writing a single diagnostic sentence and starts tracking a structured misconception history per student/concept. | None. |
-| 8 | **Extended mastery model** (M003 addition to `aristotle_mastery`) | Adds BKT-inspired fields (probability of mastery, last cold-check timestamp). Replaces pure SM-2 with a hybrid. | Existing `aristotle_mastery` (built). |
-| 9 | **`cold_start_check()`** in EXAMINER | Periodically re-verifies "mastered" concepts unassisted. Catches overreliance on hints / memorization. Recommended frequency: every 5th session per concept once mastered. | Extended mastery model (item 8). |
+| # | Deliverable | Status | Commit |
+|---|-------------|--------|--------|
+| 1 | **PREDICT step** + `aristotle_predict_event` table (M003) | ✅ | `6dfcb5d` |
+| 2 | **HINT_1 / HINT_2** SessionStates + `EXAMINER.generate_hint()` | ✅ | `e75906e` |
+| 3 | **Error diagnosis** in `EXAMINER.evaluate()` | ✅ | `95d00d2`+`a6cd987` |
+| 4 | **Faded worked examples** in `SOCRATES.teach()` (mastery-adaptive) | ✅ | `b803ef9` |
+| 5 | **Session interleaving** (concept queue with due reviews) | ✅ | `2079f0c` |
+| 6 | **Transfer question type** in `EXAMINER.quiz()` | ✅ | `0352708` |
+| 7 | **`aristotle_misconception_log`** (M003) + MENTOR misconception tracking | ✅ | `1be28f7` |
+| 8 | **Extended mastery model** — `mastery_probability()` BKT-inspired | ✅ | `d20fd3a` |
+| 9 | **`cold_start_check()`** — unassisted retrieval for mastered concepts | ✅ | `d20fd3a` |
 
-**Gate:** None. Phase B.5 can ship incrementally alongside Phase D.
-
-**Open DEFINER decisions blocking Phase B.5** (ADR-002 §16):
-- #4: `ActorResult.data` field — add to platform Protocol (breaking change) or keep error-as-payload? **Recommended:** add `data: Any = None`.
+**DEFINER decision resolved:** ADR-002 §16 #4 — `ActorResult.data` field
+added to the platform Protocol (Brain commit `ce44e53`). All ARISTOTLE
+actors now use `data=` (error-as-payload fully eliminated — see
+ARISTOTLE-DEBT-011).
 
 ---
 
@@ -300,6 +299,7 @@ instructions.
 | 2026-06-18 | Phase B (teacher dashboard) shipped: GET /aristotle/dashboard API (LEFT JOIN, all concepts, correct sort), /dashboard GUI page (3 panels: stats, struggle pattern, mastery table), nav registration ("Teach", order=35). Dashboard fix: LEFT JOIN so unstarted concepts appear + correct sort order (due → unstarted → mastered). | Super Z (main) |
 | 2026-06-19 | ADR-002 Rev 2 committed (`docs/decisions/ADR-002-intake-placement-learning-plan.md`). Added Phase B.5 (research-grounded pedagogical improvements — PREDICT, hints, error diagnosis, faded examples, interleaving, transfer questions, misconception log, mastery model extension, cold-start check) and Phase D (intake, placement, long-arc plan, OCR, voice) as planned phases with their ADR-002 §15 build orders. No code changes. | Super Z (main) |
 | 2026-06-19 | Added "Platform — Planned (Pre-ADR)" section with two entries: (1) Extension Corpus Isolation and Access Control — default isolation + configurable grants, enforcement at CorpusRegistry.get_stores(), ReadOnlyCorpusStores wrapper, ActorContext.extension_id, fully backwards-compatible; (2) Actor Prompt Customization — three-layer prompt composition (platform template + user instructions + per-actor override), ci_mode validation, extension_actor_instructions table, versioning on template bumps, UI in Phase D. Both pre-ADR — full spec before implementation. No code changes. | Super Z (main) |
+| 2026-06-19 | **Phase B.5 ✅ COMPLETE.** All 9 deliverables shipped across 8 commits: PREDICT step (6dfcb5d), HINT ladder (e75906e), error diagnosis (95d00d2+a6cd987), faded worked examples (b803ef9), session interleaving (2079f0c), transfer questions (0352708), misconception log wiring (1be28f7), extended mastery model + cold-start check (d20fd3a). ActorResult.data migration complete for all actors (ARISTOTLE-DEBT-011 resolved). 89 tests, 0 warnings. | Super Z (main) |
 
 ---
 
