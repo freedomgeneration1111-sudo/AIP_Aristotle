@@ -211,6 +211,13 @@ async def session_run_route(request: Request):
         elif session.state == SessionState.QUIZ and session.quiz_generated and answer_idx < len(answers):
             student_input = answers[answer_idx]
             answer_idx += 1
+        # HINT_1/HINT_2 phase 2: consume an answer for the re-evaluation
+        # after the learner sees the hint. Phase B.5 HINT ladder.
+        elif (session.state in (SessionState.HINT_1, SessionState.HINT_2)
+              and session.hint_generated
+              and answer_idx < len(answers)):
+            student_input = answers[answer_idx]
+            answer_idx += 1
 
         result = await run_session_step(ctx, session, student_input)
         steps.append({
@@ -420,6 +427,8 @@ def _session_to_dict(session: SessionContext) -> dict:
         "quiz_generated": session.quiz_generated,
         "probe_generated": session.probe_generated,
         "predict_generated": session.predict_generated,
+        "hint_count": session.hint_count,
+        "hint_generated": session.hint_generated,
     }
 
 
@@ -442,4 +451,6 @@ def _session_from_dict(d: dict) -> SessionContext:
         quiz_generated=d.get("quiz_generated", False),
         probe_generated=d.get("probe_generated", False),
         predict_generated=d.get("predict_generated", False),
+        hint_count=d.get("hint_count", 0),
+        hint_generated=d.get("hint_generated", False),
     )

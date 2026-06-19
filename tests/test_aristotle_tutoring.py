@@ -343,6 +343,92 @@ class TestExaminerMethods:
 
 
 # --------------------------------------------------------------------------
+# EXAMINER generate_hint tests (Phase B.5 HINT ladder)
+# --------------------------------------------------------------------------
+
+
+class TestExaminerHints:
+    """Phase B.5: ExaminerActor.generate_hint() returns graded hints.
+
+    The HINT ladder has 2 rungs: HINT_1 (gentle nudge, hint_count=0) and
+    HINT_2 (stronger clue, hint_count=1). Uses the new ActorResult.data
+    field (not error-as-payload).
+    """
+
+    @pytest.mark.asyncio
+    async def test_hint_1_returns_gentle_nudge(self):
+        """generate_hint(hint_count=0) returns ok=True with data.hint as a string.
+
+        HINT_1 is a gentle nudge — does not give the answer. The fake model
+        returns a canned hint; we verify the data field is used + the hint
+        is non-empty.
+        """
+        fake = _FakeModelProvider(responses={
+            "evaluation": "Think about what happens to a passenger when a bus brakes suddenly.",
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.generate_hint(ctx, "c1", hint_count=0)
+        assert result.ok
+        # The hint is in result.data["hint"], not result.error
+        assert result.data is not None
+        assert isinstance(result.data, dict)
+        assert "hint" in result.data
+        assert isinstance(result.data["hint"], str)
+        assert len(result.data["hint"]) > 0
+        # The hint should call the evaluation slot
+        assert len(fake.calls) == 1
+        assert fake.calls[0][0] == "evaluation"
+
+    @pytest.mark.asyncio
+    async def test_hint_2_returns_stronger_clue(self):
+        """generate_hint(hint_count=1) returns ok=True with a stronger-clue hint.
+
+        HINT_2 is a near-direct clue — may name the key term/formula but
+        still preserves some effort. We verify the data field is used +
+        the system prompt sent to the model mentions 'STRONGER HINT'.
+        """
+        fake = _FakeModelProvider(responses={
+            "evaluation": "The answer relates to inertia — objects tend to keep doing what they're doing unless a force acts on them. What's the specific term?",
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.generate_hint(ctx, "c1", hint_count=1)
+        assert result.ok
+        assert result.data is not None
+        assert isinstance(result.data, dict)
+        assert "hint" in result.data
+        assert len(result.data["hint"]) > 0
+        # The system prompt for HINT_2 should mention "STRONGER HINT"
+        system_msg = fake.calls[0][1][0]["content"]  # first message = system
+        assert "STRONGER HINT" in system_msg
+
+    @pytest.mark.asyncio
+    async def test_hint_concept_not_found(self):
+        """generate_hint() returns ok=False with 'not found' in error when concept missing."""
+        fake = _FakeModelProvider()
+        conn = _FakeConn(rows=None)  # no rows → concept not found
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.generate_hint(ctx, "nonexistent", hint_count=0)
+        assert not result.ok
+        assert "not found" in result.error
+        # data should be None on failure
+        assert result.data is None
+
+    @pytest.mark.asyncio
+    async def test_hint_returns_needs_configuration_without_model(self):
+        """generate_hint() returns NEEDS_CONFIGURATION without a model provider."""
+        examiner = ExaminerActor()
+        ctx = _make_ctx(model_provider=None, stores=_FakeStores(_FakeConn()))
+        result = await examiner.generate_hint(ctx, "c1", hint_count=0)
+        assert not result.ok
+        assert "NEEDS_CONFIGURATION" in result.error
+
+
+# --------------------------------------------------------------------------
 # MENTOR update_struggle_pattern tests
 # --------------------------------------------------------------------------
 
@@ -436,3 +522,110 @@ class TestSessionCoordinator:
         result = await run_session_step(ctx, session)
         assert result.ok
         assert session.state == SessionState.PROBE
+
+    @pytest.mark.asyncio
+    async def test_session_routes_to_hint1_on_wrong_answer(self):
+        """EVALUATE with a failing score + hint_count=0 routes to HINT_1.
+
+        Phase B.5 HINT ladder (ADR-002 Rev 2 §3): on a failed quiz, the
+        learner gets a 2-rung hint ladder before REMEDIATE. The first
+        wrong answer routes to HINT_1 (not REMEDIATE).
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        # Failing evaluation JSON (score 0.3 < 0.7 mastery_threshold)
+        eval_json = json.dumps({"score": 0.3, "mastery_achieved": False, "feedback": "Try again"})
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+            "sexton": "Learner struggles with inertia.",
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        # Start at EVALUATE with hint_count=0 (no hints given yet).
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.EVALUATE,
+            hint_count=0,
+            last_quiz_question="What is inertia?",
+            last_student_answer="I don't know",
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        assert session.state == SessionState.HINT_1, (
+            f"EVALUATE with hint_count=0 + failing score should route to "
+            f"HINT_1, got {session.state}"
+        )
+        assert session.hint_count == 0  # hint_count not yet incremented
+        assert session.hint_generated is False  # HINT_1 phase 1 not started
+
+    @pytest.mark.asyncio
+    async def test_session_routes_to_remediate_after_two_hints(self):
+        """After HINT_1 + HINT_2 both fail, the session routes to REMEDIATE.
+
+        Phase B.5 HINT ladder: both hints exhausted → REMEDIATE (not
+        NEXT_CONCEPT). This test drives the session through EVALUATE →
+        HINT_1 → HINT_2 → REMEDIATE by simulating the two-phase HINT
+        steps with a fake model that always returns a failing evaluation.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        # Failing evaluation JSON for every re-evaluation
+        eval_json = json.dumps({"score": 0.3, "mastery_achieved": False, "feedback": "Try again"})
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+            "sexton": "Learner struggles with inertia.",
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.EVALUATE,
+            hint_count=0,
+            last_quiz_question="What is inertia?",
+            last_student_answer="I don't know",
+        )
+
+        # Step 1: EVALUATE → HINT_1 (hint_count=0, failing score)
+        await run_session_step(ctx, session)
+        assert session.state == SessionState.HINT_1
+
+        # Step 2: HINT_1 phase 1 — generate hint (no student_input)
+        await run_session_step(ctx, session)
+        assert session.hint_generated is True
+
+        # Step 3: HINT_1 phase 2 — re-evaluate with student_input (still wrong)
+        await run_session_step(ctx, session, student_input="still wrong")
+        assert session.state == SessionState.HINT_2, (
+            f"After HINT_1 fails, should route to HINT_2, got {session.state}"
+        )
+        assert session.hint_count == 1
+
+        # Step 4: HINT_2 phase 1 — generate hint (no student_input)
+        await run_session_step(ctx, session)
+        assert session.hint_generated is True
+
+        # Step 5: HINT_2 phase 2 — re-evaluate with student_input (still wrong)
+        await run_session_step(ctx, session, student_input="still wrong again")
+        assert session.state == SessionState.REMEDIATE, (
+            f"After HINT_2 fails, should route to REMEDIATE, got {session.state}"
+        )
+        assert session.hint_count == 2
+        assert session.retry_count == 1  # REMEDIATE incremented retry_count

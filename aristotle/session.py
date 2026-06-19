@@ -34,20 +34,26 @@ from aip.foundation.protocols.actors import ActorContext, ActorResult
 class SessionState(str, Enum):
     """The tutoring state machine states (ADR-001 §3 + ADR-002 Rev 2 §3).
 
-    Phase B.5 adds PREDICT as the initial state (the generation effect —
-    the learner commits to a guess before seeing the explanation). The
-    full Phase B.5 flow is:
-      PREDICT → TEACH → PROBE → QUIZ → EVALUATE → [HINT_1 → HINT_2 →]
-      REMEDIATE
-    The HINT ladder (HINT_1, HINT_2) slots between EVALUATE and
-    REMEDIATE and comes in a later commit — leave a TODO marker where
-    they will slot in (see _step_evaluate's branch + the dispatch below).
+    Phase B.5 adds PREDICT (initial state — generation effect) + HINT_1/HINT_2
+    (2-rung hint ladder between EVALUATE and REMEDIATE). The full Phase B.5
+    flow is:
+      PREDICT → TEACH → PROBE → QUIZ → EVALUATE →
+        if correct: NEXT_CONCEPT
+        if wrong, hint_count == 0: HINT_1
+        if wrong, hint_count == 1: HINT_2
+        if wrong, hint_count >= 2: REMEDIATE
+      HINT_1/HINT_2 are two-phase: phase 1 generates the hint, phase 2
+      (with student_input) re-evaluates. Correct after a hint →
+      hint_assisted_correct++ on aristotle_mastery, then NEXT_CONCEPT.
+      Still wrong after HINT_2 → REMEDIATE.
     """
     PREDICT = "PREDICT"
     TEACH = "TEACH"
     PROBE = "PROBE"
     QUIZ = "QUIZ"
     EVALUATE = "EVALUATE"
+    HINT_1 = "HINT_1"
+    HINT_2 = "HINT_2"
     REMEDIATE = "REMEDIATE"
     NEXT_CONCEPT = "NEXT_CONCEPT"
     SESSION_COMPLETE = "SESSION_COMPLETE"
@@ -63,6 +69,11 @@ class SessionContext:
     The PREDICT step asks the learner to guess before teaching — the
     generation effect. `last_prediction` records the learner's
     prediction text so it can be logged to aristotle_predict_event.
+
+    Phase B.5 (HINT ladder): `hint_count` tracks how many hints have
+    been given (0, 1, or 2). `hint_generated` tracks whether the
+    current HINT_1/HINT_2 step has generated its hint (phase 1 done,
+    waiting for learner's re-answer in phase 2).
     """
     student_id: str = "definer"
     concept_id: str = ""
@@ -87,6 +98,12 @@ class SessionContext:
     # Phase B.5: track whether the predict prompt has been generated
     # (waiting for learner's prediction response)
     predict_generated: bool = False
+    # Phase B.5 (HINT ladder): number of hints given so far (0, 1, or 2).
+    # Checked at EVALUATE branch: 0 → HINT_1, 1 → HINT_2, >=2 → REMEDIATE.
+    hint_count: int = 0
+    # Phase B.5 (HINT ladder): whether the current HINT_1/HINT_2 step has
+    # generated its hint (phase 1 done, waiting for learner's re-answer).
+    hint_generated: bool = False
 
 
 async def run_session_step(
@@ -115,8 +132,12 @@ async def run_session_step(
     - PROBE → display the probe question, wait for learner's response
     - QUIZ → display the quiz question, wait for learner's answer
     - EVALUATE → display the evaluation, session.state advances automatically
-      (Phase B.5 TODO: HINT_1/HINT_2 will slot here on a failed quiz,
-      before REMEDIATE — see _step_evaluate's branch below)
+      (Phase B.5 HINT ladder: on a failed quiz, routes to HINT_1, HINT_2,
+      or REMEDIATE based on hint_count — see _step_evaluate's branch below)
+    - HINT_1 → display the first hint (gentle nudge), wait for learner's
+      re-answer. Re-evaluates; correct → NEXT_CONCEPT, still wrong → HINT_2.
+    - HINT_2 → display the second hint (stronger clue), wait for learner's
+      re-answer. Re-evaluates; correct → NEXT_CONCEPT, still wrong → REMEDIATE.
     - REMEDIATE → display the re-teaching, session.state advances to PROBE
     - NEXT_CONCEPT → session complete for this concept
     - SESSION_COMPLETE → no more concepts
@@ -162,6 +183,10 @@ async def run_session_step(
         return await _step_quiz(ctx, session, examiner, student_input)
     elif session.state == SessionState.EVALUATE:
         return await _step_evaluate(ctx, session, examiner, mentor)
+    elif session.state == SessionState.HINT_1:
+        return await _step_hint(ctx, session, examiner, mentor, student_input, hint_rung=1)
+    elif session.state == SessionState.HINT_2:
+        return await _step_hint(ctx, session, examiner, mentor, student_input, hint_rung=2)
     elif session.state == SessionState.REMEDIATE:
         return await _step_remediate(ctx, session, socrates, mentor)
     elif session.state == SessionState.NEXT_CONCEPT:
@@ -405,31 +430,224 @@ async def _step_evaluate(
     # Update SM-2 + mastery state
     await _update_mastery(ctx, session)
 
-    # Branch: mastered → next concept; struggling → remediate
-    # Phase B.5 TODO: HINT_1/HINT_2 will slot here. On a failed quiz (score
-    # below mastery_threshold), the next state should be HINT_1 (not
-    # REMEDIATE directly). HINT_1 → HINT_2 → REMEDIATE gives the learner a
-    # 2-rung hint ladder before the full re-teaching. The HINT states +
-    # EXAMINER.generate_hint() + the dispatch branches come in a later
-    # Phase B.5 commit (B.5 item 2). For now, the flow stays:
-    # EVALUATE (failed) → REMEDIATE, same as Phase A.
+    # Branch: mastered → next concept; struggling → hint ladder or remediate.
+    # Phase B.5 HINT ladder (ADR-002 Rev 2 §3): on a failed quiz, route to
+    # HINT_1 (first hint), HINT_2 (second hint), or REMEDIATE based on
+    # hint_count. The hint ladder gives the learner a 2-rung chance to
+    # self-correct before the full re-teaching. hint_count tracks how many
+    # hints have been given so far in this session for this concept.
     config = ctx.config
     mastery_threshold = getattr(config, "mastery_threshold", 0.7) if config else 0.7
     if session.last_score >= mastery_threshold:
         session.state = SessionState.NEXT_CONCEPT
     else:
-        if session.retry_count < session.max_retries:
-            session.state = SessionState.REMEDIATE
-            session.retry_count += 1
+        # Failed quiz — consult hint_count for the next step.
+        if session.hint_count == 0:
+            session.state = SessionState.HINT_1
+            session.hint_generated = False  # reset for the new HINT step
+        elif session.hint_count == 1:
+            session.state = SessionState.HINT_2
+            session.hint_generated = False
         else:
-            # Max retries — move on (the learner needs a human teacher)
-            session.state = SessionState.NEXT_CONCEPT
+            # hint_count >= 2 — both hints exhausted, remediate.
+            # Respect max_retries: if we've already remediated max_retries
+            # times, move on (the learner needs a human teacher).
+            if session.retry_count < session.max_retries:
+                session.state = SessionState.REMEDIATE
+                session.retry_count += 1
+            else:
+                session.state = SessionState.NEXT_CONCEPT
 
     logger.info(
         "session_step_evaluate concept=%s score=%.2f mastered=%s state=%s",
         session.concept_id, session.last_score, session.mastered, session.state.value,
     )
     return ActorResult(ok=True, error=session.last_evaluation)
+
+
+async def _step_hint(
+    ctx: ActorContext,
+    session: SessionContext,
+    examiner: Any,
+    mentor: Any,
+    student_input: str,
+    *,
+    hint_rung: int,
+) -> ActorResult:
+    """HINT_1/HINT_2: EXAMINER gives a graded hint, learner re-answers (ADR-002 Rev 2 §3).
+
+    Two-phase (like QUIZ + PREDICT):
+      Phase 1 (hint_generated=False): call examiner.generate_hint() with the
+        current hint_count. Returns a gentle nudge (HINT_1) or a stronger
+        clue (HINT_2). Display the hint, wait for the learner's re-answer.
+      Phase 2 (hint_generated=True, student_input non-empty): the learner has
+        seen the hint + provided a new answer. Re-evaluate via
+        examiner.evaluate(). Then route:
+        - correct (score >= mastery_threshold) → increment hint_assisted_correct
+          on aristotle_mastery, advance to NEXT_CONCEPT.
+        - still wrong, hint_rung == 1 → advance to HINT_2 (hint_count becomes 1).
+        - still wrong, hint_rung == 2 → advance to REMEDIATE (hint_count
+          becomes 2; retry_count incremented).
+
+    Args:
+        hint_rung: 1 for HINT_1, 2 for HINT_2. Passed to
+            examiner.generate_hint() so it knows which hint strength to give.
+    """
+    logger = ctx.logger
+
+    if not session.hint_generated:
+        # Phase 1: generate the hint.
+        result = await examiner.generate_hint(ctx, session.concept_id, session.hint_count)
+        if result.ok:
+            session.hint_generated = True
+            # If student_input was provided (non-interactive mode), proceed
+            # to phase 2 immediately in the same call.
+            if student_input:
+                return await _hint_phase2(ctx, session, examiner, mentor, student_input, hint_rung)
+            logger.info(
+                "session_step_hint_generate concept=%s rung=%d",
+                session.concept_id, hint_rung,
+            )
+        return result
+    else:
+        # Phase 2: learner's re-answer arrived.
+        return await _hint_phase2(ctx, session, examiner, mentor, student_input, hint_rung)
+
+
+async def _hint_phase2(
+    ctx: ActorContext,
+    session: SessionContext,
+    examiner: Any,
+    mentor: Any,
+    student_input: str,
+    hint_rung: int,
+) -> ActorResult:
+    """Phase 2 of a HINT step: re-evaluate the learner's new answer + route.
+
+    Extracted from _step_hint so both the interactive path (phase 1 returns,
+    phase 2 called on next step) and the non-interactive path (both phases
+    in one call) share the same routing logic.
+    """
+    logger = ctx.logger
+
+    if student_input:
+        session.last_student_answer = student_input
+
+    # Re-evaluate with the new answer (same quiz question, new answer).
+    eval_result = await examiner.evaluate(
+        ctx, session.concept_id,
+        student_answer=session.last_student_answer,
+        quiz_question=session.last_quiz_question,
+    )
+    if not eval_result.ok:
+        return eval_result
+
+    session.last_evaluation = eval_result.error or ""
+
+    # Parse the new score (same logic as _step_evaluate).
+    import json
+    try:
+        eval_data = json.loads(session.last_evaluation)
+        session.last_score = float(eval_data.get("score", 0.0))
+        session.mastered = bool(eval_data.get("mastery_achieved", False))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        session.last_score = 0.0
+        session.mastered = False
+        logger.warning(
+            "session_hint_eval_parse_failed concept=%s raw=%s",
+            session.concept_id, session.last_evaluation[:200],
+        )
+
+    # MENTOR updates the struggle_pattern (non-fatal on failure).
+    mentor_result = await mentor.update_struggle_pattern(
+        ctx, session.concept_id, session.last_evaluation,
+    )
+    if not mentor_result.ok:
+        logger.warning(
+            "session_hint_mentor_update_failed concept=%s error=%s",
+            session.concept_id, mentor_result.error,
+        )
+
+    # Update SM-2 + mastery state (same as _step_evaluate).
+    await _update_mastery(ctx, session)
+
+    # Route based on the new score.
+    config = ctx.config
+    mastery_threshold = getattr(config, "mastery_threshold", 0.7) if config else 0.7
+
+    if session.last_score >= mastery_threshold:
+        # Correct after a hint — increment hint_assisted_correct on
+        # aristotle_mastery (the column exists from M003). Best-effort:
+        # a DB failure here is non-fatal (the mastery row already exists
+        # from _update_mastery; we're just incrementing a counter).
+        await _increment_hint_assisted_correct(ctx, session)
+        session.state = SessionState.NEXT_CONCEPT
+        logger.info(
+            "session_hint_correct_after_hint concept=%s rung=%d score=%.2f",
+            session.concept_id, hint_rung, session.last_score,
+        )
+    else:
+        # Still wrong after this hint. Increment hint_count + route.
+        session.hint_count = hint_rung  # hint_rung is 1 or 2; this sets hint_count to match
+        if hint_rung == 1:
+            # Was HINT_1, still wrong → HINT_2.
+            session.state = SessionState.HINT_2
+            session.hint_generated = False  # reset for HINT_2's phase 1
+            logger.info(
+                "session_hint_still_wrong concept=%s rung=1 → HINT_2",
+                session.concept_id,
+            )
+        else:
+            # hint_rung == 2, still wrong → REMEDIATE.
+            # Respect max_retries: if we've already remediated max_retries
+            # times, move on (the learner needs a human teacher).
+            if session.retry_count < session.max_retries:
+                session.state = SessionState.REMEDIATE
+                session.retry_count += 1
+                session.hint_generated = False  # reset for any future HINT
+                logger.info(
+                    "session_hint_still_wrong concept=%s rung=2 → REMEDIATE retry=%d",
+                    session.concept_id, session.retry_count,
+                )
+            else:
+                session.state = SessionState.NEXT_CONCEPT
+                logger.info(
+                    "session_hint_still_wrong concept=%s rung=2 → NEXT_CONCEPT (max retries)",
+                    session.concept_id,
+                )
+
+    return ActorResult(ok=True, error=session.last_evaluation)
+
+
+async def _increment_hint_assisted_correct(
+    ctx: ActorContext, session: SessionContext
+) -> None:
+    """Increment hint_assisted_correct on aristotle_mastery (ADR-002 §10.6, M003).
+
+    Called when the learner gets the answer right after seeing a hint. The
+    column was added by M003. Best-effort: non-fatal on DB failure (the
+    mastery row already exists from _update_mastery; we're just incrementing
+    a counter).
+    """
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        await conn.execute(
+            "UPDATE aristotle_mastery SET hint_assisted_correct = hint_assisted_correct + 1 "
+            "WHERE student_id = ? AND concept_id = ?",
+            (session.student_id, session.concept_id),
+        )
+        await conn.commit()
+    except Exception as exc:
+        ctx.logger.warning(
+            "session_hint_assisted_correct_increment_failed concept=%s error=%s:%s",
+            session.concept_id, type(exc).__name__, exc,
+        )
 
 
 async def _step_remediate(
