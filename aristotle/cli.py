@@ -75,7 +75,7 @@ def health(ctx: click.Context) -> None:
     """Check extension health + Aristotelan status."""
     with _client(ctx.obj["base_url"]) as client:
         try:
-            resp = client.get("/health/extensions")
+            resp = client.get("/api/v1/health/extensions")
             resp.raise_for_status()
             data = resp.json()
             click.echo(f"Host running: {data.get('host_running', False)}")

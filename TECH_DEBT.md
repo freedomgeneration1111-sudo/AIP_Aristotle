@@ -321,3 +321,94 @@ pre-alpha trade-off.
 - `AIP_Brain/gui/theme.py` (the theme constants)
 - `tests/test_import_boundary.py` (doesn't catch this — `gui.*` isn't `aip.*`)
 
+---
+
+## ARISTOTLE-DEBT-009 — CLI `health` hit wrong URL (404 against real server)
+
+**Status:** Resolved — fixed 2026-06-19 during dogfood
+**Phase:** CLI
+**Filed:** 2026-06-19
+
+**What was broken:**
+`aristotle/cli.py:78` called `client.get("/health/extensions")`, but the
+Brain platform mounts the health router with `prefix="/api/v1"` — so the
+real URL is `/api/v1/health/extensions`. Running `aristotle health`
+against a live Brain server returned `404 Not Found`, and the CLI
+printed `ERROR: Client error '404 Not Found' for url
+'http://127.0.0.1:8000/health/extensions'` and exited 1.
+
+The other CLI commands (`ingest`, `list-concepts`, `session`) worked
+because they hit `/aristotle/*` (no `/api/v1` prefix — Aristotle's
+router is mounted without a prefix).
+
+The 8 CLI tests in `tests/test_aristotle_cli_api.py` didn't catch this
+because they `patch("aristotle.cli._client")` with a MagicMock — the
+mock returns a 200-style response regardless of which URL the CLI
+actually requests. There is no integration test that exercises the real
+URL path against a real (or test-client) server.
+
+**Resolution:**
+One-line fix: `client.get("/health/extensions")` → `client.get("/api/v1/health/extensions")`.
+
+**Recommended follow-up:**
+Add an integration test that uses FastAPI's `TestClient` against the
+real `create_app()` to verify each CLI URL resolves (no mock). This
+would also have caught the platform-side bug
+(AIP_BRAIN DEBT-013) where Aristotle's routers weren't mounted at all.
+
+**Related work:**
+- `aristotle/cli.py:78` (the URL)
+- `tests/test_aristotle_cli_api.py:312` (mocks `_client`, hides URL bugs)
+
+---
+
+## ARISTOTLE-DEBT-010 — EXAMINER CI-fixture breaks EVALUATE JSON parse (student always fails in CI mode)
+
+**Status:** Open
+**Phase:** Tutoring loop / CI mode
+**Filed:** 2026-06-19
+
+**What's broken:**
+The session coordinator (`aristotle/session.py::_step_evaluate`) expects
+EXAMINER's `evaluate()` to return JSON `{score, mastery_achieved, feedback}`,
+which it parses with `json.loads(session.last_evaluation)`. In CI mode,
+however, the platform's `ModelSlotResolver` returns a plain-text fixture
+like `[CI-FIXTURE for evaluation] Concept: Newton's First Law...` for
+the `evaluation` slot. `json.loads` raises `JSONDecodeError`, the
+coordinator catches it and defaults to `score=0.0, mastered=False`, and
+the learner can never reach the mastery threshold — every session
+exhausts `max_retries=2` and exits with `mastered=False`.
+
+Observed during dogfood (2026-06-19): `aristotle session newton_first_law
+--answer "objects resist changes in motion"` produced a 14-step session
+with three EVALUATE attempts, all parsing as score=0.0, ending
+`Mastered: False, Final score: 0.0`. The struggle-pattern table also
+fills with concatenated `[CI-FIXTURE for sexton]` prefixes because
+MENTOR keeps re-reading the prior pattern and prepending the fixture.
+
+**Why deferred:**
+In production (real LLM), EXAMINER is prompted to return strict JSON and
+this works. The bug only manifests in CI mode, where it's "expected"
+that fixtures don't drive real learning — but it makes the dogfood
+smoke test misleading (the loop runs, but the learner can never succeed).
+
+**Recommended fix (one of):**
+1. Have `ModelSlotResolver` return valid JSON for the `evaluation` slot
+   when `ci_mode=True` (e.g. `{"score": 0.8, "mastery_achieved": true,
+   "feedback": "[CI-FIXTURE]"}`). This is the cleanest fix because it
+   makes CI-mode sessions actually exercise the mastered=True branch.
+2. Have `ExaminerActor.evaluate()` detect `ci_mode` and synthesize a
+   valid JSON response itself, bypassing the model call.
+3. Have `_step_evaluate` treat a non-JSON response as a soft pass
+   (score=0.5, mastered=False) rather than a hard zero — at least the
+   learner wouldn't always fail.
+
+Option 1 is preferred because it fixes the root cause and lets CI mode
+verify the mastered branch end-to-end.
+
+**Related work:**
+- `aristotle/session.py:_step_evaluate` (the `json.loads` + fallback)
+- `aristotle/actors/examiner.py` (evaluate prompt — should enforce JSON)
+- `AIP_Brain/src/aip/adapter/model_slot_resolver.py` (CI fixture format)
+- `tests/test_aristotle_tutoring.py` — likely uses a stub that returns
+  valid JSON directly, masking this in unit tests.
