@@ -28,3 +28,9 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Runtime SQLite databases (e.g. aristotle/textbook.db from dogfood runs).
+# Covers the main DB file + SQLite WAL mode sidecar files (-shm, -wal).
+*.db
+*.db-shm
+*.db-wal
