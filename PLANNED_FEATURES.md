@@ -188,6 +188,110 @@ from Phase B.5's cold-start check but can ship a simpler version first.
 
 ---
 
+## Status: Platform — Planned (Pre-ADR)
+
+Two architectural directions were discussed but are not yet fully
+architected. Captured here so they don't get lost. **No ADR numbers
+yet — these are pre-ADR.** A full spec must be written + reviewed as
+an ADR before any implementation work begins. Both directions have no
+external blockers — they ship on the AIP_Brain platform side, consumed
+by ARISTOTLE + future extensions.
+
+### Entry 1 — Extension Corpus Isolation and Access Control
+
+**Problem:** Today every extension can reach every corpus via
+`CorpusRegistry.get_stores(corpus_id)`. This works for a single
+extension (ARISTOTLE) but does not scale to a multi-extension future
+where extensions owned by different authors must not freely read each
+other's data (e.g. a third-party "study buddy" extension must not
+silently read ARISTOTLE's per-student struggle patterns without an
+explicit grant).
+
+**Default:** each extension owns its contributed corpus in isolation.
+No other extension can read or write it without an explicit grant.
+
+**Mechanism:**
+- **Manifest declares corpus ownership + access requests.** An
+  extension's manifest lists the corpora it contributes (owns) and the
+  corpora it wants to read (or read/write) from other extensions.
+- **Runtime grant table** stores approvals (operator-approved or
+  auto-approved in dev mode). A grant is `(requesting_ext_id,
+  target_corpus_id, access_level)` where `access_level ∈ {read,
+  read_write}`.
+- **Dev mode auto-approves** declared requests — keeps the dogfood
+  loop friction-free. Production requires explicit operator approval
+  (a platform-side admin UI or config file).
+- **Enforcement at `CorpusRegistry.get_stores()`.** Add an optional
+  `requesting_extension_id: str | None` param. When non-None, the
+  registry checks the grant table before returning stores. `None`
+  means "platform-internal call" (unrestricted — backwards-compatible).
+- **`ReadOnlyCorpusStores` wrapper** enforces read grants — wraps the
+  real `CorpusStores` and blocks write methods (`execute`, `commit`,
+  etc.) when the grant is read-only.
+- **Sensitive corpus flag (ADR-008) composes with grants** — both must
+  pass. A sensitive corpus requires BOTH a grant AND the existing
+  sensitivity checks. Neither alone is sufficient.
+- **`ActorContext` gains `extension_id`** so actors know which
+  extension they're running under. The host sets this at actor
+  registration time. Actors pass it through to
+  `corpus_registry.get_stores(corpus_id, requesting_extension_id=...)`.
+
+**Backwards compatibility:** Fully backwards-compatible.
+`requesting_extension_id=None` (the default) means "unrestricted
+platform call" — every existing call site continues to work unchanged.
+The new enforcement only activates when a non-None extension_id is
+passed. ARISTOTLE + future extensions opt in incrementally.
+
+**No external blockers.** Pre-ADR — full spec before implementation.
+
+### Entry 2 — Actor Prompt Customization
+
+**Problem:** Today actor prompts are hardcoded in the actor's Python
+source (e.g. `SocratesActor._build_system_prompt`, `_build_teach_prompt`).
+The learner (or teacher) cannot customize how Aristotle talks to them
+without editing source code. Phase D's onboarding flow surfaces this —
+a learner who wants Aristotle to "use cricket analogies" or "avoid
+Urdu transliteration" has no way to express that.
+
+**Design:**
+- **Actor prompts composed of three layers:**
+  1. **Platform-managed template** (versioned, not user-editable).
+     Ships with the extension. Updated on extension version bumps.
+  2. **User instructions slot** (editable). Stored per-learner (or
+     per-teacher for class-wide overrides). Free text.
+  3. **Optional per-actor override** on top of global extension
+     instructions. Lets a learner say "for SOCRATES specifically, be
+     more concise" without changing EXAMINER or MENTOR.
+- **Resolution order:** `template + global_instructions + actor_override`.
+  The final prompt sent to the model is the template with the user
+  instructions + per-actor override appended (or injected at a marker).
+- **Reset = clear user instructions, template unchanged.** A learner
+  can always return to the extension's default voice.
+- **Validation:** run the customized prompt through `ci_mode` before
+  accepting it. Catches prompt injections or formatting that breaks
+  the model's expected input shape. Reject + explain on failure.
+- **DB:** `extension_actor_instructions` table —
+  `(extension_id, actor_id_or_global, instructions, updated_at,
+  template_version)`. `actor_id_or_global = 'global'` for the
+  extension-wide instructions; a specific actor name for per-actor
+  overrides.
+- **Versioning:** when the platform template is updated (extension
+  version bump), flag every customized actor row so the UI can prompt
+  the learner: "Aristotle's default voice changed. Keep your
+  customization, or reset to the new default?"
+- **Ownership split:** Platform owns the mechanism (the table, the
+  resolution, the validation). Extension owns its default templates.
+  UI (learner settings page) ships in Phase D.
+
+**Backwards compatibility:** Fully backwards-compatible. Empty user
+instructions + empty per-actor override = the template alone (today's
+behavior). The resolution layer is a no-op until a learner sets
+instructions.
+
+**No external blockers.** Pre-ADR — full spec before implementation.
+
+---
+
 ## Change Log
 
 | Date | Change | Agent |
@@ -195,6 +299,7 @@ from Phase B.5's cold-start check but can ship a simpler version first.
 | 2026-06-18 | Created file. Seeded with Phase A dogfood status + Near-Term/Long-Term from ADR-001 §11. | Super Z (main) |
 | 2026-06-18 | Phase B (teacher dashboard) shipped: GET /aristotle/dashboard API (LEFT JOIN, all concepts, correct sort), /dashboard GUI page (3 panels: stats, struggle pattern, mastery table), nav registration ("Teach", order=35). Dashboard fix: LEFT JOIN so unstarted concepts appear + correct sort order (due → unstarted → mastered). | Super Z (main) |
 | 2026-06-19 | ADR-002 Rev 2 committed (`docs/decisions/ADR-002-intake-placement-learning-plan.md`). Added Phase B.5 (research-grounded pedagogical improvements — PREDICT, hints, error diagnosis, faded examples, interleaving, transfer questions, misconception log, mastery model extension, cold-start check) and Phase D (intake, placement, long-arc plan, OCR, voice) as planned phases with their ADR-002 §15 build orders. No code changes. | Super Z (main) |
+| 2026-06-19 | Added "Platform — Planned (Pre-ADR)" section with two entries: (1) Extension Corpus Isolation and Access Control — default isolation + configurable grants, enforcement at CorpusRegistry.get_stores(), ReadOnlyCorpusStores wrapper, ActorContext.extension_id, fully backwards-compatible; (2) Actor Prompt Customization — three-layer prompt composition (platform template + user instructions + per-actor override), ci_mode validation, extension_actor_instructions table, versioning on template bumps, UI in Phase D. Both pre-ADR — full spec before implementation. No code changes. | Super Z (main) |
 
 ---
 
