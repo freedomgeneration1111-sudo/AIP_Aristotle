@@ -439,3 +439,51 @@ strict-JSON slot, the same pattern (slot-specific fixture in
 - `aristotle/actors/examiner.py` (evaluate prompt — unchanged, still enforces JSON contract for real LLM)
 - `tests/test_aristotle_tutoring.py` (uses `_FakeModelProvider` stub — masks this in unit tests; recommend adding an integration test that exercises the real resolver in CI mode)
 - `/home/z/my-project/scripts/verify_debt010_fix.py` (end-to-end verification script)
+
+---
+
+## ARISTOTLE-DEBT-011 — probe() error-as-payload migration (side-effect resolved)
+
+**Status:** Resolved — migrated as a side effect of TASK 2 (commit 0352708)
+**Scope:** `aristotle/actors/examiner.py` probe() + `aristotle/session.py` _step_probe
+**Filed:** 2026-06-19
+
+**Original issue (as filed):**
+`probe()` used the error-as-payload pattern
+(`ActorResult(ok=True, error=question_text)`). The session coordinator
+read `result.error` in `_step_probe`. This was inconsistent with the
+migrated actors (evaluate(), teach(), quiz() all use `ActorResult.data`).
+
+**Resolution (side effect):**
+TASK 2 (B.5 item 6 — transfer questions) migrated `_generate_question()`
+— the shared helper used by BOTH `probe()` and `quiz()` — from
+`error=question` to `data={"question": ..., "question_type": ...}`. This
+migrated `probe()` automatically. `_step_probe` in session.py was updated
+to read `result.data` (with a backward-compat fallback to `result.error`).
+
+**Why this was filed as Open but resolved as a side effect:**
+The original TASK 3 spec assumed `probe()` would NOT be migrated in
+TASK 2. In practice, `probe()` and `quiz()` share `_generate_question()`,
+so migrating `quiz()` necessarily migrated `probe()` too. The migration
+is correct — there's no reason to keep `probe()` on error-as-payload when
+its sibling `quiz()` uses `data=`. The debt entry is preserved for
+traceability + to document the side-effect resolution.
+
+**Current state:**
+All four ARISTOTLE actors now use `ActorResult.data`:
+  - `evaluate()` → `data={score, mastery_achieved, feedback, diagnosis}`
+  - `teach()` → `data={explanation, fading_mode}`
+  - `quiz()` → `data={question, question_type}`
+  - `probe()` → `data={question, question_type}` (via shared _generate_question)
+  - `predict()` → `data={prompt}` (was already on data= from the PREDICT commit)
+  - `generate_hint()` → `data={hint}` (was already on data= from the HINT ladder commit)
+  - `log_misconception()` → `data={logged, ...}` (was already on data= from the misconception-log commit)
+
+The error-as-payload pattern is now fully eliminated from ARISTOTLE. The
+platform-wide soft-deprecation (Brain DEBT-015) is on track.
+
+**Related work:**
+- `aristotle/actors/examiner.py:_generate_question()` (the shared helper — migrated in commit 0352708)
+- `aristotle/session.py:_step_probe()` (reads result.data with backward-compat fallback)
+- `tests/test_aristotle_tutoring.py::test_probe_calls_evaluation_slot` (updated to read result.data)
+- Brain DEBT-015 (platform-wide ActorResult.data field — the root enabler)
