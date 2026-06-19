@@ -313,19 +313,71 @@ def _derive_session_id(session: SessionContext) -> str:
     return f"{session.student_id}:{session.concept_id}:{datetime.now(timezone.utc).isoformat()}"
 
 
+async def _get_mastery_level(ctx: ActorContext, session: SessionContext) -> int:
+    """Query the concept's mastery level (repetitions column on aristotle_mastery).
+
+    Phase B.5 (faded worked examples): used by _step_teach + _step_remediate
+    to adapt the teach() prompt. The `repetitions` column counts consecutive
+    correct reviews (SM-2) — it's the natural mastery-level proxy:
+      0 = new concept (no mastery row yet, or row exists but 0 reps)
+      1-2 = early mastery
+      3+ = near-mastered
+
+    Returns 0 if no mastery row exists yet (new concept) or if the query
+    fails (best-effort — the teach step should never block on a DB read).
+    """
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return 0
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        cur = await conn.execute(
+            "SELECT repetitions FROM aristotle_mastery "
+            "WHERE student_id = ? AND concept_id = ?",
+            (session.student_id, session.concept_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return 0
+        return int(row[0])
+    except Exception:
+        return 0  # best-effort — never block the teach step
+
+
 async def _step_teach(
     ctx: ActorContext,
     session: SessionContext,
     socrates: Any,
 ) -> ActorResult:
-    """TEACH: SOCRATES explains the concept (ADR-001 §3)."""
+    """TEACH: SOCRATES explains the concept (ADR-001 §3 + ADR-002 Rev 2 §3/§4).
+
+    Phase B.5 (faded worked examples): queries the concept's mastery level
+    (repetitions column on aristotle_mastery) before calling teach(), so
+    the prompt can adapt — full worked example for new concepts, partial
+    faded for early mastery, conceptual-only for near-mastered. Default 0
+    when no mastery row exists yet.
+    """
     logger = ctx.logger
-    result = await socrates.teach(ctx, session.concept_id)
+    mastery_level = await _get_mastery_level(ctx, session)
+    result = await socrates.teach(ctx, session.concept_id, mastery_level=mastery_level)
 
     if result.ok:
-        session.last_explanation = result.error or ""
+        # Phase B.5: read from result.data (not error-as-payload).
+        # Fallback to result.error for backward compat with any actor
+        # that hasn't migrated yet.
+        if result.data is not None and isinstance(result.data, dict):
+            session.last_explanation = result.data.get("explanation", "")
+        else:
+            session.last_explanation = result.error or ""
         session.state = SessionState.PROBE
-        logger.info("session_step_teach concept=%s", session.concept_id)
+        logger.info(
+            "session_step_teach concept=%s mastery_level=%d",
+            session.concept_id, mastery_level,
+        )
     return result
 
 
@@ -730,14 +782,23 @@ async def _step_remediate(
     # Get the struggle_pattern to inform the re-teaching
     struggle_pattern = await mentor.get_struggle_pattern(ctx, session.student_id)
 
+    # Phase B.5: pass mastery_level so the re-teaching uses the right
+    # fading mode (a learner at level 3+ who somehow ends up in REMEDIATE
+    # should get a conceptual re-frame, not a full worked example).
+    mastery_level = await _get_mastery_level(ctx, session)
     result = await socrates.teach(
         ctx, session.concept_id,
         retry=True,
         struggle_pattern=struggle_pattern,
+        mastery_level=mastery_level,
     )
 
     if result.ok:
-        session.last_explanation = result.error or ""
+        # Phase B.5: read from result.data (not error-as-payload).
+        if result.data is not None and isinstance(result.data, dict):
+            session.last_explanation = result.data.get("explanation", "")
+        else:
+            session.last_explanation = result.error or ""
         # After remediation, re-probe (ADR-001 §3: re-probe after remediation)
         session.state = SessionState.PROBE
         logger.info(

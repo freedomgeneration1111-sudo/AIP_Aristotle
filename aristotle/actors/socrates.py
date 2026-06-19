@@ -81,8 +81,21 @@ class SocratesActor:
         *,
         retry: bool = False,
         struggle_pattern: str | None = None,
+        mastery_level: int = 0,
     ) -> ActorResult:
-        """Generate an explanation for a concept (ADR-001 §3 TEACH).
+        """Generate an explanation for a concept (ADR-001 §3 TEACH + ADR-002 Rev 2 §3/§4).
+
+        Phase B.5 (faded worked examples): the prompt adapts to mastery_level:
+          - level 0 (new concept): full worked example + explanation.
+          - level 1-2 (early mastery): partial faded example — set up the
+            problem, work through the first step, leave the final step for
+            the learner to complete.
+          - level 3+ (near-mastered): conceptual explanation only, no
+            worked example. Focus on depth and nuance.
+
+        mastery_level maps to the `repetitions` column on aristotle_mastery
+        (consecutive correct reviews — the SM-2 counter). 0 = new, 1-2 =
+        early, 3+ = established. Default 0 when no mastery row exists yet.
 
         Args:
             ctx: ActorContext with container + config + logger.
@@ -92,11 +105,13 @@ class SocratesActor:
             struggle_pattern: the student's diagnostic sentence (from MENTOR).
                 Injected into the prompt when retry=True so the re-teaching
                 addresses the specific gap.
+            mastery_level: 0/1/2/3+ — controls the fading mode.
 
         Returns:
-            ActorResult with ok=True + the explanation in `error` field
-            (re-purposed as the result payload since ActorResult has no
-            `data` field — a future Protocol revision should add one).
+            ActorResult with ok=True + data={"explanation": <str>,
+            "fading_mode": <str>}. Phase B.5 migration: uses the data
+            field, not error-as-payload. evaluate() is the reference
+            migration; teach() is the second actor migrated.
 
         Governance: if no model provider is configured, returns
         NEEDS_CONFIGURATION (never a placeholder explanation).
@@ -119,13 +134,14 @@ class SocratesActor:
         primary_lang = getattr(config, "primary_language", "en") if config else "en"
         alt_lang = getattr(config, "alt_language", "ur") if config else "ur"
 
-        system_prompt = self._build_system_prompt(retry=retry)
+        system_prompt = self._build_system_prompt(retry=retry, mastery_level=mastery_level)
         user_prompt = self._build_teach_prompt(
             concept=concept,
             retry=retry,
             struggle_pattern=struggle_pattern,
             primary_lang=primary_lang,
             alt_lang=alt_lang,
+            mastery_level=mastery_level,
         )
 
         # Call the model (beast slot for explanation generation)
@@ -138,14 +154,16 @@ class SocratesActor:
                 ],
             )
             explanation = result.get("content", "")
+            fading_mode = self._fading_mode_for_level(mastery_level)
             logger.info(
-                "socrates_teach_ok concept=%s retry=%s explanation_len=%d",
-                concept_id, retry, len(explanation),
+                "socrates_teach_ok concept=%s retry=%s mastery_level=%d fading=%s explanation_len=%d",
+                concept_id, retry, mastery_level, fading_mode, len(explanation),
             )
-            # ActorResult has no data field — use `error` as the payload.
-            # This is a known Protocol limitation; future revision should add
-            # a `data: Any` field to ActorResult.
-            return ActorResult(ok=True, error=explanation)
+            # Phase B.5: use the data field, not error-as-payload.
+            return ActorResult(
+                ok=True,
+                data={"explanation": explanation, "fading_mode": fading_mode},
+            )
         except Exception as exc:
             logger.warning(
                 "socrates_teach_failed concept=%s error=%s:%s",
@@ -251,13 +269,33 @@ class SocratesActor:
         except Exception:
             return None
 
-    def _build_system_prompt(self, *, retry: bool = False) -> str:
+    def _fading_mode_for_level(self, mastery_level: int) -> str:
+        """Return the fading mode name for a mastery level (ADR-002 §4).
+
+        - level 0 → "full_worked_example"
+        - level 1-2 → "partial_faded_example"
+        - level 3+ → "conceptual_only"
+        """
+        if mastery_level <= 0:
+            return "full_worked_example"
+        elif mastery_level <= 2:
+            return "partial_faded_example"
+        else:
+            return "conceptual_only"
+
+    def _build_system_prompt(self, *, retry: bool = False, mastery_level: int = 0) -> str:
         """Build the system prompt for the teaching model.
 
         ADR-001 §1: single-voice principle. The system prompt establishes
         Aristotle's voice — patient, clear, one tutor. The mode (teach vs
         re-teach) is an internal distinction; the learner just hears
         Aristotle explaining.
+
+        Phase B.5 (faded worked examples): the system prompt includes a
+        mastery-adaptive instruction block that tells the model which
+        presentation mode to use (full example / partial faded / conceptual
+        only). This keeps the fading deterministic — exact instruction for
+        each level, no ambiguity about which mode applies.
         """
         base = (
             "You are Aristotle — a patient, exact tutor. You explain concepts "
@@ -271,6 +309,37 @@ class SocratesActor:
                 "concrete example, an analogy. Address the specific gap noted "
                 "in the struggle pattern."
             )
+
+        # Phase B.5: mastery-adaptive fading instruction.
+        fading_mode = self._fading_mode_for_level(mastery_level)
+        if fading_mode == "full_worked_example":
+            base += (
+                "\n\nFADING MODE: full worked example. The learner is new to "
+                "this concept. Walk through a complete step-by-step example "
+                "showing exactly how this concept applies. Show every step — "
+                "do not skip anything. The learner needs to see the full "
+                "reasoning path before they can attempt it themselves."
+            )
+        elif fading_mode == "partial_faded_example":
+            base += (
+                "\n\nFADING MODE: partial faded example. The learner has seen "
+                "this concept before and has early mastery. Set up a problem, "
+                "work through the first step explicitly, then STOP before the "
+                "final step. Clearly mark where the learner should complete it "
+                "(e.g. 'Now you try the last step: ...'). Do not give the "
+                "final answer — let the learner finish. This is the faded "
+                "worked-example technique: the learner practices the hardest "
+                "part while still seeing the setup."
+            )
+        else:  # conceptual_only
+            base += (
+                "\n\nFADING MODE: conceptual explanation only. The learner "
+                "has near-mastered this concept — they have seen it multiple "
+                "times. Do NOT include a worked example. Focus on depth and "
+                "nuance: edge cases, common misconceptions, connections to "
+                "other concepts, the 'why' behind the mechanics. The learner "
+                "already knows the 'how'; give them the 'why'."
+            )
         return base
 
     def _build_teach_prompt(
@@ -281,12 +350,17 @@ class SocratesActor:
         struggle_pattern: str | None,
         primary_lang: str,
         alt_lang: str,
+        mastery_level: int = 0,
     ) -> str:
         """Build the user prompt for the teaching model.
 
         Includes the concept content from the textbook corpus (if ingested)
         + the struggle_pattern (if retry). Requests bilingual output per
         ADR-001 §7.
+
+        Phase B.5: the user prompt echoes the fading mode so the model has
+        a second deterministic cue (the system prompt has the primary
+        instruction; this reinforces it in the user turn).
         """
         parts = [f"Explain the concept: {concept['topic']}"]
         if concept.get("subtopic"):
@@ -301,6 +375,11 @@ class SocratesActor:
         if retry and struggle_pattern:
             parts.append(f"\nThe learner's struggle pattern: {struggle_pattern}")
             parts.append("Address this specific gap in your re-teaching.")
+
+        # Phase B.5: echo the fading mode in the user prompt.
+        fading_mode = self._fading_mode_for_level(mastery_level)
+        parts.append(f"\nMastery level: {mastery_level} (fading mode: {fading_mode}).")
+        parts.append("Follow the FADING MODE instruction from the system prompt exactly.")
 
         parts.append(f"\nProvide the explanation in {primary_lang} (primary).")
         parts.append(f"If possible, also provide a {alt_lang} translation.")

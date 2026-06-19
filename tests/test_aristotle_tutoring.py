@@ -200,7 +200,9 @@ class TestSocratesTeach:
         assert result.ok
         assert len(fake.calls) == 1
         assert fake.calls[0][0] == "beast"  # called with beast slot
-        assert "Newton's First Law" in result.error
+        # Phase B.5: teach() now returns data={"explanation": ...}, not error=
+        assert result.data is not None
+        assert "Newton's First Law" in result.data["explanation"]
 
     @pytest.mark.asyncio
     async def test_teach_concept_not_found(self):
@@ -212,6 +214,78 @@ class TestSocratesTeach:
         result = await socrates.teach(ctx, "nonexistent")
         assert not result.ok
         assert "not found" in result.error
+
+    @pytest.mark.asyncio
+    async def test_teach_mastery_0_includes_worked_example(self):
+        """teach(mastery_level=0) sends a prompt requesting a full worked example.
+
+        Phase B.5 (ADR-002 §4): level 0 (new concept) → full worked example.
+        We verify the system prompt sent to the model includes the
+        'full worked example' fading instruction.
+        """
+        fake = _FakeModelProvider(responses={"beast": "Here is a full worked example..."})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        socrates = SocratesActor()
+        result = await socrates.teach(ctx, "c1", mastery_level=0)
+        assert result.ok
+        assert result.data["fading_mode"] == "full_worked_example"
+        # The system prompt should mention "full worked example"
+        system_msg = fake.calls[0][1][0]["content"]
+        assert "full worked example" in system_msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_teach_mastery_2_includes_partial_example(self):
+        """teach(mastery_level=2) sends a prompt requesting a partial faded example.
+
+        Phase B.5 (ADR-002 §4): level 1-2 (early mastery) → partial faded
+        example. The learner completes the final step.
+        """
+        fake = _FakeModelProvider(responses={"beast": "Here is a partial example..."})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        socrates = SocratesActor()
+        result = await socrates.teach(ctx, "c1", mastery_level=2)
+        assert result.ok
+        assert result.data["fading_mode"] == "partial_faded_example"
+        system_msg = fake.calls[0][1][0]["content"]
+        assert "partial faded example" in system_msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_teach_mastery_3_is_conceptual_only(self):
+        """teach(mastery_level=3) sends a prompt for conceptual explanation only.
+
+        Phase B.5 (ADR-002 §4): level 3+ (near-mastered) → no worked
+        example, focus on depth and nuance.
+        """
+        fake = _FakeModelProvider(responses={"beast": "Here is a conceptual deep-dive..."})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        socrates = SocratesActor()
+        result = await socrates.teach(ctx, "c1", mastery_level=3)
+        assert result.ok
+        assert result.data["fading_mode"] == "conceptual_only"
+        system_msg = fake.calls[0][1][0]["content"]
+        assert "conceptual explanation only" in system_msg.lower()
+        assert "worked example" not in system_msg.lower().replace("do not include a worked example", "")
+
+    @pytest.mark.asyncio
+    async def test_teach_defaults_to_level_0_for_new_concept(self):
+        """_get_mastery_level returns 0 when no mastery row exists (new concept).
+
+        Phase B.5: the session coordinator queries aristotle_mastery before
+        calling teach(). A new concept has no mastery row → level 0 → full
+        worked example. This test pins the default so a future refactor
+        can't silently change it.
+        """
+        from aristotle.session import SessionContext, _get_mastery_level
+
+        # No mastery row → _FakeConn returns None for fetchone
+        conn = _FakeConn(rows=None)
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = SessionContext(concept_id="c1")
+        level = await _get_mastery_level(ctx, session)
+        assert level == 0, "new concept (no mastery row) should default to level 0"
 
 
 # --------------------------------------------------------------------------
