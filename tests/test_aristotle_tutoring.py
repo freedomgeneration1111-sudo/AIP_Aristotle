@@ -543,6 +543,132 @@ class TestMentorUpdate:
 
 
 # --------------------------------------------------------------------------
+# MENTOR log_misconception tests (Phase B.5 item 7)
+# --------------------------------------------------------------------------
+
+
+class TestMentorLogMisconception:
+    """Phase B.5: MentorActor.log_misconception() writes to aristotle_misconception_log.
+
+    Best-effort: returns ok=True even on DB failure (a misconception-log
+    failure must NEVER break the session). Uses ActorResult.data for
+    confirmation, not error-as-payload.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mentor_log_misconception_writes_row(self):
+        """log_misconception() returns ok=True + the row is written to the fake DB.
+
+        The fake _FakeConn records every execute() call. We verify the
+        INSERT was issued with the correct table + the diagnosis fields
+        were extracted into misconception_text + corrective_text.
+        """
+        conn = _FakeConn(rows=None)
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        mentor = MentorActor()
+        diagnosis = {
+            "misconception": "You seem to think a force is needed to sustain motion",
+            "why_wrong": "Objects keep moving on their own",
+            "corrective": "Force changes motion, not sustains it",
+        }
+        result = await mentor.log_misconception(
+            ctx, concept_id="c1", session_id="sess-1", diagnosis=diagnosis,
+        )
+        assert result.ok
+        # data confirms the write
+        assert result.data is not None
+        assert result.data["logged"] is True
+        assert result.data["concept_id"] == "c1"
+        # The INSERT was executed on the fake conn
+        insert_calls = [
+            (sql, params) for sql, params in conn._executed
+            if "INSERT INTO aristotle_misconception_log" in sql
+        ]
+        assert len(insert_calls) == 1, "expected one INSERT into aristotle_misconception_log"
+        sql, params = insert_calls[0]
+        # params: (session_id, concept_id, misconception_text, corrective_text)
+        assert params[0] == "sess-1"
+        assert params[1] == "c1"
+        assert params[2] == "You seem to think a force is needed to sustain motion"
+        assert params[3] == "Force changes motion, not sustains it"
+
+    @pytest.mark.asyncio
+    async def test_mentor_log_misconception_survives_db_error(self):
+        """Even if the DB write raises, ok=True is returned (best-effort).
+
+        A misconception-log failure must NEVER break the session. The
+        learner's progress through the tutoring loop is more important
+        than the analytics row. The error is logged at WARNING for
+        observability + ok=True is returned with data.logged=False.
+        """
+        class _ExplodingConn:
+            async def execute(self, sql, params=()):
+                raise RuntimeError("simulated DB failure")
+            async def commit(self):
+                pass
+
+        class _ExplodingStores:
+            connection_manager = type("CM", (), {"write_conn": _ExplodingConn()})()
+
+        class _ExplodingRegistry:
+            async def get_stores(self, corpus_id, **kwargs):
+                return _ExplodingStores()
+
+        container = type("C", (), {
+            "corpus_registry": _ExplodingRegistry(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        mentor = MentorActor()
+        diagnosis = {
+            "misconception": "some misconception",
+            "why_wrong": "some why",
+            "corrective": "some corrective",
+        }
+        result = await mentor.log_misconception(
+            ctx, concept_id="c1", session_id="sess-1", diagnosis=diagnosis,
+        )
+        # ok MUST be True — best-effort never breaks the session
+        assert result.ok
+        # data.logs is False + the error is captured for observability
+        assert result.data is not None
+        assert result.data["logged"] is False
+        assert "error" in result.data
+
+    @pytest.mark.asyncio
+    async def test_mentor_log_misconception_handles_partial_diagnosis(self):
+        """log_misconception() handles a diagnosis missing keys (defensive).
+
+        If the model returned a partial diagnosis (e.g. missing
+        'corrective'), the method should not KeyError — it writes empty
+        strings for the missing fields. This is the defensive normalization
+        the actor does before the INSERT.
+        """
+        conn = _FakeConn(rows=None)
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        mentor = MentorActor()
+        # Partial diagnosis — only 'misconception' present
+        diagnosis = {"misconception": "partial thought", "why_wrong": "partial why"}
+        result = await mentor.log_misconception(
+            ctx, concept_id="c1", session_id="sess-1", diagnosis=diagnosis,
+        )
+        assert result.ok
+        assert result.data["logged"] is True
+        # The INSERT should have empty string for the missing corrective
+        insert_calls = [
+            (sql, params) for sql, params in conn._executed
+            if "INSERT INTO aristotle_misconception_log" in sql
+        ]
+        assert len(insert_calls) == 1
+        _sql, params = insert_calls[0]
+        assert params[2] == "partial thought"  # misconception_text
+        assert params[3] == ""  # corrective_text (missing → empty string)
+
+
+# --------------------------------------------------------------------------
 # Session coordinator tests
 # --------------------------------------------------------------------------
 
@@ -645,6 +771,63 @@ class TestSessionCoordinator:
         assert "why_wrong" in session.last_diagnosis
         assert "corrective" in session.last_diagnosis
         assert session.last_diagnosis["misconception"] == "You seem to think a force is needed to sustain motion"
+
+    @pytest.mark.asyncio
+    async def test_session_logs_misconception_on_wrong_evaluate(self):
+        """After a wrong EVALUATE step with diagnosis, the misconception log write is triggered.
+
+        Phase B.5 item 7: the session coordinator fire-and-forgets a
+        mentor.log_misconception() call after a wrong EVALUATE. This test
+        verifies the INSERT into aristotle_misconception_log is issued
+        during the EVALUATE step (the fake conn records every execute()).
+        The call is best-effort — a failure wouldn't break the session
+        (tested separately in TestMentorLogMisconception).
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        eval_json = json.dumps({
+            "score": 0.3,
+            "mastery_achieved": False,
+            "feedback": "Not quite.",
+            "diagnosis": {
+                "misconception": "You seem to think a force is needed to sustain motion",
+                "why_wrong": "Objects keep moving on their own",
+                "corrective": "Force changes motion, not sustains it",
+            },
+        })
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+            "sexton": "Learner struggles with inertia.",
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.EVALUATE,
+            hint_count=0,
+            last_quiz_question="What is inertia?",
+            last_student_answer="a force keeps it going",
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        # The misconception-log INSERT should have been issued on the fake conn
+        insert_calls = [
+            sql for sql, _params in conn._executed
+            if "INSERT INTO aristotle_misconception_log" in sql
+        ]
+        assert len(insert_calls) == 1, (
+            "expected one INSERT into aristotle_misconception_log after a "
+            "wrong EVALUATE with diagnosis"
+        )
 
     @pytest.mark.asyncio
     async def test_session_routes_to_hint1_on_wrong_answer(self):

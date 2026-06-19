@@ -285,13 +285,7 @@ async def _log_predict_event(ctx: ActorContext, session: SessionContext) -> None
     try:
         stores = await registry.get_stores("aristotle:textbook")
         conn = stores.connection_manager.write_conn
-        # session_id: use a stable identifier. For Phase B.5 pre-alpha
-        # (single-tenant, no session table yet), derive from student_id +
-        # concept_id + a timestamp so multiple sessions per concept are
-        # distinguishable. A real session_id comes in Phase D with the
-        # aristotle_intake_session table.
-        from datetime import datetime, timezone
-        session_id = f"{session.student_id}:{session.concept_id}:{datetime.now(timezone.utc).isoformat()}"
+        session_id = _derive_session_id(session)
         await conn.execute(
             "INSERT INTO aristotle_predict_event (session_id, concept_id, prediction_text) "
             "VALUES (?, ?, ?)",
@@ -305,6 +299,18 @@ async def _log_predict_event(ctx: ActorContext, session: SessionContext) -> None
             "session_predict_log_failed concept=%s error=%s:%s",
             session.concept_id, type(exc).__name__, exc,
         )
+
+
+def _derive_session_id(session: SessionContext) -> str:
+    """Derive a session_id for analytics tables (predict_event, misconception_log).
+
+    Phase B.5 pre-alpha: single-tenant, no session table yet. Derive from
+    student_id + concept_id + a timestamp so multiple sessions per concept
+    are distinguishable. A real session_id comes in Phase D with the
+    aristotle_intake_session table.
+    """
+    from datetime import datetime, timezone
+    return f"{session.student_id}:{session.concept_id}:{datetime.now(timezone.utc).isoformat()}"
 
 
 async def _step_teach(
@@ -485,6 +491,29 @@ async def _step_evaluate(
                 session.retry_count += 1
             else:
                 session.state = SessionState.NEXT_CONCEPT
+
+    # Phase B.5 (misconception log, B.5 item 7): if the answer was wrong
+    # and EXAMINER produced a diagnosis, fire-and-forget a
+    # mentor.log_misconception() call. This is best-effort — a DB failure
+    # never breaks the session (log_misconception returns ok=True always).
+    # The misconception log builds a queryable per-instance history that
+    # complements the long-arc struggle_pattern (ADR-002 §7).
+    if session.last_diagnosis is not None and session.last_score < mastery_threshold:
+        session_id = _derive_session_id(session)
+        try:
+            await mentor.log_misconception(
+                ctx,
+                concept_id=session.concept_id,
+                session_id=session_id,
+                diagnosis=session.last_diagnosis,
+            )
+        except Exception as exc:
+            # Non-fatal — log + continue. The session must never break
+            # over an analytics row.
+            logger.warning(
+                "session_misconception_log_failed concept=%s error=%s:%s",
+                session.concept_id, type(exc).__name__, exc,
+            )
 
     logger.info(
         "session_step_evaluate concept=%s score=%.2f mastered=%s state=%s has_diagnosis=%s",

@@ -169,6 +169,97 @@ class MentorActor:
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
 
+    async def log_misconception(
+        self,
+        ctx: ActorContext,
+        concept_id: str,
+        session_id: str,
+        diagnosis: dict,
+        student_id: str = "definer",
+    ) -> ActorResult:
+        """Write one row to aristotle_misconception_log (ADR-002 Rev 2 §7, B.5 item 7).
+
+        Called by the session coordinator after a wrong EVALUATE step (when
+        diagnosis is present). This is the instance-level misconception
+        tracking that complements the existing struggle_pattern (which is
+        the long-arc summary). The log builds a queryable history of
+        specific misconceptions per student per concept — after 3+ entries
+        with similar misconception_text, MENTOR can update struggle_pattern
+        to explicitly name the pattern (ADR-002 §7 pattern recognition —
+        future work, not in this commit).
+
+        Best-effort: returns ActorResult(ok=True) even if the DB write
+        fails. A misconception-log failure must NEVER break the session —
+        the learner's progress through the tutoring loop is more important
+        than the analytics row. The error is logged at WARNING for
+        observability.
+
+        Args:
+            ctx: ActorContext with container + logger.
+            concept_id: the concept the learner struggled with.
+            session_id: the session identifier (derived by the coordinator
+                from student_id:concept_id:timestamp when no real session
+                table exists — Phase D will provide a real session_id).
+            diagnosis: the diagnosis dict from EXAMINER.evaluate(). Must
+                have "misconception" and "corrective" keys. The "why_wrong"
+                key is not stored in the M003 simplified schema (it's
+                available in session.last_evaluation for future analysis).
+            student_id: defaults to "definer" (single-tenant pre-alpha).
+
+        Returns:
+            ActorResult(ok=True, data={"logged": True, ...}) on success.
+            ActorResult(ok=True, data={"logged": False, "error": ...}) on
+            best-effort failure (ok is ALWAYS True — see above).
+        """
+        logger = ctx.logger
+        container: Any = ctx.container
+
+        # Defensive: extract the two fields we store. Missing keys default
+        # to empty string so a partial diagnosis doesn't KeyError.
+        misconception_text = str(diagnosis.get("misconception", "")) if isinstance(diagnosis, dict) else ""
+        corrective_text = str(diagnosis.get("corrective", "")) if isinstance(diagnosis, dict) else ""
+
+        registry = getattr(container, "corpus_registry", None)
+        if registry is None:
+            # Best-effort: log + return ok=True (never break the session).
+            logger.warning("mentor_log_misconception_skipped reason=registry_none concept=%s", concept_id)
+            return ActorResult(ok=True, data={"logged": False, "reason": "registry_none"})
+
+        try:
+            stores = await registry.get_stores("aristotle:textbook")
+            conn = stores.connection_manager.write_conn
+            await conn.execute(
+                "INSERT INTO aristotle_misconception_log "
+                "(session_id, concept_id, misconception_text, corrective_text) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, concept_id, misconception_text, corrective_text),
+            )
+            await conn.commit()
+            logger.info(
+                "mentor_misconception_logged concept=%s session=%s misconception_len=%d",
+                concept_id, session_id, len(misconception_text),
+            )
+            return ActorResult(
+                ok=True,
+                data={
+                    "logged": True,
+                    "concept_id": concept_id,
+                    "session_id": session_id,
+                    "misconception_len": len(misconception_text),
+                },
+            )
+        except Exception as exc:
+            # Best-effort: NEVER break the session over an analytics row.
+            # Log at WARNING for observability + return ok=True.
+            logger.warning(
+                "mentor_log_misconception_failed concept=%s error=%s:%s",
+                concept_id, type(exc).__name__, exc,
+            )
+            return ActorResult(
+                ok=True,
+                data={"logged": False, "error": f"{type(exc).__name__}: {exc}"},
+            )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
