@@ -364,51 +364,78 @@ would also have caught the platform-side bug
 
 ## ARISTOTLE-DEBT-010 — EXAMINER CI-fixture breaks EVALUATE JSON parse (student always fails in CI mode)
 
-**Status:** Open
+**Status:** Resolved — fixed 2026-06-19 (Option 1, platform-side)
 **Phase:** Tutoring loop / CI mode
 **Filed:** 2026-06-19
 
-**What's broken:**
+**What was broken:**
 The session coordinator (`aristotle/session.py::_step_evaluate`) expects
 EXAMINER's `evaluate()` to return JSON `{score, mastery_achieved, feedback}`,
 which it parses with `json.loads(session.last_evaluation)`. In CI mode,
-however, the platform's `ModelSlotResolver` returns a plain-text fixture
+however, the platform's `ModelSlotResolver` returned a plain-text fixture
 like `[CI-FIXTURE for evaluation] Concept: Newton's First Law...` for
-the `evaluation` slot. `json.loads` raises `JSONDecodeError`, the
-coordinator catches it and defaults to `score=0.0, mastered=False`, and
-the learner can never reach the mastery threshold — every session
-exhausts `max_retries=2` and exits with `mastered=False`.
+the `evaluation` slot. `json.loads` raised `JSONDecodeError`, the
+coordinator caught it and defaulted to `score=0.0, mastered=False`, and
+the learner could never reach the mastery threshold — every session
+exhausted `max_retries=2` and exited with `mastered=False`.
 
 Observed during dogfood (2026-06-19): `aristotle session newton_first_law
 --answer "objects resist changes in motion"` produced a 14-step session
 with three EVALUATE attempts, all parsing as score=0.0, ending
 `Mastered: False, Final score: 0.0`. The struggle-pattern table also
-fills with concatenated `[CI-FIXTURE for sexton]` prefixes because
-MENTOR keeps re-reading the prior pattern and prepending the fixture.
+filled with concatenated `[CI-FIXTURE for sexton]` prefixes because
+MENTOR kept re-reading the prior pattern and prepending the fixture.
 
-**Why deferred:**
-In production (real LLM), EXAMINER is prompted to return strict JSON and
-this works. The bug only manifests in CI mode, where it's "expected"
-that fixtures don't drive real learning — but it makes the dogfood
-smoke test misleading (the loop runs, but the learner can never succeed).
+**Resolution (Option 1 — platform-side, chosen as cleanest):**
+Fixed in `AIP_Brain/src/aip/adapter/model_slot_resolver.py` (commit on
+`feat/multi-corpus`). When `ci_mode=True` and `slot_name == "evaluation"`,
+the resolver now returns a JSON string:
+`{"score": 0.9, "mastery_achieved": true, "feedback": "[CI-FIXTURE...]"}`.
+The high score + `mastery_achieved=True` lets CI-mode dogfood runs
+exercise the `mastered=True` branch (TEACH → PROBE → QUIZ → EVALUATE →
+NEXT_CONCEPT → SESSION_COMPLETE in 6 steps, not 14). Other slots
+(`synthesis`, `beast`, `sexton`, `embedding`) keep the plain-text
+fixture — their callers don't have a JSON contract (or, like Sexton and
+Beast, they have robust find-first-bracket JSON extraction that handles
+plain text gracefully).
 
-**Recommended fix (one of):**
-1. Have `ModelSlotResolver` return valid JSON for the `evaluation` slot
-   when `ci_mode=True` (e.g. `{"score": 0.8, "mastery_achieved": true,
-   "feedback": "[CI-FIXTURE]"}`). This is the cleanest fix because it
-   makes CI-mode sessions actually exercise the mastered=True branch.
-2. Have `ExaminerActor.evaluate()` detect `ci_mode` and synthesize a
-   valid JSON response itself, bypassing the model call.
-3. Have `_step_evaluate` treat a non-JSON response as a soft pass
-   (score=0.5, mastered=False) rather than a hard zero — at least the
-   learner wouldn't always fail.
+**Why Option 1 over Options 2/3:**
+- Option 2 (ExaminerActor detects ci_mode and synthesizes JSON) would
+  couple the extension to a platform-specific runtime flag — exactly
+  the kind of import-boundary violation ADR-014 §5.3 forbids.
+- Option 3 (treat non-JSON as soft pass, score=0.5) papers over the
+  root cause and still wouldn't let CI mode exercise the mastered=True
+  branch (0.5 < 0.7 mastery_threshold).
+- Option 1 fixes the root cause: the resolver was producing
+  wrong-shaped output for a slot with a documented JSON contract. The
+  fix is one branch in `ModelSlotResolver.call()`, fully testable from
+  the platform side without coupling.
 
-Option 1 is preferred because it fixes the root cause and lets CI mode
-verify the mastered branch end-to-end.
+**Why this slot specifically:**
+The `evaluation` slot is the only slot with a strict `json.loads()`
+caller that has no fallback extraction logic. Sexton and Beast parse
+JSON too, but they use a robust extractor (`_extract_json_array` in
+`sexton.py` lines 77-118) that finds the first `[` and last `]` —
+plain-text fixtures don't break them. If a future actor adds another
+strict-JSON slot, the same pattern (slot-specific fixture in
+`ModelSlotResolver.call()`) should be extended.
+
+**Verification:**
+- Aristotle full test suite: 54 passed, 3 warnings (no regressions —
+  the unit tests use `_FakeModelProvider` with explicit JSON responses,
+  so they don't exercise the real resolver path).
+- Brain `tests/test_model_slot_resolver.py`: 25 passed (the existing CI
+  fixture tests use the `synthesis` slot, which still returns plain
+  text — backward compat preserved).
+- End-to-end: wrote `/home/z/my-project/scripts/verify_debt010_fix.py`
+  which calls the real resolver in CI mode for the `evaluation` slot
+  and confirms the output parses as JSON with `score=0.9,
+  mastery_achieved=True`. Other slots confirmed to still return plain
+  text (backward compat).
 
 **Related work:**
-- `aristotle/session.py:_step_evaluate` (the `json.loads` + fallback)
-- `aristotle/actors/examiner.py` (evaluate prompt — should enforce JSON)
-- `AIP_Brain/src/aip/adapter/model_slot_resolver.py` (CI fixture format)
-- `tests/test_aristotle_tutoring.py` — likely uses a stub that returns
-  valid JSON directly, masking this in unit tests.
+- `AIP_Brain/src/aip/adapter/model_slot_resolver.py` (the fix — slot-specific CI fixture, ~line 328)
+- `aristotle/session.py:_step_evaluate` (the `json.loads` + fallback — unchanged)
+- `aristotle/actors/examiner.py` (evaluate prompt — unchanged, still enforces JSON contract for real LLM)
+- `tests/test_aristotle_tutoring.py` (uses `_FakeModelProvider` stub — masks this in unit tests; recommend adding an integration test that exercises the real resolver in CI mode)
+- `/home/z/my-project/scripts/verify_debt010_fix.py` (end-to-end verification script)
