@@ -1,8 +1,8 @@
 # AIP_Aristotle — Status
 
 **Last Updated:** 2026-06-18
-**Phase:** Phase A dogfood
-**Operational State:** Pre-alpha, not yet dogfoodable (actors are placeholders)
+**Phase:** Phase B complete / Phase C planning
+**Operational State:** Pre-alpha — Phase A tutoring loop + Phase B teacher dashboard shipped
 
 ---
 
@@ -11,28 +11,32 @@
 Aristotle is a pip-installable extension of AIP Brain. It mounts via the
 platform's entry-point discovery (`aip.extensions` group) and runs through
 the full ExtensionHost lifecycle: discover → validate → migrate → register →
-ready. At startup, the host discovers Aristotle, parses its manifest, applies
-M001_aristotle.sql to the `aristotle:textbook` corpus, calls `on_load` to
-register three actors (SOCRATES, EXAMINER, MENTOR), and starts their
-scheduler tasks.
+mount → ready. At startup, the host discovers Aristotle, parses its manifest,
+applies M001 + M002 migrations to the `aristotle:textbook` corpus, calls
+`on_load` to register three actors (SOCRATES, EXAMINER, MENTOR), two GUI
+pages (/learn, /dashboard), and one API router, then starts actor scheduler
+tasks.
 
 **What works:**
-- Extension discovery + lifecycle (mount, validate, migrate, register, ready, stop)
+- Extension discovery + lifecycle (mount, validate, migrate, register, mount, ready, stop)
 - Three actors conform to the foundation Actor Protocol (isinstance-validated)
-- MENTOR reads/writes `aristotle_struggle_pattern` via the corpus write connection
-- EXAMINER degrades gracefully without a model (returns ok=True)
-- The tutoring state machine workflow is declared (engine-compatible, 7 nodes)
-- Health surfaces via the platform's `/health/extensions` endpoint
-- Import boundary is machine-enforced (extensions import only the allowlist)
+- Real model calls: SOCRATES.teach(), EXAMINER.probe()/quiz()/evaluate(), MENTOR.update_struggle_pattern()
+- SM-2 spaced repetition module (aristotle/sm2.py) + aristotle_mastery table
+- Session coordinator drives TEACH→PROBE→QUIZ→EVALUATE→REMEDIATE state machine
+- Content ingestor (YAML → aristotle_concept, bilingual)
+- CLI (HTTP client): health, list-concepts, ingest, session (interactive + non-interactive)
+- API routes: /concepts, /ingest, /session/{start,step,run}, /dashboard
+- GUI learning view at /learn (concept selector + tutoring session)
+- GUI teacher dashboard at /dashboard (stats header, struggle pattern, mastery table)
+- Dashboard LEFT JOIN: all concepts appear including unstarted; sort: due → unstarted → mastered
+- Nav items dynamic via /health/extensions nav_items (no hardcoded extension names)
+- Health surfaces via the platform's /health/extensions endpoint
+- Import boundary machine-enforced (extensions import only the allowlist; gui/ scanned too)
 
 **What doesn't work yet:**
-- Actors don't make real model calls (SOCRATES doesn't generate explanations,
-  EXAMINER doesn't generate/score questions, MENTOR doesn't write AI diagnostics)
-- The workflow's script handlers (`aristotle_evaluate`, `aristotle_next_concept`)
-  aren't registered — the workflow runs in fixture/no-op mode
-- No content ingestor — `aristotle_concept` table is empty
-- No SM-2 integration — VIGIL is reused from core but not wired
-- No GUI learning view (platform v1.1, stage 4 mount, not yet built)
+- Phase C (HERALD): field awareness — blocked on platform web/feed layer (ADR-014 §3.4)
+- SOCRATES uses raw SQL on aristotle_concept, not the Brain's retrieval pipeline (ARISTOTLE-DEBT-007)
+- GUI coupling to Brain's gui/ package (ARISTOTLE-DEBT-008)
 
 ---
 
@@ -122,7 +126,7 @@ Aristotle depends on these platform capabilities (all shipped in AIP_Brain
 | WorkflowEngine wired into container | ADR-014 §8 step 2 | ✅ Shipped |
 | `/health/extensions` endpoint | ADR-014 §7 | ✅ Shipped |
 | Import boundary enforcement | ADR-014 §5.3 | ✅ Shipped |
-| GUI mount (stage 4) | ADR-014 §8 step 6 | ⏳ v1.1 (not started) |
+| GUI mount (stage 4) | ADR-014 §8 step 6 | ✅ Shipped (v1.1) |
 | MCP tools | ADR-014 §8 step 7 | ⏳ v1.2 (not started) |
 | Web/feed layer (HERALD dependency) | ADR-014 §3.4 | ⏳ Not started |
 
@@ -130,15 +134,18 @@ Aristotle depends on these platform capabilities (all shipped in AIP_Brain
 
 ## Pilot Readiness
 
-**Not yet dogfoodable.** The actors are placeholders (no real model calls),
-the workflow runs in no-op mode, and there's no content to tutor. The
-platform contract is proven, but the tutoring loop isn't live.
+**Ready for dogfood testing.** Phase A (tutoring loop) + Phase B (teacher
+dashboard) are shipped. The tutoring loop runs end-to-end with real model
+calls, SM-2 scheduling, struggle_pattern tracking, and a GUI learning view.
+The teacher dashboard shows mastery, due items, and the struggle pattern.
 
-**Path to dogfoodable:**
-1. Real model calls in SOCRATES/EXAMINER/MENTOR (Near-Term)
-2. Script handlers registered (Near-Term)
-3. Content ingestor — populate `aristotle_concept` (Near-Term)
-4. SM-2 via core VIGIL (Near-Term)
+**What to test:**
+1. Install both repos (pip install -e)
+2. Start the server (./start.sh from AIP_Brain)
+3. Ingest concepts: `python -m aristotle.cli ingest concepts_sample.yaml`
+4. Run a session: `python -m aristotle.cli session newton_first_law --answer "objects resist changes in motion"`
+5. Open the GUI: http://localhost:8080/learn (learner view) + http://localhost:8080/dashboard (teacher view)
 
-After those four, Ramesh can self-tutor a chapter he already knows
-(ADR-001 §10 pilot protocol step 1).
+**Next major milestone: Phase C (HERALD)** — field awareness. Blocked on
+the platform's web/feed layer (ADR-014 §3.4), which is not yet built.
+The tutoring loop ships without it; HERALD layers on when feeds land.

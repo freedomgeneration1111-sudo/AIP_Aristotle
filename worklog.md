@@ -184,3 +184,43 @@ Files changed:
 - pyproject.toml (MODIFIED — added click, httpx, pyyaml dependencies)
 - tests/test_aristotle_cli_api.py (NEW — 7 tests: API routes + full-session + CLI)
 
+
+---
+Task ID: 7
+Agent: Super Z (main)
+Task: Phase B teacher dashboard — API route + GUI page + dashboard fix
+
+Work Log:
+- Built GET /aristotle/dashboard API route (aristotle/api.py): returns {student_id, total_concepts, mastered_count, due_count, struggle_pattern, mastery_by_concept}. Pulls from aristotle_mastery + aristotle_concept + aristotle_struggle_pattern via corpus_registry.get_stores("aristotle:textbook").
+- Built @ui.page("/dashboard") GUI page (aristotle/gui.py): three panels — header (stat cards: total/mastered/due), struggle pattern sentence (prominent, amber border), mastery table (concept | topic | mastered | last score | next due). Fetches from GET /aristotle/dashboard. Same layout conventions as /learn.
+- Registered /dashboard in hooks.py via host.register_page("/dashboard", "Teach", "school_outlined", order=35).
+- Fixed dashboard_route: LEFT JOIN aristotle_concept with aristotle_mastery so ALL concepts appear (including unstarted). Sort: due items first (priority 0), then unstarted (priority 1), then mastered (priority 2), then not-due (priority 3). Unstarted concepts: mastered=false, last_score=null, repetitions=0, next_review_at=null, is_due=false.
+- Upgraded _FakeConn to support multi_rows mode (returns different rows per query) for dashboard testing.
+- Logged ARISTOTLE-DEBT-008: GUI coupling to Brain's gui/ package (gui.components.layout, gui.state, gui.theme). Revisit when third-party extensions need the same components.
+
+Stage Summary:
+- Phase B (teacher dashboard) is complete. The /dashboard GUI page shows Komal exactly what she needs: how many concepts exist, how many are mastered, how many are due, the struggle pattern sentence, and a mastery table sorted by what needs attention.
+- The dashboard's LEFT JOIN ensures unstarted concepts appear — Komal sees the full curriculum, not just what's been studied.
+- Nav is fully dynamic: "Learn" (order=30) + "Teach" (order=35) appear automatically via /health/extensions nav_items. No hardcoded extension names.
+- 46 tests pass. No regression.
+
+Files changed:
+- aristotle/api.py (dashboard_route — LEFT JOIN + correct sort)
+- aristotle/gui.py (@ui.page("/dashboard") — three panels)
+- aristotle/hooks.py (register_page for /dashboard)
+- tests/test_aristotle_cli_api.py (_FakeConn multi_rows + dashboard test)
+- TECH_DEBT.md (ARISTOTLE-DEBT-008 — GUI coupling)
+
+---
+Task ID: 8
+Agent: Super Z (main)
+Task: Mark Phase B done in docs (PLANNED_FEATURES + STATUS + worklog)
+
+Work Log:
+- PLANNED_FEATURES.md: marked Phase B Teacher Dashboard items as ✅ Built (mastery heatmap, what's due, struggle-pattern display, nav registration). Added Change Log entry.
+- STATUS.md: updated Phase to "Phase B complete / Phase C planning". Updated "What works" to include all Phase A + Phase B features. Updated "What doesn't work" to Phase C + known debts. Updated Pilot Readiness to "Ready for dogfood testing" with test instructions. Updated platform dependencies table (GUI mount → ✅ Shipped).
+- worklog.md: appended Task ID 7 (Phase B work) + Task ID 8 (this docs update).
+
+Stage Summary:
+- Docs are current. Phase B is marked done. Phase C (HERALD) is the next major milestone, blocked on platform web/feed layer.
+

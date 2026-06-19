@@ -86,13 +86,14 @@ These are genuine gaps worth pursuing. They are NOT yet implemented.
 | **Content ingestor** | Populates `aristotle_concept` with real bilingual content. Concept-chunking per ADR-001 §4. | ~1-2 days | Textbook material to ingest. May surface platform gaps (concept-graph integration). |
 | **SM-2 via core VIGIL** | Spaced repetition — VIGIL is reused from core, not re-implemented. | ~half day | May surface a protocol gap if Vigil's API doesn't expose what ARISTOTLE needs. |
 
-### Teacher Dashboard (ADR-001 §8, Phase B)
+### Teacher Dashboard (ADR-001 §8, Phase B) — ✅ BUILT
 
-| Feature | Why it matters | Effort | Dependencies |
-|---------|----------------|--------|--------------|
-| **Mastery heatmap** | Komal sees per-student mastery per concept. Read-view into MENTOR's data. | ~1 day | Real MENTOR data (Near-Term above). GUI mount (platform v1.1). |
-| **What's due (VIGIL)** | Komal sees what's due for each student. Read-view into VIGIL's SM-2 schedule. | ~half day | SM-2 wiring (Near-Term above). |
-| **Struggle-pattern display** | Komal sees the diagnostic sentence per student. | ~half day | Real MENTOR data. |
+| Feature | Status | Implementation |
+|---------|--------|----------------|
+| **Mastery heatmap** | ✅ Built | `GET /aristotle/dashboard` returns `mastery_by_concept` with LEFT JOIN (all concepts, including unstarted). Sort: due → unstarted → mastered. `/dashboard` GUI renders as a table. |
+| **What's due (SM-2)** | ✅ Built | `is_due` computed from `next_review_at` + `repetitions`. Due count in dashboard header. Due items marked ⚠ in GUI table. |
+| **Struggle-pattern display** | ✅ Built | `struggle_pattern` from `aristotle_struggle_pattern` table. Prominent panel in `/dashboard` GUI (amber border, raised background). |
+| **Nav registration** | ✅ Built | `host.register_page("/dashboard", "Teach", "school_outlined", order=35)` in hooks.py. Appears dynamically in layout via `/health/extensions` nav_items. |
 
 ---
 
@@ -120,6 +121,7 @@ built. The tutoring loop ships without it; HERALD layers on when feeds land.
 | Date | Change | Agent |
 |------|--------|-------|
 | 2026-06-18 | Created file. Seeded with Phase A dogfood status + Near-Term/Long-Term from ADR-001 §11. | Super Z (main) |
+| 2026-06-18 | Phase B (teacher dashboard) shipped: GET /aristotle/dashboard API (LEFT JOIN, all concepts, correct sort), /dashboard GUI page (3 panels: stats, struggle pattern, mastery table), nav registration ("Teach", order=35). Dashboard fix: LEFT JOIN so unstarted concepts appear + correct sort order (due → unstarted → mastered). | Super Z (main) |
 
 ---
 
