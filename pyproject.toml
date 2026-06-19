@@ -22,6 +22,12 @@ dependencies = [
 [project.entry-points."aip.extensions"]
 aristotle = "aristotle.entrypoint:get_manifest"
 
+# ADR-014 v1.1: GUI page discovery. gui/app.py in AIP_Brain scans this
+# group and loads each module — the @ui.page decorator inside registers
+# the route. No named imports from the platform to the extension.
+[project.entry-points."aip.extension_gui"]
+aristotle = "aristotle.gui"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
