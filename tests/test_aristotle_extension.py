@@ -245,6 +245,43 @@ async def test_aristotle_m003_creates_phase_b5_schema(host: ExtensionHost, conta
 
 @pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
 @pytest.mark.asyncio
+async def test_aristotle_m004_creates_phase_d_schema(host: ExtensionHost, container):
+    """M004_aristotle_phase_d.sql creates the Phase D onboarding tables.
+
+    Phase D (ADR-002 Rev 2 §10) adds:
+      - aristotle_intake_session: records the intake conversation state.
+      - aristotle_learning_plan: versioned learning plan with concept sequence.
+      - aristotle_placement_event: placement calibration results.
+
+    This test runs the full host lifecycle (which applies M001 + M002 +
+    M003 + M004 in order) and verifies every new table exists. Follows
+    the pattern of test_aristotle_migrations_create_tables above.
+    """
+    await host.start()
+    assert host.state("aristotle") in (ExtensionState.REGISTERED, ExtensionState.MOUNTED), (
+        f"ARISTOTLE should reach REGISTERED or MOUNTED; failures="
+        f"{[f.to_dict() for f in host.failures('aristotle')]}"
+    )
+
+    stores = await container.corpus_registry.get_stores("aristotle:textbook")
+
+    # Phase D tables (ADR-002 §10.1, §10.2, §10.3)
+    assert await _table_exists(stores, "aristotle_intake_session"), \
+        "M004 should create aristotle_intake_session table"
+    assert await _table_exists(stores, "aristotle_learning_plan"), \
+        "M004 should create aristotle_learning_plan table"
+    assert await _table_exists(stores, "aristotle_placement_event"), \
+        "M004 should create aristotle_placement_event table"
+
+    # Sanity: the pre-existing M001 tables are still there (M004 is additive).
+    assert await _table_exists(stores, "aristotle_concept"), \
+        "M001 aristotle_concept table should still exist after M004"
+    assert await _table_exists(stores, "aristotle_mastery"), \
+        "M002 aristotle_mastery table should still exist after M004"
+
+
+@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.asyncio
 async def test_aristotle_registers_actors(host: ExtensionHost):
     """All three actors are registered via hooks.py::on_load."""
     await host.start()
