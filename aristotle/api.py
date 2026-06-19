@@ -240,14 +240,24 @@ async def dashboard_route(request: Request):
                     "last_score": float | null,
                     "repetitions": int,
                     "next_review_at": str | null,
-                    "updated_at": str
+                    "is_due": bool,
+                    "updated_at": str | null
                 }
             ]
         }
 
-    Pulls from aristotle_mastery + aristotle_concept + aristotle_struggle_pattern
-    via corpus_registry.get_stores("aristotle:textbook"). student_id is always
-    "definer" (single-tenant pre-alpha).
+    Uses a LEFT JOIN so ALL concepts appear — including ones with no
+    mastery record yet (never studied). Unstarted concepts show
+    mastered=false, last_score=null, repetitions=0, next_review_at=null,
+    is_due=false.
+
+    Sort order: due items first (next_review_at past or null with
+    repetitions>0), then unstarted (repetitions=0), then mastered.
+
+    Pulls from aristotle_mastery + aristotle_concept +
+    aristotle_struggle_pattern via
+    corpus_registry.get_stores("aristotle:textbook"). student_id is
+    always "definer" (single-tenant pre-alpha).
     """
     container = _get_container(request)
     registry = getattr(container, "corpus_registry", None)
@@ -271,75 +281,100 @@ async def dashboard_route(request: Request):
     await cur.close()
     struggle_pattern = row[0] if row is not None else None
 
-    # 2. Read all concepts
+    # 2. LEFT JOIN all concepts with mastery records.
+    #    Concepts with no mastery row get NULLs (never studied).
     cur = await conn.execute(
-        "SELECT id, topic FROM aristotle_concept ORDER BY id"
-    )
-    concept_rows = await cur.fetchall()
-    await cur.close()
-    concepts = {r[0]: r[1] for r in concept_rows}
-
-    # 3. Read mastery records
-    cur = await conn.execute(
-        "SELECT concept_id, mastered, last_score, repetitions, "
-        "next_review_at, updated_at "
-        "FROM aristotle_mastery WHERE student_id = ? ORDER BY next_review_at",
+        "SELECT c.id, c.topic, "
+        "  COALESCE(m.mastered, 0) AS mastered, "
+        "  m.last_score, "
+        "  COALESCE(m.repetitions, 0) AS repetitions, "
+        "  m.next_review_at, "
+        "  m.updated_at "
+        "FROM aristotle_concept c "
+        "LEFT JOIN aristotle_mastery m "
+        "  ON c.id = m.concept_id AND m.student_id = ? "
+        "ORDER BY c.id",
         (student_id,),
     )
-    mastery_rows = await cur.fetchall()
+    rows = await cur.fetchall()
     await cur.close()
 
-    # 4. Build mastery_by_concept (merge concept info + mastery state)
+    # 3. Build mastery_by_concept with sort key
     from datetime import datetime, timezone
-    now_iso = datetime.now(timezone.utc).isoformat()
 
     mastery_by_concept: list[dict] = []
     mastered_count = 0
     due_count = 0
 
-    for r in mastery_rows:
+    for r in rows:
         concept_id = r[0]
-        mastered = bool(r[1])
-        last_score = r[2]
-        repetitions = r[3]
-        next_review_at = r[4]
-        updated_at = r[5]
+        topic = r[1]
+        mastered = bool(r[2])
+        last_score = r[3]
+        repetitions = r[4]
+        next_review_at = r[5]
+        updated_at = r[6]
 
         if mastered:
             mastered_count += 1
 
-        # Check if due (next_review_at is null or in the past)
-        is_due = True
-        if next_review_at:
-            try:
-                next_review = datetime.fromisoformat(next_review_at)
-                if next_review.tzinfo is None:
-                    next_review = next_review.replace(tzinfo=timezone.utc)
-                is_due = datetime.now(timezone.utc) >= next_review
-            except (ValueError, TypeError):
+        # Determine is_due:
+        # - If repetitions == 0 and next_review_at IS NULL → unstarted, NOT due
+        # - If next_review_at IS NULL and repetitions > 0 → due (started but no schedule)
+        # - If next_review_at is in the past → due
+        # - If next_review_at is in the future → not due
+        is_due = False
+        if repetitions > 0:
+            if next_review_at is None:
                 is_due = True
+            else:
+                try:
+                    next_review = datetime.fromisoformat(next_review_at)
+                    if next_review.tzinfo is None:
+                        next_review = next_review.replace(tzinfo=timezone.utc)
+                    is_due = datetime.now(timezone.utc) >= next_review
+                except (ValueError, TypeError):
+                    is_due = True
+        # Unstarted (repetitions == 0) → is_due stays False
+
         if is_due:
             due_count += 1
 
+        # Sort key: 0 = due (needs attention), 1 = unstarted, 2 = mastered, 3 = not due
+        if is_due:
+            sort_priority = 0
+        elif repetitions == 0:
+            sort_priority = 1
+        elif mastered:
+            sort_priority = 2
+        else:
+            sort_priority = 3
+
         mastery_by_concept.append({
             "concept_id": concept_id,
-            "topic": concepts.get(concept_id, concept_id),
+            "topic": topic,
             "mastered": mastered,
             "last_score": last_score,
             "repetitions": repetitions,
             "next_review_at": next_review_at,
             "is_due": is_due,
             "updated_at": updated_at,
+            "_sort_priority": sort_priority,
         })
 
-    # Sort by next_review_at ascending (nulls/due first), then by concept_id
+    # Sort: due first, then unstarted, then mastered, then not-due.
+    # Within each priority, sort by next_review_at ascending (nulls first), then concept_id.
     mastery_by_concept.sort(
-        key=lambda m: (m["next_review_at"] or "0000", m["concept_id"])
+        key=lambda m: (m["_sort_priority"], m["next_review_at"] or "0000", m["concept_id"])
     )
+
+    # Strip the internal sort key before returning
+    for m in mastery_by_concept:
+        del m["_sort_priority"]
 
     return {
         "student_id": student_id,
-        "total_concepts": len(concepts),
+        "total_concepts": len(rows),
         "mastered_count": mastered_count,
         "due_count": due_count,
         "struggle_pattern": struggle_pattern,

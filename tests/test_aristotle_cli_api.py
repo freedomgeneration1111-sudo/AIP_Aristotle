@@ -37,13 +37,31 @@ class _FakeModelProvider:
 
 
 class _FakeConn:
-    def __init__(self, rows: list[tuple] | None = None):
+    """Fake aiosqlite.Connection for testing.
+
+    Can either return the same rows for every query (simple mode) or
+    return different rows per query based on a list of row-sets
+    (multi-query mode). In multi-query mode, each execute() call
+    consumes the next row-set from the list.
+    """
+
+    def __init__(self, rows: list[tuple] | None = None, multi_rows: list[list[tuple]] | None = None):
         self._rows = rows or []
+        self._multi_rows = multi_rows
+        self._multi_idx = 0
         self._executed: list[tuple[str, tuple]] = []
 
     async def execute(self, sql: str, params: tuple = ()):
         self._executed.append((sql, params))
-        return _FakeCursor(self._rows)
+        if self._multi_rows is not None:
+            if self._multi_idx < len(self._multi_rows):
+                rows = self._multi_rows[self._multi_idx]
+                self._multi_idx += 1
+            else:
+                rows = []
+        else:
+            rows = self._rows
+        return _FakeCursor(rows)
 
     async def commit(self):
         pass
@@ -330,3 +348,74 @@ class TestCLI:
             result = runner.invoke(cli, ["list-concepts"])
             assert result.exit_code == 0
             assert "Inertia" in result.output
+
+
+# --------------------------------------------------------------------------
+# Dashboard route tests (Phase B — teacher dashboard)
+# --------------------------------------------------------------------------
+
+
+class TestDashboardRoute:
+    """Test the GET /aristotle/dashboard route."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_shows_all_concepts_including_unstarted(self):
+        """Dashboard returns ALL concepts, including ones with no mastery record.
+
+        Ingest 2 concepts. Start mastery on only 1 (the other is unstarted).
+        The dashboard's LEFT JOIN should return 2 rows — one with mastery
+        state, one with nulls (unstarted).
+        """
+        from aristotle.api import dashboard_route
+
+        # multi_rows: query 1 = struggle_pattern (fetchone, no rows = None)
+        #             query 2 = LEFT JOIN (fetchall, 2 rows)
+        # Row format from LEFT JOIN:
+        #   (concept_id, topic, mastered, last_score, repetitions, next_review_at, updated_at)
+        conn = _FakeConn(multi_rows=[
+            [],  # query 1: struggle_pattern (no row → None)
+            [
+                # concept 1: has mastery record (started, not mastered, due)
+                ("c1", "Inertia", 0, 0.4, 1, "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00"),
+                # concept 2: no mastery record (unstarted — all NULLs from LEFT JOIN)
+                ("c2", "Force", 0, None, 0, None, None),
+            ],
+        ])
+        container = _make_container(stores=_FakeStores(conn))
+
+        request = type("R", (), {
+            "app": type("A", (), {
+                "state": type("S", (), {"container": container})(),
+            })(),
+        })()
+
+        result = await dashboard_route(request)
+
+        # total_concepts = 2 (both concepts)
+        assert result["total_concepts"] == 2
+
+        # mastery_by_concept has 2 rows (LEFT JOIN includes unstarted)
+        assert len(result["mastery_by_concept"]) == 2
+
+        # concept c1: started, not mastered, due (next_review in 2020 → past)
+        c1 = next(m for m in result["mastery_by_concept"] if m["concept_id"] == "c1")
+        assert c1["mastered"] is False
+        assert c1["last_score"] == 0.4
+        assert c1["repetitions"] == 1
+        assert c1["is_due"] is True
+
+        # concept c2: unstarted (all nulls from LEFT JOIN)
+        c2 = next(m for m in result["mastery_by_concept"] if m["concept_id"] == "c2")
+        assert c2["mastered"] is False
+        assert c2["last_score"] is None
+        assert c2["repetitions"] == 0
+        assert c2["next_review_at"] is None
+        assert c2["is_due"] is False  # unstarted is NOT due
+
+        # Sort: c1 (due, priority 0) should come before c2 (unstarted, priority 1)
+        assert result["mastery_by_concept"][0]["concept_id"] == "c1"
+        assert result["mastery_by_concept"][1]["concept_id"] == "c2"
+
+        # due_count = 1 (only c1 is due; c2 is unstarted, not due)
+        assert result["due_count"] == 1
+        assert result["mastered_count"] == 0
