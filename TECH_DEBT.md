@@ -235,3 +235,39 @@ implementation works and is cleaner — ARISTOTLE owns its pedagogy.
 - ADR-001 §9 ("If anything here forces a reach into core internals, that is
   a Phase 0 gap to log")
 
+
+---
+
+## ARISTOTLE-DEBT-007 — SOCRATES Uses Raw SQL, Not Brain's Retrieval Pipeline
+
+**Status:** Active — Phase A pragmatism, revisit at Phase B/C
+**Phase:** Phase A
+**Filed:** 2026-06-19
+
+**What was deferred:**
+SOCRATES.teach() fetches concept content from `aristotle_concept` via raw SQL
+on the corpus write connection (`stores.connection_manager.write_conn.execute()`).
+It does NOT use the Brain's `assemble_augmented_context` or the hybrid FTS5+vector
+retrieval pipeline. The same is true for EXAMINER's `_fetch_concept()` helper.
+
+**Why deferred:**
+Phase A dogfood goal was to prove the tutoring loop end-to-end. Raw SQL is simpler
+and works — the concept table is small and the query is a primary-key lookup. The
+Brain's retrieval pipeline (FTS5 + vector + graph + RRF fusion) is designed for
+fuzzy retrieval across a large corpus, not for exact concept lookups.
+
+**Remediation trigger:**
+Phase B/C — when SOCRATES needs to:
+1. Pull alternate framings from the textbook corpus (requires fuzzy retrieval, not PK lookup)
+2. Blend textbook content with HERALD's live news (requires cross-corpus retrieval)
+3. Use the graph store for prerequisite DAG traversal (requires graph retrieval)
+
+At that point, SOCRATES should call `ctx.container._search_sources_fn` or equivalent
+to use the Brain's retrieval pipeline, not raw SQL.
+
+**Related work:**
+- `aristotle/actors/socrates.py::_fetch_concept()` (raw SQL)
+- `aristotle/actors/examiner.py::_fetch_concept()` (same pattern)
+- `AIP_Brain/src/aip/adapter/api/routes/_augmented_context.py` (the Brain's retrieval pipeline)
+- ADR-001 §4 (concept-aware retrieval via the graph store)
+
