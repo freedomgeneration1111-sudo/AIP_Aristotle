@@ -6,7 +6,7 @@
 > file BEFORE recommending changes — so no one gives advice that's already
 > obsolete relative to the implementation state.
 >
-> **Last Updated:** 2026-06-18
+> **Last Updated:** 2026-06-19
 > **Maintained by:** Super Z (main agent) + DEFINER review
 
 ## How to use this file
@@ -116,18 +116,92 @@ built. The tutoring loop ships without it; HERALD layers on when feeds land.
 
 ---
 
+## Status: Planned (Phase B.5 — Research-Grounded Pedagogical Improvements)
+
+Phase B.5 is the ADR-002 Rev 2 pedagogical upgrade to the existing tutoring
+loop. **It is net-new and can start immediately** — none of its deliverables
+depend on the platform web/feed layer (Phase C gate) or on the
+intake/placement system (Phase D). The improvements land in the existing
+TEACH → PROBE → QUIZ → EVALUATE → REMEDIATE state machine and the existing
+SOCRATES / EXAMINER / MENTOR actors.
+
+Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
+(Part A — Pedagogical Core, §§2–8).
+
+Internal build order (from ADR-002 §15):
+
+| # | Deliverable | Why it matters | Dependencies |
+|---|-------------|----------------|--------------|
+| 1 | **PREDICT step** in `session.py` + `aristotle_predict_event` table (M003 partial) | Pre-teaches a prediction; commits the learner before exposure. New SessionState, new schema, new EXAMINER method. | None beyond Phase A. |
+| 2 | **HINT_1 / HINT_2** SessionStates + `EXAMINER.generate_hint()` | Replaces the "give up and remediate" cliff with a 2-rung hint ladder before REMEDIATE. | None. |
+| 3 | **Error diagnosis** in `EXAMINER.evaluate()` | EVALUATE returns a structured error type (procedural vs. conceptual vs. misread), not just a score. Feeds MENTOR. | None. |
+| 4 | **Faded worked examples** in `SOCRATES.teach()` | Worked example → partially completed → learner completes. Reduces cognitive load on first exposure. | None. |
+| 5 | **Session interleaving** in the session coordinator | Mix new concepts with review of due concepts (SM-2 schedule), not blocked-by-prerequisite linear. | Existing SM-2 + concept DAG (built). |
+| 6 | **Transfer question type** in `EXAMINER.quiz()` | Recognition vs. transfer — different quiz types for different Bloom levels. | None. |
+| 7 | **`aristotle_misconception_log`** table (M003) + MENTOR misconception tracking | MENTOR stops writing a single diagnostic sentence and starts tracking a structured misconception history per student/concept. | None. |
+| 8 | **Extended mastery model** (M003 addition to `aristotle_mastery`) | Adds BKT-inspired fields (probability of mastery, last cold-check timestamp). Replaces pure SM-2 with a hybrid. | Existing `aristotle_mastery` (built). |
+| 9 | **`cold_start_check()`** in EXAMINER | Periodically re-verifies "mastered" concepts unassisted. Catches overreliance on hints / memorization. Recommended frequency: every 5th session per concept once mastered. | Extended mastery model (item 8). |
+
+**Gate:** None. Phase B.5 can ship incrementally alongside Phase D.
+
+**Open DEFINER decisions blocking Phase B.5** (ADR-002 §16):
+- #4: `ActorResult.data` field — add to platform Protocol (breaking change) or keep error-as-payload? **Recommended:** add `data: Any = None`.
+
+---
+
+## Status: Planned (Phase D — Onboarding: Intake + Placement + Long-Arc Plan)
+
+Phase D is the ADR-002 Rev 2 onboarding system. New learners walk through a
+five-stage intake interview, take a placement calibration, and receive a
+versioned long-arc learning plan that drives session selection across
+weeks. Two new actors (INTAKE, PLACER), three new tables, OCR + voice
+capabilities for material upload.
+
+Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
+(Part B — Onboarding, §§9–13; Part C — New capabilities, §§12–13).
+
+**Core Phase D has no external dependencies.** Web search unlocks material
+sourcing (fetching a PDF from a publisher's page); the intake/placement
+loop itself runs without it.
+
+Internal build order (from ADR-002 §15):
+
+| # | Deliverable | Why it matters | Dependencies |
+|---|-------------|----------------|--------------|
+| 1 | **M003 full schema** (`aristotle_learning_plan`, `aristotle_placement_event`, `aristotle_intake_session` + the B.5 tables) | Versioned, append-only long-arc plan + placement history + intake session log. | None. |
+| 2 | **INTAKE actor** (ADR-002 §11) + intake session API route | Conducts the five-stage intake interview (context, goals, prior exposure, time, friction). Uses the `synthesis` slot. | None. |
+| 3 | **INTAKE GUI page** at `/intake` | Conversational UI mirroring the tutoring loop's polish. | Platform v1.1 GUI mount (built). |
+| 4 | **`ui.upload` for PDF + image** | Learner uploads their textbook / worksheet / handwritten problem. | Platform NiceGUI `ui.upload` (built). |
+| 5 | **OCR path** via `pytesseract` | Extracts text from uploaded images / scanned PDFs into the ingestor. `pypdf` for native PDFs (DEBT-012 resolved). | None. `pytesseract` + `Pillow` installed (ADR-002 §17). |
+| 6 | **PLACER actor** (ADR-002 §11) + placement API route | Calibrates starting mastery per concept after intake. Writes `aristotle_placement_event`. Uses the `evaluation` slot. | INTAKE actor (item 2). |
+| 7 | **Voice mode toggle** | Browser Web Speech API for STT (zero-dep path). Optional Whisper slot for Urdu / noisy sessions. | None for browser path. Whisper needs platform model slot. |
+| 8 | **Long-arc plan executor** | Session coordinator consults the versioned `aristotle_learning_plan` to pick the next concept + session type. | M003 schema (item 1) + Phase B.5 cold-start check (B.5 item 9). |
+
+**Gate:** None for core (items 1–7). Item 8 (long-arc plan executor) benefits
+from Phase B.5's cold-start check but can ship a simpler version first.
+
+**Open DEFINER decisions blocking Phase D** (ADR-002 §16):
+- #1: Backup strategy A/B/C (ADR-014 §9.7) — **blocking**. Recommended: Option A.
+- #2: OCR quality — `pytesseract` (local, free) vs vision model slot. Recommended: `pytesseract` for Phase D.
+- #3: Voice STT — browser Web Speech API (zero-dep) vs Whisper slot (Urdu, noisy). Recommended: browser for Phase D.
+- #5: Intake conversation language — English-only intake, bilingual tutoring? Recommended: English-only intake for Phase D.
+
+---
+
 ## Change Log
 
 | Date | Change | Agent |
 |------|--------|-------|
 | 2026-06-18 | Created file. Seeded with Phase A dogfood status + Near-Term/Long-Term from ADR-001 §11. | Super Z (main) |
 | 2026-06-18 | Phase B (teacher dashboard) shipped: GET /aristotle/dashboard API (LEFT JOIN, all concepts, correct sort), /dashboard GUI page (3 panels: stats, struggle pattern, mastery table), nav registration ("Teach", order=35). Dashboard fix: LEFT JOIN so unstarted concepts appear + correct sort order (due → unstarted → mastered). | Super Z (main) |
+| 2026-06-19 | ADR-002 Rev 2 committed (`docs/decisions/ADR-002-intake-placement-learning-plan.md`). Added Phase B.5 (research-grounded pedagogical improvements — PREDICT, hints, error diagnosis, faded examples, interleaving, transfer questions, misconception log, mastery model extension, cold-start check) and Phase D (intake, placement, long-arc plan, OCR, voice) as planned phases with their ADR-002 §15 build orders. No code changes. | Super Z (main) |
 
 ---
 
 ## Cross-References
 
 - **ADR-001** → `docs/decisions/ADR-001-aristotle-architecture.md` — the architecture spec
+- **ADR-002** → `docs/decisions/ADR-002-intake-placement-learning-plan.md` — intake, placement, long-arc plan, and the Phase B.5 pedagogical upgrades
 - **TECH_DEBT.md** → ARISTOTLE-specific debt items
 - **STATUS.md** → current operational state
 - **Platform ADR-014** → `AIP_Brain/docs/decisions/ADR-014-phase0-extension-host.md` — the extension contract

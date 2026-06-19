@@ -1,8 +1,8 @@
 # AIP_Aristotle Roadmap
 # DEFINER: B. Moses Jorgensen
-# Last Updated: 2026-06-18
+# Last Updated: 2026-06-19
 # Process: Update this document after each significant build session or architectural decision.
-# Release: 0.1.0-alpha (Phase A dogfood)
+# Release: 0.1.0-alpha (Phase A + Phase B dogfood complete)
 
 ---
 
@@ -24,7 +24,14 @@ extension boundary.
 
 ## Phase A — Tutoring Loop (ships first)
 *The dogfood drop. Proves the platform contract end-to-end.*
-*Status: ⏳ IN PROGRESS (platform integration done; actors are placeholders)*
+*Status: ✅ COMPLETE — tutoring loop runs end-to-end (verified 2026-06-19 dogfood)*
+
+Phase A is done. The TEACH → PROBE → QUIZ → EVALUATE → REMEDIATE state
+machine runs through `aristotle.session.run_session_step`, the CLI drives
+it (`aristotle session <concept>`), the API exposes it
+(`/aristotle/session/{start,step,run}`), the GUI learning view at `/learn`
+renders it, and the sample concepts (`concepts_sample.yaml`) include the
+prerequisite DAG (Newton's Three Laws, bilingual en/ur).
 
 ### What's done (Phase A foundation)
 
@@ -65,7 +72,13 @@ These are the gates between "platform contract proven" and "Ramesh can self-tuto
 
 ## Phase B — Teacher Dashboard
 *Read-views into every student's state — leverage, not surveillance.*
-*Status: 🔲 PLANNED (depends on Phase A completion + platform v1.1 GUI mount)*
+*Status: ✅ COMPLETE — GET /aristotle/dashboard + /dashboard GUI page shipped (verified 2026-06-19 dogfood)*
+
+Phase B is done. The dashboard API returns `mastery_by_concept` via a
+LEFT JOIN (all concepts appear, including never-started ones), the sort
+order is due → unstarted → mastered, and the GUI renders a stats header,
+the struggle-pattern panel, and the mastery table. Nav item "Teach"
+(order=35) is registered dynamically via `/health/extensions`.
 
 The one place the actor decomposition is visible (ADR-001 §8). Komal's scarce
 human time goes where only a human can go; the tutor absorbs infinite patient
@@ -80,6 +93,30 @@ repetition.
 
 **Gate:** Phase B requires the platform's v1.1 GUI mount (stage 4). The backend
 data is available once Phase A is complete; the GUI surface is the platform dependency.
+
+---
+
+## Phase B.5 — Research-Grounded Pedagogical Improvements
+*Tutoring loop upgrade from ADR-002 Rev 2. No external dependencies — can start immediately.*
+*Status: 🔲 PLANNED (spec committed 2026-06-19; awaiting DEFINER review of ADR-002)*
+
+Phase B.5 layers the ADR-002 Rev 2 pedagogical upgrades onto the existing
+TEACH → PROBE → QUIZ → EVALUATE → REMEDIATE state machine. The state
+machine gains a PREDICT step and a hint ladder; SOCRATES gains faded
+worked examples; EXAMINER gains error diagnosis, transfer questions, and
+a cold-start check; MENTOR graduates from a single diagnostic sentence to
+a structured misconception log; the mastery model gets a BKT-inspired
+extension on top of SM-2.
+
+Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
+(Part A — §§2–8). Build order: ADR-002 §15 (9 items, listed in
+PLANNED_FEATURES.md → Phase B.5 table).
+
+**Gate:** None. Phase B.5 can ship incrementally alongside Phase D.
+
+**Open DEFINER decision blocking B.5:** ADR-002 §16 #4 — add
+`ActorResult.data` field to the platform Protocol (breaking change) or
+keep the error-as-payload pattern.
 
 ---
 
@@ -99,6 +136,33 @@ absorbs not just concepts but the living landscape they sit in (ADR-001 §6).
 
 **Gate:** Phase C is blocked on the platform's web/feed layer (ADR-014 §3.4).
 The tutoring loop ships without HERALD; HERALD layers on when feeds land.
+
+---
+
+## Phase D — Onboarding (Intake + Placement + Long-Arc Plan)
+*Five-stage intake, placement calibration, versioned long-arc plan. ADR-002 Rev 2.*
+*Status: 🔲 PLANNED (spec committed 2026-06-19; awaiting DEFINER review of ADR-002)*
+
+Phase D is the ADR-002 Rev 2 onboarding system. New learners walk through a
+five-stage intake interview (context, goals, prior exposure, time, friction),
+take a placement calibration, and receive a versioned long-arc learning plan
+that drives session selection across weeks. Two new actors (INTAKE, PLACER),
+three new tables, OCR + voice capabilities for material upload.
+
+Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
+(Part B — §§9–13; Part C — §§12–13). Build order: ADR-002 §15 (8 items,
+listed in PLANNED_FEATURES.md → Phase D table).
+
+**Gate:** None for core (M003 schema, INTAKE actor + GUI, `ui.upload`, OCR,
+PLACER actor, voice toggle). The long-arc plan executor benefits from
+Phase B.5's cold-start check but can ship a simpler version first.
+Web search (a platform-side capability) unlocks material sourcing —
+fetching a PDF from a publisher's page — but the intake/placement loop
+itself runs without it.
+
+**Open DEFINER decisions blocking Phase D:** ADR-002 §16 #1 (backup
+strategy — blocking), #2 (OCR quality), #3 (voice STT), #5 (intake
+language).
 
 ---
 
@@ -136,6 +200,7 @@ ARISTOTLE depends on these platform capabilities (all in AIP_Brain `feat/multi-c
 | Date | Change | Author |
 |------|--------|--------|
 | 2026-06-18 | Created roadmap. Seeded with Phase A/B/C from ADR-001 §11. Phase A foundation done; near-term gates identified. | Super Z (main) |
+| 2026-06-19 | ADR-002 Rev 2 committed. Phase A and Phase B marked COMPLETE (verified via 2026-06-19 dogfood run). Phase B.5 added (research-grounded pedagogical improvements — no external dependencies). Phase D added (intake, placement, long-arc plan, OCR, voice — no external dependencies for core; web search unlocks material sourcing). Phase C unchanged (still gated on platform web/feed layer). | Super Z (main) |
 
 ---
 
