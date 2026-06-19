@@ -113,6 +113,18 @@ class SessionContext:
     # Phase B.5 (HINT ladder): whether the current HINT_1/HINT_2 step has
     # generated its hint (phase 1 done, waiting for learner's re-answer).
     hint_generated: bool = False
+    # Phase B.5 (interleaving, B.5 item 5): the concept queue for this
+    # session. Slot 0 is the primary concept (the one the caller passed).
+    # Slots 1-2 are due review concepts (selected by _build_concept_queue
+    # at session start). The current concept is always concept_queue[0].
+    # When NEXT_CONCEPT fires, queue[0] is popped; if non-empty, the
+    # session advances to the next concept; if empty, SESSION_COMPLETE.
+    concept_queue: list = field(default_factory=list)
+    # Phase B.5 (cold-start check, B.5 item 9): concepts in the queue that
+    # need a cold-start check (skip PREDICT/TEACH, go directly to PROBE).
+    # Populated by _build_concept_queue for review concepts whose SM-2
+    # interval >= 7 days AND cold_start_passed == 0.
+    cold_start_pending: set = field(default_factory=set)
 
 
 async def run_session_step(
@@ -350,6 +362,71 @@ async def _get_mastery_level(ctx: ActorContext, session: SessionContext) -> int:
         return int(row[0])
     except Exception:
         return 0  # best-effort — never block the teach step
+
+
+async def _build_concept_queue(
+    ctx: ActorContext,
+    primary_concept_id: str,
+    student_id: str = "definer",
+) -> tuple[list, set]:
+    """Build the interleaved concept queue for a session (ADR-002 §6, B.5 item 5).
+
+    Slot 0 (primary): the concept_id passed by the caller (the new or
+    in-progress concept the learner wants to study).
+    Slots 1-2 (review): up to 2 concepts where next_review_at <= now
+    AND concept_id != primary, ordered by next_review_at ASC. These are
+    due for a spaced-repetition retrieval check — interleaved practice
+    (contextual interference effect, Bjork).
+
+    Also identifies cold-start candidates: review concepts whose SM-2
+    interval >= 7 days AND cold_start_passed == 0. These skip
+    PREDICT/TEACH and go directly to PROBE (unassisted retrieval) —
+    the cold-start check catches overreliance on hints (B.5 item 9).
+
+    Returns: (concept_queue, cold_start_pending)
+      - concept_queue: list of concept_ids, [primary, review1, review2?]
+      - cold_start_pending: set of concept_ids needing a cold-start check
+
+    If no review concepts are due, returns ([primary], set()).
+    """
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return [primary_concept_id], set()
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Query for due review concepts (next_review_at <= now, not the primary).
+        # Order by next_review_at ASC so the most overdue come first. Limit 2.
+        cur = await conn.execute(
+            "SELECT concept_id, interval_days, cold_start_passed "
+            "FROM aristotle_mastery "
+            "WHERE student_id = ? AND concept_id != ? "
+            "AND next_review_at IS NOT NULL AND next_review_at <= ? "
+            "ORDER BY next_review_at ASC LIMIT 2",
+            (student_id, primary_concept_id, now_iso),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        queue = [primary_concept_id]
+        cold_start_pending: set = set()
+
+        for row in rows:
+            review_concept_id = row[0]
+            interval_days = row[1] if row[1] is not None else 0
+            cold_start_passed = row[2] if row[2] is not None else 0
+            queue.append(review_concept_id)
+            # Cold-start check: interval >= 7 days AND not yet passed.
+            if interval_days >= 7 and cold_start_passed == 0:
+                cold_start_pending.add(review_concept_id)
+
+        return queue, cold_start_pending
+    except Exception:
+        return [primary_concept_id], set()
 
 
 async def _increment_mastery_column(
@@ -886,21 +963,76 @@ async def _step_next_concept(
     ctx: ActorContext,
     session: SessionContext,
 ) -> ActorResult:
-    """NEXT_CONCEPT: concept mastered (or max retries), advance (ADR-001 §3)."""
+    """NEXT_CONCEPT: advance to the next concept in the queue, or complete (ADR-002 §6).
+
+    Phase B.5 (interleaving): pops concept_queue[0] (the just-completed
+    concept). If the queue is non-empty, sets concept_id = queue[0],
+    resets the per-concept state (state, hint_count, last_diagnosis,
+    last_question_type, predict_generated, etc.), and continues the
+    session. If the queue is empty, the session is complete.
+
+    Cold-start handling: if the new concept_id is in cold_start_pending,
+    the state is set to PROBE (not PREDICT) — the cold-start check skips
+    PREDICT/TEACH and goes directly to unassisted retrieval (B.5 item 9).
+    """
     logger = ctx.logger
 
-    # For Phase A single-concept sessions, the session is complete.
-    # A future full-session coordinator would consult the prerequisite DAG
-    # for the next concept whose foundations are met.
-    session.state = SessionState.SESSION_COMPLETE
-    logger.info(
-        "session_step_next_concept concept=%s mastered=%s — session complete",
-        session.concept_id, session.mastered,
-    )
-    return ActorResult(
-        ok=True,
-        error=f"Concept {session.concept_id} session complete. Mastered: {session.mastered}",
-    )
+    # Pop the just-completed concept from the queue.
+    if session.concept_queue:
+        session.concept_queue.pop(0)
+
+    if session.concept_queue:
+        # Advance to the next concept in the queue.
+        next_concept = session.concept_queue[0]
+        session.concept_id = next_concept
+
+        # Reset per-concept state for the new concept.
+        session.hint_count = 0
+        session.hint_generated = False
+        session.last_diagnosis = None
+        session.last_question_type = "recognition"
+        session.predict_generated = False
+        session.last_prediction = ""
+        session.last_explanation = ""
+        session.last_probe_question = ""
+        session.last_quiz_question = ""
+        session.last_student_answer = ""
+        session.last_evaluation = ""
+        session.last_score = 0.0
+        session.mastered = False
+        session.retry_count = 0
+        session.quiz_generated = False
+        session.probe_generated = False
+
+        # Cold-start check: if the new concept is in cold_start_pending,
+        # skip PREDICT/TEACH and go directly to PROBE (unassisted).
+        if next_concept in session.cold_start_pending:
+            session.state = SessionState.PROBE
+            logger.info(
+                "session_step_next_concept cold_start concept=%s — skipping PREDICT/TEACH",
+                next_concept,
+            )
+        else:
+            session.state = SessionState.PREDICT
+            logger.info(
+                "session_step_next_concept advance concept=%s queue_len=%d",
+                next_concept, len(session.concept_queue),
+            )
+        return ActorResult(
+            ok=True,
+            error=f"Advancing to concept {next_concept}. Cold-start: {next_concept in session.cold_start_pending}",
+        )
+    else:
+        # Queue empty — session complete.
+        session.state = SessionState.SESSION_COMPLETE
+        logger.info(
+            "session_step_next_concept concept=%s mastered=%s — session complete (queue empty)",
+            session.concept_id, session.mastered,
+        )
+        return ActorResult(
+            ok=True,
+            error=f"Concept {session.concept_id} session complete. Mastered: {session.mastered}",
+        )
 
 
 async def _update_mastery(ctx: ActorContext, session: SessionContext) -> None:

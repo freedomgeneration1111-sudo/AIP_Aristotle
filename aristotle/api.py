@@ -128,12 +128,23 @@ async def session_start_route(request: Request):
     """Start a new tutoring session.
 
     Request body: {"concept_id": "newton_first_law"}
-    Returns: the initial SessionContext (state=PREDICT).
+    Returns: the initial SessionContext (state=PREDICT) with the
+    interleaved concept_queue populated.
 
-    Phase B.5: sessions now start at PREDICT (the generation effect —
-    learner guesses before teaching). The caller's first /session/step
-    call generates the predict prompt; the next call with the learner's
-    prediction text in student_input records it + advances to TEACH.
+    Phase B.5 (interleaving, B.5 item 5): the session builds a concept
+    queue at start — slot 0 is the primary concept (the one the caller
+    passed), slots 1-2 are due review concepts (selected by
+    _build_concept_queue from aristotle_mastery where next_review_at
+    <= now). When the primary concept is mastered (NEXT_CONCEPT), the
+    session advances to the next concept in the queue. If the queue
+    has only the primary, the session degrades to single-concept
+    (Phase A behavior).
+
+    Phase B.5 (cold-start, B.5 item 9): review concepts whose SM-2
+    interval >= 7 days AND cold_start_passed == 0 are added to
+    cold_start_pending. When the session reaches such a concept, it
+    skips PREDICT/TEACH and goes directly to PROBE (unassisted
+    retrieval) — the cold-start check catches overreliance on hints.
     """
     container = _get_container(request)
     body = await request.json()
@@ -141,7 +152,18 @@ async def session_start_route(request: Request):
     if not concept_id:
         raise HTTPException(status_code=400, detail="concept_id required")
 
-    session = SessionContext(concept_id=concept_id, state=SessionState.PREDICT)
+    # Build the interleaved concept queue + cold-start pending set.
+    from aristotle.session import _build_concept_queue
+    queue, cold_start_pending = await _build_concept_queue(
+        _make_ctx(container), concept_id,
+    )
+
+    session = SessionContext(
+        concept_id=concept_id,
+        state=SessionState.PREDICT,
+        concept_queue=queue,
+        cold_start_pending=cold_start_pending,
+    )
     return _session_to_dict(session)
 
 
@@ -429,6 +451,10 @@ def _session_to_dict(session: SessionContext) -> dict:
         "predict_generated": session.predict_generated,
         "hint_count": session.hint_count,
         "hint_generated": session.hint_generated,
+        "last_diagnosis": session.last_diagnosis,
+        "last_question_type": session.last_question_type,
+        "concept_queue": list(session.concept_queue),
+        "cold_start_pending": list(session.cold_start_pending),
     }
 
 
@@ -453,4 +479,8 @@ def _session_from_dict(d: dict) -> SessionContext:
         predict_generated=d.get("predict_generated", False),
         hint_count=d.get("hint_count", 0),
         hint_generated=d.get("hint_generated", False),
+        last_diagnosis=d.get("last_diagnosis", None),
+        last_question_type=d.get("last_question_type", "recognition"),
+        concept_queue=d.get("concept_queue", []),
+        cold_start_pending=set(d.get("cold_start_pending", [])),
     )

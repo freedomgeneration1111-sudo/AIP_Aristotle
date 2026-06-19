@@ -1173,3 +1173,118 @@ class TestSessionCoordinator:
         )
         assert session.hint_count == 2
         assert session.retry_count == 1  # REMEDIATE incremented retry_count
+
+    # ------------------------------------------------------------------
+    # Phase B.5 item 5: session interleaving (concept_queue)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_session_queue_includes_due_review_concepts(self):
+        """_build_concept_queue returns [primary, review1, review2?] when reviews are due.
+
+        Phase B.5 item 5: the session queue interleaves the primary concept
+        with up to 2 due review concepts. This test uses a routing fake conn
+        that returns 2 due review concepts for the mastery query.
+        """
+        from aristotle.session import _build_concept_queue
+
+        class _RoutingConn:
+            async def execute(self, sql, params=()):
+                if "aristotle_mastery" in sql.lower() and "next_review_at" in sql.lower():
+                    # Due review concepts query → return 2 rows
+                    return _FakeCursor([
+                        ("review_1", 6, 0),
+                        ("review_2", 14, 0),
+                    ])
+                return _FakeCursor(None)
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        queue, cold_start = await _build_concept_queue(ctx, "primary_concept")
+        assert len(queue) == 3  # primary + 2 reviews
+        assert queue[0] == "primary_concept"
+        assert "review_1" in queue
+        assert "review_2" in queue
+
+    @pytest.mark.asyncio
+    async def test_session_queue_primary_only_when_nothing_due(self):
+        """_build_concept_queue returns [primary] when no reviews are due."""
+        from aristotle.session import _build_concept_queue
+
+        conn = _FakeConn(rows=None)  # no due reviews
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        queue, cold_start = await _build_concept_queue(ctx, "primary_concept")
+        assert len(queue) == 1
+        assert queue[0] == "primary_concept"
+        assert cold_start == set()
+
+    @pytest.mark.asyncio
+    async def test_session_advances_to_next_concept_in_queue(self):
+        """After NEXT_CONCEPT with a non-empty queue, concept_id changes + state resets.
+
+        Phase B.5 item 5: when the current concept is mastered, the session
+        pops concept_queue[0] and advances to the next concept. The state
+        resets to PREDICT (or PROBE if cold-start pending), hint_count
+        resets to 0, etc.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        fake = _FakeModelProvider()
+        conn = _FakeConn(rows=None)
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="concept_a",
+            state=SessionState.NEXT_CONCEPT,
+            concept_queue=["concept_a", "concept_b"],
+            hint_count=2,
+            last_diagnosis={"misconception": "x"},
+            last_question_type="transfer",
+            predict_generated=True,
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        # concept_id should have advanced to concept_b
+        assert session.concept_id == "concept_b"
+        assert session.state == SessionState.PREDICT  # reset to PREDICT
+        assert session.hint_count == 0  # reset
+        assert session.last_diagnosis is None  # reset
+        assert session.last_question_type == "recognition"  # reset
+        assert session.predict_generated is False  # reset
+
+    @pytest.mark.asyncio
+    async def test_session_completes_when_queue_empty(self):
+        """After the last concept in the queue, state is SESSION_COMPLETE."""
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        fake = _FakeModelProvider()
+        conn = _FakeConn(rows=None)
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="last_concept",
+            state=SessionState.NEXT_CONCEPT,
+            concept_queue=["last_concept"],  # only one concept — will be empty after pop
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        assert session.state == SessionState.SESSION_COMPLETE
