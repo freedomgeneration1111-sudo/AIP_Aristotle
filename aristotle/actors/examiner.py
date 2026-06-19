@@ -81,22 +81,55 @@ class ExaminerActor:
             ),
         )
 
-    async def quiz(self, ctx: ActorContext, concept_id: str) -> ActorResult:
-        """Generate a real quiz question (ADR-001 §3 QUIZ).
+    async def quiz(
+        self,
+        ctx: ActorContext,
+        concept_id: str,
+        *,
+        question_type: str = "recognition",
+    ) -> ActorResult:
+        """Generate a quiz question — recognition or transfer (ADR-002 Rev 2 §3 QUIZ).
 
-        A quiz is a real question at the concept's bloom_target level.
-        Returns the quiz question. The student's answer is scored by
-        `evaluate()`.
+        Phase B.5: two question types:
+          - "recognition" (default): can the learner identify/recall the
+            correct answer? Tests whether the concept is known. This is
+            the Phase A behavior — a definition check or identification.
+          - "transfer": apply the concept to a NEW situation the learner
+            hasn't seen. Different prompt — the model produces an
+            application scenario, not a definition check. Transfer is
+            the hard target; recognition is the gate. A learner who can
+            recognize but not transfer hasn't truly mastered the concept.
+
+        The session coordinator selects question_type based on mastery_level:
+        recognition for level < 2, transfer for level >= 2 (ADR-002 §3).
+
+        Returns:
+            ActorResult(ok=True, data={"question": <str>, "question_type": <str>}).
+            Phase B.5 migration: uses data, not error-as-payload. quiz() is
+            the third actor migrated (evaluate() + teach() are the reference).
 
         Governance: if no model provider, returns NEEDS_CONFIGURATION.
         """
+        if question_type == "transfer":
+            system_prompt = (
+                "You are Aristotle. Ask a TRANSFER question — apply this "
+                "concept to a NEW situation the learner hasn't seen before. "
+                "Do NOT ask for a definition or identification. Instead, "
+                "present a novel scenario, problem, or application that "
+                "requires the learner to USE the concept to reason through "
+                "it. The scenario should be different from any examples in "
+                "the textbook passage. One question only."
+            )
+        else:
+            system_prompt = (
+                "You are Aristotle. Ask a RECOGNITION question that tests "
+                "whether the learner can identify or recall the correct "
+                "answer for this concept. The question should match the "
+                "concept's Bloom's taxonomy level. One question only."
+            )
         return await self._generate_question(
-            ctx, concept_id, question_type="quiz",
-            system_prompt=(
-                "You are Aristotle. Ask a real question that tests whether "
-                "the learner has mastered this concept. The question should "
-                "match the concept's Bloom's taxonomy level. One question only."
-            ),
+            ctx, concept_id, question_type=question_type,
+            system_prompt=system_prompt,
         )
 
     async def evaluate(
@@ -412,10 +445,15 @@ class ExaminerActor:
             )
             question = result.get("content", "")
             logger.info(
-                "examiner_%s_ok concept=%s question_len=%d",
-                question_type, concept_id, len(question),
+                "examiner_%s_ok concept=%s question_type=%s question_len=%d",
+                question_type, concept_id, question_type, len(question),
             )
-            return ActorResult(ok=True, error=question)
+            # Phase B.5: use the data field, not error-as-payload.
+            # This migrates both quiz() AND probe() (which share this helper).
+            return ActorResult(
+                ok=True,
+                data={"question": question, "question_type": question_type},
+            )
         except Exception as exc:
             logger.warning(
                 "examiner_%s_failed concept=%s error=%s:%s",

@@ -88,6 +88,10 @@ class SessionContext:
     last_evaluation: str = ""  # JSON from EXAMINER.evaluate() (legacy — kept for backward compat)
     last_score: float = 0.0
     mastered: bool = False
+    # Phase B.5 (transfer questions): the type of the last quiz question.
+    # "recognition" (default) or "transfer". Set by _step_quiz, read by
+    # _step_evaluate to increment transfer_correct when the answer is right.
+    last_question_type: str = "recognition"
     # Phase B.5 (error diagnosis): the structured diagnosis dict from
     # EXAMINER.evaluate() when the answer is wrong. None when correct or
     # when the model didn't return a diagnosis. Read by MENTOR's
@@ -348,6 +352,40 @@ async def _get_mastery_level(ctx: ActorContext, session: SessionContext) -> int:
         return 0  # best-effort — never block the teach step
 
 
+async def _increment_mastery_column(
+    ctx: ActorContext, session: SessionContext, column_name: str
+) -> None:
+    """Increment an integer counter column on aristotle_mastery (best-effort).
+
+    Phase B.5: used by _step_quiz (transfer_attempted) and _step_evaluate
+    (transfer_correct). The columns were added by M003. Best-effort:
+    non-fatal on DB failure (the mastery row may not exist yet; the
+    counter is analytics, not control flow).
+    """
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        # parameterized column name isn't supported in SQL — validate
+        # against a whitelist to prevent injection.
+        allowed = {"transfer_attempted", "transfer_correct", "hint_assisted_correct",
+                   "slip_count", "cold_start_passed"}
+        if column_name not in allowed:
+            return
+        await conn.execute(
+            f"UPDATE aristotle_mastery SET {column_name} = {column_name} + 1 "
+            "WHERE student_id = ? AND concept_id = ?",
+            (session.student_id, session.concept_id),
+        )
+        await conn.commit()
+    except Exception:
+        pass  # best-effort — analytics counter, never block the session
+
+
 async def _step_teach(
     ctx: ActorContext,
     session: SessionContext,
@@ -400,7 +438,12 @@ async def _step_probe(
     result = await examiner.probe(ctx, session.concept_id)
 
     if result.ok:
-        session.last_probe_question = result.error or ""
+        # Phase B.5: read from result.data (not error-as-payload).
+        # probe() shares _generate_question with quiz(), which was migrated.
+        if result.data is not None and isinstance(result.data, dict):
+            session.last_probe_question = result.data.get("question", "")
+        else:
+            session.last_probe_question = result.error or ""
         session.probe_generated = True
         session.state = SessionState.QUIZ
         logger.info("session_step_probe concept=%s", session.concept_id)
@@ -413,25 +456,51 @@ async def _step_quiz(
     examiner: Any,
     student_input: str,
 ) -> ActorResult:
-    """QUIZ: EXAMINER asks a real question (ADR-001 §3).
+    """QUIZ: EXAMINER asks a real question (ADR-001 §3 + ADR-002 Rev 2 §3).
 
     Two-phase: first call generates the quiz question (no input needed),
     second call (with student_input) records the answer and advances to EVALUATE.
+
+    Phase B.5 (transfer questions): the question type is selected based on
+    mastery_level — recognition for level < 2, transfer for level >= 2.
+    Transfer questions apply the concept to a new situation the learner
+    hasn't seen. When transfer is selected, transfer_attempted is
+    incremented on aristotle_mastery (column from M003). The question
+    type is stored on session.last_question_type so _step_evaluate can
+    increment transfer_correct when the answer is right.
     """
     logger = ctx.logger
 
     if not session.quiz_generated:
+        # Phase B.5: select question_type based on mastery_level.
+        mastery_level = await _get_mastery_level(ctx, session)
+        if mastery_level >= 2:
+            question_type = "transfer"
+            # Best-effort: increment transfer_attempted on aristotle_mastery.
+            await _increment_mastery_column(ctx, session, "transfer_attempted")
+        else:
+            question_type = "recognition"
+
         # Phase 1: generate the quiz question
-        result = await examiner.quiz(ctx, session.concept_id)
+        result = await examiner.quiz(ctx, session.concept_id, question_type=question_type)
         if result.ok:
-            session.last_quiz_question = result.error or ""
+            # Phase B.5: read from result.data (not error-as-payload).
+            if result.data is not None and isinstance(result.data, dict):
+                session.last_quiz_question = result.data.get("question", "")
+                session.last_question_type = result.data.get("question_type", question_type)
+            else:
+                session.last_quiz_question = result.error or ""
+                session.last_question_type = question_type
             session.quiz_generated = True
             # If student_input was provided (non-interactive mode), record it
             # and advance to EVALUATE immediately
             if student_input:
                 session.last_student_answer = student_input
                 session.state = SessionState.EVALUATE
-            logger.info("session_step_quiz_generate concept=%s", session.concept_id)
+            logger.info(
+                "session_step_quiz_generate concept=%s question_type=%s mastery_level=%d",
+                session.concept_id, session.last_question_type, mastery_level,
+            )
         return result
     else:
         # Phase 2: student's answer arrived — advance to EVALUATE
@@ -525,6 +594,11 @@ async def _step_evaluate(
     config = ctx.config
     mastery_threshold = getattr(config, "mastery_threshold", 0.7) if config else 0.7
     if session.last_score >= mastery_threshold:
+        # Phase B.5 (transfer questions): if the correct answer was for a
+        # transfer question, increment transfer_correct on aristotle_mastery
+        # (column from M003). Best-effort — non-fatal on DB failure.
+        if session.last_question_type == "transfer":
+            await _increment_mastery_column(ctx, session, "transfer_correct")
         session.state = SessionState.NEXT_CONCEPT
     else:
         # Failed quiz — consult hint_count for the next step.

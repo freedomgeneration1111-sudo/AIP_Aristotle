@@ -390,7 +390,9 @@ class TestExaminerMethods:
         assert result.ok
         assert len(fake.calls) == 1
         assert fake.calls[0][0] == "evaluation"
-        assert "inertia" in result.error.lower()
+        # Phase B.5: probe() returns data={"question": ...}, not error=
+        assert result.data is not None
+        assert "inertia" in result.data["question"].lower()
 
     @pytest.mark.asyncio
     async def test_quiz_calls_evaluation_slot(self):
@@ -400,7 +402,9 @@ class TestExaminerMethods:
         examiner = ExaminerActor()
         result = await examiner.quiz(ctx, "c1")
         assert result.ok
-        assert "force" in result.error.lower()
+        # Phase B.5: quiz() returns data={"question": ...}, not error=
+        assert result.data is not None
+        assert "force" in result.data["question"].lower()
 
     @pytest.mark.asyncio
     async def test_evaluate_returns_json(self):
@@ -614,6 +618,166 @@ class TestMentorUpdate:
         mentor = MentorActor()
         pattern = await mentor.get_struggle_pattern(ctx, "definer")
         assert pattern is None
+
+
+# --------------------------------------------------------------------------
+# EXAMINER quiz transfer tests (Phase B.5 item 6)
+# --------------------------------------------------------------------------
+
+
+class TestExaminerQuizTransfer:
+    """Phase B.5: ExaminerActor.quiz() supports recognition vs. transfer.
+
+    Transfer questions apply the concept to a new situation; recognition
+    questions test identification/recall. The session coordinator selects
+    based on mastery_level (recognition for <2, transfer for >=2).
+    """
+
+    @pytest.mark.asyncio
+    async def test_quiz_recognition_type_for_low_mastery(self):
+        """quiz(question_type='recognition') sends a recognition prompt.
+
+        The system prompt should mention 'RECOGNITION' — a definition/
+        identification check, not an application scenario.
+        """
+        fake = _FakeModelProvider(responses={"evaluation": "What is Newton's First Law?"})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.quiz(ctx, "c1", question_type="recognition")
+        assert result.ok
+        assert result.data["question_type"] == "recognition"
+        system_msg = fake.calls[0][1][0]["content"]
+        assert "RECOGNITION" in system_msg
+
+    @pytest.mark.asyncio
+    async def test_quiz_transfer_type_for_high_mastery(self):
+        """quiz(question_type='transfer') sends a transfer prompt.
+
+        The system prompt should mention 'TRANSFER' + 'NEW situation' —
+        an application scenario, not a definition check.
+        """
+        fake = _FakeModelProvider(responses={"evaluation": "A spacecraft is coasting..."})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.quiz(ctx, "c1", question_type="transfer")
+        assert result.ok
+        assert result.data["question_type"] == "transfer"
+        system_msg = fake.calls[0][1][0]["content"]
+        assert "TRANSFER" in system_msg
+        assert "NEW situation" in system_msg
+
+    @pytest.mark.asyncio
+    async def test_quiz_transfer_increments_transfer_attempted(self):
+        """_step_quiz with mastery_level >= 2 issues an UPDATE on transfer_attempted.
+
+        Phase B.5: when the coordinator selects a transfer question, it
+        increments transfer_attempted on aristotle_mastery (column from M003).
+        This test uses a routing fake conn that returns a high mastery level
+        for the mastery query + the concept row for the concept query.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        class _RoutingConn:
+            """Fake conn that returns different rows based on the SQL query."""
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "repetitions" in sql.lower():
+                    # mastery query → return (3,) = 3 repetitions → level 3 → transfer
+                    return _FakeCursor([(3,)])
+                else:
+                    # concept query → return 8-column concept row
+                    return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider(responses={
+            "evaluation": "A spacecraft is coasting through space...",
+        })
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(concept_id="c1", state=SessionState.QUIZ)
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        # The coordinator should have selected transfer (mastery_level=3 >= 2)
+        assert session.last_question_type == "transfer"
+        # And issued an UPDATE on transfer_attempted
+        update_calls = [
+            sql for sql, _ in conn._executed
+            if "transfer_attempted" in sql and "UPDATE" in sql.upper()
+        ]
+        assert len(update_calls) == 1, "expected one UPDATE on transfer_attempted"
+
+    @pytest.mark.asyncio
+    async def test_correct_transfer_answer_increments_transfer_correct(self):
+        """_step_evaluate with a correct transfer answer increments transfer_correct.
+
+        Phase B.5: when the answer is correct AND the last question was a
+        transfer question, the coordinator increments transfer_correct on
+        aristotle_mastery (column from M003).
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "repetitions" in sql.lower():
+                    return _FakeCursor([(3,)])
+                else:
+                    return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+
+            async def commit(self):
+                pass
+
+        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        conn = _RoutingConn()
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+            "sexton": "Learner does well.",
+        })
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.EVALUATE,
+            last_question_type="transfer",  # the last quiz was a transfer question
+            last_quiz_question="A spacecraft is coasting...",
+            last_student_answer="It keeps coasting — no force needed",
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        assert session.state == SessionState.NEXT_CONCEPT  # correct → next concept
+        # The coordinator should have issued an UPDATE on transfer_correct
+        update_calls = [
+            sql for sql, _ in conn._executed
+            if "transfer_correct" in sql and "UPDATE" in sql.upper()
+        ]
+        assert len(update_calls) == 1, "expected one UPDATE on transfer_correct"
 
 
 # --------------------------------------------------------------------------
