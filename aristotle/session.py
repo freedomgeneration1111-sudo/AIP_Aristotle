@@ -676,8 +676,49 @@ async def _step_evaluate(
         # (column from M003). Best-effort — non-fatal on DB failure.
         if session.last_question_type == "transfer":
             await _increment_mastery_column(ctx, session, "transfer_correct")
+
+        # Phase B.5 (cold-start check, item 9): if this concept was in
+        # cold_start_pending (unassisted retrieval after a long interval),
+        # a correct answer means the learner has independent recall —
+        # mark cold_start_passed = 1 + remove from pending.
+        if session.concept_id in session.cold_start_pending:
+            await _increment_mastery_column(ctx, session, "cold_start_passed")
+            # _increment_mastery_column increments, but cold_start_passed
+            # is a flag (0→1), not a counter. Use a direct UPDATE to set
+            # it to 1. Best-effort.
+            try:
+                container_cs = ctx.container
+                registry_cs = getattr(container_cs, "corpus_registry", None)
+                if registry_cs is not None:
+                    stores_cs = await registry_cs.get_stores("aristotle:textbook")
+                    conn_cs = stores_cs.connection_manager.write_conn
+                    await conn_cs.execute(
+                        "UPDATE aristotle_mastery SET cold_start_passed = 1 "
+                        "WHERE student_id = ? AND concept_id = ?",
+                        (session.student_id, session.concept_id),
+                    )
+                    await conn_cs.commit()
+            except Exception:
+                pass  # best-effort
+            session.cold_start_pending.discard(session.concept_id)
+            logger.info(
+                "session_cold_start_passed concept=%s — independent recall confirmed",
+                session.concept_id,
+            )
+
         session.state = SessionState.NEXT_CONCEPT
     else:
+        # Phase B.5 (cold-start check, item 9): if this was a cold-start
+        # concept and the answer was wrong, remove from pending — the
+        # normal session flow (TEACH → PROBE → QUIZ → ...) resumes on
+        # the next cycle via REMEDIATE/HINT.
+        if session.concept_id in session.cold_start_pending:
+            session.cold_start_pending.discard(session.concept_id)
+            logger.info(
+                "session_cold_start_failed concept=%s — normal flow resumes",
+                session.concept_id,
+            )
+
         # Failed quiz — consult hint_count for the next step.
         if session.hint_count == 0:
             session.state = SessionState.HINT_1
@@ -1036,7 +1077,21 @@ async def _step_next_concept(
 
 
 async def _update_mastery(ctx: ActorContext, session: SessionContext) -> None:
-    """Update the aristotle_mastery table with SM-2 state + score."""
+    """Update the aristotle_mastery table with SM-2 state + score.
+
+    Phase B.5 (item 8 — extended mastery model): also tracks slips. A slip
+    is a correct answer that scored below 0.85 — a near-miss where the
+    learner got it right but shakily. Slip count feeds mastery_probability()
+    as a penalty (slip_rate = slip_count / repetitions). The slip increment
+    is best-effort via _increment_mastery_column.
+
+    TODO: mastery_probability is computed in the health snapshot (see
+    _step_evaluate's return) but does NOT yet drive the SM-2 interval
+    logic. This is intentional — the probabilistic model is read-only
+    diagnostic for now. A future commit may use mastery_probability to
+    adjust intervals (e.g. shorten the interval if probability drops
+    below 0.5 despite a correct answer).
+    """
     from aristotle.sm2 import SM2State, update_sm2
 
     container: Any = ctx.container
@@ -1087,5 +1142,11 @@ async def _update_mastery(ctx: ActorContext, session: SessionContext) -> None:
             ),
         )
         await conn.commit()
+
+        # Phase B.5 (item 8): slip tracking. A slip is a correct answer
+        # that scored below 0.85 — the learner got it right but shakily.
+        # This feeds mastery_probability() as a penalty.
+        if session.mastered and 0.7 <= session.last_score < 0.85:
+            await _increment_mastery_column(ctx, session, "slip_count")
     except Exception:
         pass  # non-fatal — mastery tracking is best-effort

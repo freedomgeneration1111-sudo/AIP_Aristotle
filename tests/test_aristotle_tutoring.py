@@ -173,6 +173,60 @@ class TestSM2Algorithm:
             state = update_sm2(state, score=0.0)  # quality = 0
         assert state.easiness_factor >= 1.3
 
+    # ------------------------------------------------------------------
+    # Phase B.5 item 8: mastery_probability (BKT-inspired extension)
+    # ------------------------------------------------------------------
+
+    def test_mastery_probability_pure_correct(self):
+        """mastery_probability with pure unassisted correct answers = 1.0.
+
+        No hints, no transfers, no slips → probability is 1.0 (full credit
+        for independent recall).
+        """
+        from aristotle.sm2 import mastery_probability
+        p = mastery_probability(repetitions=3, hint_assisted_correct=0,
+                                transfer_correct=0, slip_count=0)
+        assert p == 1.0
+
+    def test_mastery_probability_penalizes_slips(self):
+        """mastery_probability with slips is below 1.0.
+
+        A slip (correct answer that scored below 0.85) signals fragile
+        mastery. The slip_rate penalty reduces the probability.
+        """
+        from aristotle.sm2 import mastery_probability
+        p_no_slip = mastery_probability(repetitions=4, slip_count=0)
+        p_with_slip = mastery_probability(repetitions=4, slip_count=2)
+        assert p_with_slip < p_no_slip
+        assert p_with_slip < 1.0
+
+    def test_mastery_probability_boosts_transfer(self):
+        """mastery_probability with transfer_correct boosts the score.
+
+        Correct transfer questions (applying concept to new situation)
+        give a 1.5x bonus — stronger evidence of mastery than recognition.
+        With 3 repetitions + 1 transfer correct, the unclamped probability
+        is (3 + 1.5) / 3 = 1.5, which clamps to 1.0. Without the transfer
+        bonus, it's 3/3 = 1.0. To see the boost below the clamp, test with
+        a lower repetition count where the bonus pushes the probability up
+        but not to 1.0.
+        """
+        from aristotle.sm2 import mastery_probability
+        # With 2 reps + 0 transfer: (2 + 0) / 2 = 1.0
+        # With 2 reps + 1 transfer: (2 + 1.5) / 2 = 1.75 → clamped to 1.0
+        # Both clamp to 1.0, so test with a scenario where the boost is
+        # visible below the clamp: 1 rep + 1 transfer = (1 + 1.5) / 1 = 2.5
+        # → clamped to 1.0. Still clamps. Use slip penalty to pull below 1.0:
+        # 3 reps + 0 transfer + 2 slips = (3/3) - 0.15*(2/3) = 1.0 - 0.1 = 0.9
+        # 3 reps + 1 transfer + 2 slips = (3 + 1.5)/3 - 0.1 = 1.5 - 0.1 = 1.4 → 1.0
+        # The transfer bonus offsets the slip penalty:
+        p_no_transfer = mastery_probability(repetitions=3, transfer_correct=0, slip_count=2)
+        p_with_transfer = mastery_probability(repetitions=3, transfer_correct=1, slip_count=2)
+        assert p_with_transfer > p_no_transfer, (
+            f"transfer bonus should boost probability: "
+            f"no_transfer={p_no_transfer}, with_transfer={p_with_transfer}"
+        )
+
 
 # --------------------------------------------------------------------------
 # SOCRATES teach() tests
@@ -1288,3 +1342,105 @@ class TestSessionCoordinator:
         result = await run_session_step(ctx, session)
         assert result.ok
         assert session.state == SessionState.SESSION_COMPLETE
+
+    # ------------------------------------------------------------------
+    # Phase B.5 item 9: cold-start check
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_cold_start_skips_predict_goes_to_probe(self):
+        """When a concept is in cold_start_pending, NEXT_CONCEPT sets state to PROBE.
+
+        Phase B.5 item 9: a cold-start concept (SM-2 interval >= 7 days,
+        cold_start_passed == 0) skips PREDICT/TEACH and goes directly to
+        PROBE — unassisted retrieval. This test verifies the queue-advance
+        logic sets PROBE (not PREDICT) when the next concept is cold-start
+        pending.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        fake = _FakeModelProvider()
+        conn = _FakeConn(rows=None)
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="concept_a",
+            state=SessionState.NEXT_CONCEPT,
+            concept_queue=["concept_a", "concept_b"],
+            cold_start_pending={"concept_b"},  # concept_b needs a cold-start check
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        assert session.concept_id == "concept_b"
+        # Cold-start: state should be PROBE, not PREDICT
+        assert session.state == SessionState.PROBE, (
+            f"Cold-start concept should go to PROBE (not PREDICT), got {session.state}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cold_start_correct_marks_passed(self):
+        """A correct cold-start answer marks cold_start_passed = 1 + removes from pending.
+
+        Phase B.5 item 9: when the learner answers correctly on a cold-start
+        concept, the coordinator updates cold_start_passed = 1 on
+        aristotle_mastery + removes the concept from cold_start_pending.
+        This test verifies the UPDATE is issued + the concept is removed.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "repetitions" in sql.lower():
+                    return _FakeCursor([(3,)])
+                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+            "sexton": "Learner does well.",
+        })
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.EVALUATE,
+            cold_start_pending={"c1"},  # c1 is a cold-start concept
+            last_quiz_question="What is inertia?",
+            last_student_answer="objects resist changes in motion",
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        assert session.state == SessionState.NEXT_CONCEPT  # correct → next concept
+        # c1 should be removed from cold_start_pending
+        assert "c1" not in session.cold_start_pending
+        # An UPDATE setting cold_start_passed = 1 should have been issued
+        update_calls = [
+            sql for sql, _ in conn._executed
+            if "cold_start_passed = 1" in sql and "UPDATE" in sql.upper()
+        ]
+        assert len(update_calls) == 1, "expected one UPDATE setting cold_start_passed = 1"

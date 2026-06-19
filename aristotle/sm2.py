@@ -129,3 +129,62 @@ def is_due(state: SM2State) -> bool:
         return now >= next_review
     except (ValueError, TypeError):
         return True  # malformed timestamp → treat as due
+
+
+def mastery_probability(
+    repetitions: int,
+    hint_assisted_correct: int = 0,
+    transfer_correct: int = 0,
+    slip_count: int = 0,
+) -> float:
+    """Compute a BKT-inspired mastery probability (ADR-002 §8, B.5 item 8).
+
+    A pragmatic extension of SM-2 that captures the most important BKT
+    insights (slip/guess distinction, skill transfer) without requiring
+    training data or neural infrastructure. This is a READ-ONLY diagnostic
+    — it does NOT change the SM-2 interval logic. The SM-2 scheduler
+    continues to drive next_review_at; mastery_probability is surfaced
+    alongside it for observability.
+
+    Formula:
+        p = (unassisted_correct + 0.5 * hint_assisted_correct
+             + 1.5 * transfer_correct) / max(1, total_attempts)
+        p -= 0.15 * slip_rate
+        return clamp(p, 0.0, 1.0)
+
+    where:
+      - total_attempts = repetitions (SM-2 consecutive correct reviews)
+      - unassisted_correct = repetitions - hint_assisted_correct
+        (correct answers that did NOT require hints)
+      - slip_rate = slip_count / max(1, repetitions)
+        (wrong answers on known concepts — penalizes overreliance)
+
+    Weights:
+      - unassisted_correct: 1.0 (full credit — independent recall)
+      - hint_assisted_correct: 0.5 (partial credit — needed a nudge)
+      - transfer_correct: 1.5 (bonus — applied concept to new situation)
+      - slip penalty: -0.15 per slip_rate unit (slips signal fragility)
+
+    Args:
+        repetitions: SM-2 repetitions (consecutive correct reviews).
+        hint_assisted_correct: correct answers that required hints (M003).
+        transfer_correct: correct transfer questions (M003).
+        slip_count: wrong answers on known concepts (M003).
+
+    Returns:
+        float in [0.0, 1.0] — the estimated probability of mastery.
+    """
+    total_attempts = max(1, repetitions)
+    unassisted_correct = max(0, repetitions - hint_assisted_correct)
+
+    numerator = (
+        unassisted_correct
+        + 0.5 * hint_assisted_correct
+        + 1.5 * transfer_correct
+    )
+    p = numerator / total_attempts
+
+    slip_rate = slip_count / max(1, repetitions)
+    p -= 0.15 * slip_rate
+
+    return max(0.0, min(1.0, p))
