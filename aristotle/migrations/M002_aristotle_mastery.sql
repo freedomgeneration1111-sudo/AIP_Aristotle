@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS aristotle_mastery (
     easiness_factor REAL NOT NULL DEFAULT 2.5,   -- SM-2 EF (>= 1.3)
     interval_days INTEGER NOT NULL DEFAULT 0,    -- days until next review
     repetitions INTEGER NOT NULL DEFAULT 0,      -- consecutive correct reviews
-    next_review_at TEXT,                          -- ISO timestamp; NULL = not scheduled
+    next_review_at TEXT,                          -- ISO timestamp, NULL = not scheduled
     -- Mastery tracking (separate from SM-2)
     last_score REAL,                              -- 0.0-1.0 from EXAMINER.evaluate()
     mastered INTEGER NOT NULL DEFAULT 0,          -- 0 = not mastered, 1 = mastered

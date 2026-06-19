@@ -11,7 +11,7 @@
 -- dashboard) when cross-corpus aggregation matters.
 
 -- aristotle_concept: concept-aware chunks per ADR-ARISTOTLE §4.
--- Standard RAG token-chunking is pedagogically wrong; ARISTOTLE chunks by
+-- Standard RAG token-chunking is pedagogically wrong. ARISTOTLE chunks by
 -- concept with a prerequisite DAG. The bilingual columns match ADR-014 §1:
 -- content_primary + content_alt + content_alt_lang (ISO 639-1).
 CREATE TABLE IF NOT EXISTS aristotle_concept (
