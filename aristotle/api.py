@@ -260,6 +260,123 @@ async def session_run_route(request: Request):
 
 
 # ------------------------------------------------------------------
+# Intake routes (Phase D — onboarding, ADR-002 Rev 2 §9)
+# ------------------------------------------------------------------
+
+
+@router.post("/intake/start")
+async def intake_start_route(request: Request):
+    """Start a new intake session or resume from a trigger.
+
+    Request body: {"plan_id": str | None, "student_input": str | None}
+    Returns: {"session": dict, "prompt": str | None, "trigger": str | None}
+
+    Phase D (ADR-002 §9): calls check_intake_triggers(ctx, plan_id). If a
+    trigger exists, builds an IntakeSession with the trigger's entry_state.
+    If the trigger has a pre-built prompt (checkin level), returns it
+    directly. Otherwise calls run_intake_step to generate the first prompt.
+    """
+    container = _get_container(request)
+    body = await request.json()
+    plan_id = body.get("plan_id")
+    student_input = body.get("student_input", "")
+
+    ctx = _make_ctx(container)
+
+    from aristotle.actors.intake import (
+        IntakeSession,
+        IntakeState,
+        check_intake_triggers,
+        run_intake_step,
+        intake_session_to_dict,
+    )
+
+    trigger = await check_intake_triggers(ctx, plan_id)
+
+    if trigger is not None:
+        # Build a session starting at the trigger's entry_state.
+        session = IntakeSession(
+            state=trigger.entry_state,
+            entry_state=trigger.entry_state,
+        )
+        if trigger.prompt:
+            # Checkin level: return the pre-built prompt directly.
+            return {
+                "session": intake_session_to_dict(session),
+                "prompt": trigger.prompt,
+                "trigger": trigger.level,
+            }
+        else:
+            # Full or partial: generate the first prompt via run_intake_step.
+            result = await run_intake_step(session, student_input, ctx)
+            return {
+                "session": intake_session_to_dict(session),
+                "prompt": result.get("prompt"),
+                "trigger": trigger.level,
+                "state": result.get("state"),
+            }
+    else:
+        # No trigger — normal intake from GREETING.
+        session = IntakeSession()
+        result = await run_intake_step(session, student_input, ctx)
+        return {
+            "session": intake_session_to_dict(session),
+            "prompt": result.get("prompt"),
+            "trigger": None,
+            "state": result.get("state"),
+        }
+
+
+@router.post("/intake/step")
+async def intake_step_route(request: Request):
+    """Advance an intake session one step.
+
+    Request body: {"session": dict, "student_input": str}
+    Returns: {"session": dict, "prompt": str | None, "state": str,
+              "plan_id": str | None, "pivot": str | None}
+
+    Also runs _detect_intake_intent(student_input) before dispatching —
+    if a trigger is detected mid-session, overrides the session state
+    accordingly and notes the pivot in the response.
+    """
+    container = _get_container(request)
+    body = await request.json()
+    session_dict = body.get("session", {})
+    student_input = body.get("student_input", "")
+
+    ctx = _make_ctx(container)
+
+    from aristotle.actors.intake import (
+        _detect_intake_intent,
+        run_intake_step,
+        intake_session_to_dict,
+        intake_session_from_dict,
+    )
+
+    session = intake_session_from_dict(session_dict)
+
+    # Intent detection: check if the learner's input signals a re-INTAKE
+    # trigger mid-session. If so, override the session state + note the pivot.
+    pivot = None
+    if student_input:
+        trigger = _detect_intake_intent(student_input)
+        if trigger is not None:
+            pivot = trigger.level
+            session.entry_state = trigger.entry_state
+            session.state = trigger.entry_state
+
+    result = await run_intake_step(session, student_input, ctx)
+
+    return {
+        "session": intake_session_to_dict(session),
+        "prompt": result.get("prompt"),
+        "state": result.get("state"),
+        "plan_id": result.get("plan_id"),
+        "pivot": pivot,
+    }
+
+
+# ------------------------------------------------------------------
 # Dashboard route (Phase B — teacher view, ADR-001 §8)
 # ------------------------------------------------------------------
 
