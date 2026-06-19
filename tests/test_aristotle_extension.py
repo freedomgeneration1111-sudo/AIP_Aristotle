@@ -196,6 +196,55 @@ async def test_aristotle_migrations_create_tables(host: ExtensionHost, container
 
 @pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
 @pytest.mark.asyncio
+async def test_aristotle_m003_creates_phase_b5_schema(host: ExtensionHost, container):
+    """M003_aristotle_phase_b5.sql creates the Phase B.5 tables + extends mastery.
+
+    Phase B.5 (ADR-002 Rev 2) adds:
+      - aristotle_predict_event: logs the learner's pre-TEACH prediction.
+      - aristotle_misconception_log: structured per-instance misconception history.
+      - aristotle_mastery extended columns: hint_assisted_correct, slip_count,
+        cold_start_passed, transfer_correct, transfer_attempted.
+
+    This test runs the full host lifecycle (which applies M001 + M002 + M003
+    in order) and verifies every new schema element exists. Follows the
+    pattern of test_aristotle_migrations_create_tables above.
+    """
+    await host.start()
+    assert host.state("aristotle") in (ExtensionState.REGISTERED, ExtensionState.MOUNTED), (
+        f"ARISTOTLE should reach REGISTERED or MOUNTED; failures="
+        f"{[f.to_dict() for f in host.failures('aristotle')]}"
+    )
+
+    stores = await container.corpus_registry.get_stores("aristotle:textbook")
+
+    # New tables (ADR-002 §10.4, §10.5)
+    assert await _table_exists(stores, "aristotle_predict_event"), \
+        "M003 should create aristotle_predict_event table"
+    assert await _table_exists(stores, "aristotle_misconception_log"), \
+        "M003 should create aristotle_misconception_log table"
+
+    # Extended aristotle_mastery columns (ADR-002 §10.6)
+    expected_new_columns = [
+        "hint_assisted_correct",
+        "slip_count",
+        "cold_start_passed",
+        "transfer_correct",
+        "transfer_attempted",
+    ]
+    for col in expected_new_columns:
+        assert await _column_exists(stores, "aristotle_mastery", col), (
+            f"M003 should add column {col!r} to aristotle_mastery"
+        )
+
+    # Sanity: the pre-existing M002 columns are still there (M003 is additive).
+    assert await _column_exists(stores, "aristotle_mastery", "easiness_factor"), \
+        "M002 easiness_factor column should still exist after M003"
+    assert await _column_exists(stores, "aristotle_mastery", "mastered"), \
+        "M002 mastered column should still exist after M003"
+
+
+@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.asyncio
 async def test_aristotle_registers_actors(host: ExtensionHost):
     """All three actors are registered via hooks.py::on_load."""
     await host.start()
@@ -268,5 +317,15 @@ async def _table_exists(stores, table: str) -> bool:
     conn = stores.connection_manager.write_conn
     cur = await conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    )
+    return await cur.fetchone() is not None
+
+
+async def _column_exists(stores, table: str, column: str) -> bool:
+    """Check a column exists on a table via pragma_table_info."""
+    conn = stores.connection_manager.write_conn
+    cur = await conn.execute(
+        f"SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?",
+        (column,),
     )
     return await cur.fetchone() is not None
