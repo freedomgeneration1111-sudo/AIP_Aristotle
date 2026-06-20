@@ -201,6 +201,19 @@ async def run_session_step(
     examiner = ExaminerActor()
     mentor = MentorActor()
 
+    # ADR-002 Amendment A1: classify student input for curiosity path.
+    # Only non-empty input is classified — empty input (e.g. first call
+    # to generate a prompt) always goes through the ANSWER path.
+    if student_input:
+        intent_class = _classify_student_input(student_input)
+        if intent_class in ("QUESTION", "TANGENT"):
+            result = await _step_curiosity(ctx, session, student_input, intent_class)
+            return result
+        elif intent_class == "CHAT":
+            result = await _step_chat(ctx, session, student_input)
+            return result
+        # else: ANSWER — fall through to existing dispatch
+
     # Dispatch based on session state
     if session.state == SessionState.PREDICT:
         return await _step_predict(ctx, session, socrates, student_input)
@@ -222,6 +235,215 @@ async def run_session_step(
         return await _step_next_concept(ctx, session)
     else:
         return ActorResult(ok=False, error="session already complete")
+
+
+# ---------------------------------------------------------------------------
+# ADR-002 Amendment A1: Curiosity path — open learner model
+# ---------------------------------------------------------------------------
+
+
+def _classify_student_input(text: str) -> str:
+    """Classify student input intent for curiosity path routing.
+
+    Returns one of: 'ANSWER' | 'QUESTION' | 'TANGENT' | 'CHAT'
+
+    v1: heuristic/keyword-based (ADR-002 Amendment A1 §v1 note).
+    v2: LLM-based classifier (future ADR-002 TODO item).
+    """
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    # QUESTION signals
+    if stripped.endswith("?"):
+        return "QUESTION"
+    question_starters = (
+        "what ", "why ", "how ", "when ", "where ", "who ",
+        "could you", "can you", "would you", "explain ",
+        "tell me", "describe ", "define ", "what's", "how's",
+    )
+    if any(lower.startswith(s) for s in question_starters):
+        return "QUESTION"
+
+    # TANGENT signals
+    tangent_markers = (
+        "what about", "but what", "wait,", "wait —", "actually,",
+        "actually —", "but ", "hold on", "i was thinking",
+        "speaking of", "that reminds me",
+    )
+    if any(lower.startswith(m) for m in tangent_markers):
+        return "TANGENT"
+
+    # CHAT signals — short social acknowledgments
+    word_count = len(stripped.split())
+    if word_count <= 4:
+        social_words = (
+            "ok", "okay", "cool", "thanks", "got it", "yes",
+            "no", "sure", "right", "hmm", "interesting",
+            "i see", "makes sense", "understood",
+        )
+        if any(lower == s or lower.startswith(s + " ") or
+               lower.startswith(s + ",")
+               for s in social_words):
+            return "CHAT"
+
+    return "ANSWER"
+
+
+async def _step_curiosity(
+    ctx: ActorContext,
+    session: SessionContext,
+    student_input: str,
+    intent_class: str,
+) -> ActorResult:
+    """Handle QUESTION and TANGENT intents (ADR-002 Amendment A1).
+
+    Answers the student's question using the beast model slot (same slot
+    as SOCRATES.teach — conversational explanation). Does NOT advance
+    session phase. Logs curiosity event. Appends a soft weave-back offer.
+    """
+    logger = ctx.logger
+    container: Any = ctx.container
+
+    model_provider = getattr(container, "model_provider", None)
+    if model_provider is None:
+        return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+
+    concept_context = ""
+    if session.concept_id:
+        concept_context = f"The student is studying: {session.concept_id}. "
+
+    system_prompt = (
+        "You are Aristotle — a patient, exact tutor. A student has asked "
+        "a question or raised a tangent during a tutoring session. Answer "
+        "their question clearly and helpfully. If it connects to what "
+        "you're studying, make that connection. Keep the response "
+        "conversational and under 150 words."
+    )
+    user_prompt = (
+        f"{concept_context}"
+        f"The student asked: {student_input}"
+    )
+
+    try:
+        result = await model_provider.call(
+            slot_name="beast",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        response_text = result.get("content", "")
+    except Exception as exc:
+        logger.warning("curiosity_model_failed error=%s:%s", type(exc).__name__, exc)
+        return ActorResult(ok=False, error=f"model call failed: {exc}")
+
+    # Soft weave-back offer — never forces return.
+    weave_back = (
+        "\n\nWant to keep exploring this, or shall we continue "
+        "where we left off?"
+    )
+    full_response = response_text + weave_back
+
+    # Log curiosity event (best-effort — never raises).
+    await _log_curiosity_event(ctx, session, student_input, intent_class)
+
+    logger.info(
+        "curiosity_path concept=%s intent=%s response_len=%d",
+        session.concept_id, intent_class, len(full_response),
+    )
+
+    # Session state is NOT advanced — the student stays at the same phase.
+    return ActorResult(
+        ok=True,
+        error=full_response,
+        data={"response": full_response, "intent_class": intent_class},
+    )
+
+
+async def _step_chat(
+    ctx: ActorContext,
+    session: SessionContext,
+    student_input: str,
+) -> ActorResult:
+    """Handle CHAT intents — brief conversational reply (ADR-002 Amendment A1).
+
+    Keeps session alive but advances no state.
+    """
+    logger = ctx.logger
+    container: Any = ctx.container
+
+    model_provider = getattr(container, "model_provider", None)
+    if model_provider is None:
+        return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+
+    system_prompt = (
+        "You are Aristotle — a warm, patient tutor. The student sent a "
+        "brief social message. Respond warmly in one sentence and gently "
+        "invite them to continue the session."
+    )
+    user_prompt = f'The student sent: "{student_input}"'
+
+    try:
+        result = await model_provider.call(
+            slot_name="beast",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        response_text = result.get("content", "")
+    except Exception as exc:
+        logger.warning("chat_model_failed error=%s:%s", type(exc).__name__, exc)
+        return ActorResult(ok=False, error=f"model call failed: {exc}")
+
+    logger.info("chat_path concept=%s response_len=%d", session.concept_id, len(response_text))
+
+    return ActorResult(
+        ok=True,
+        error=response_text,
+        data={"response": response_text, "intent_class": "CHAT"},
+    )
+
+
+async def _log_curiosity_event(
+    ctx: ActorContext,
+    session: SessionContext,
+    student_input: str,
+    intent_class: str,
+) -> None:
+    """Log curiosity event to aristotle_misconception_log (best-effort).
+
+    Uses the intent_class column added by M006. Does NOT update
+    last_score — curiosity cannot fail a concept.
+    """
+    logger = ctx.logger
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        session_id = _derive_session_id(session)
+        await conn.execute(
+            "INSERT INTO aristotle_misconception_log "
+            "(session_id, concept_id, misconception_text, corrective_text, intent_class) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                session_id,
+                session.concept_id,
+                student_input,
+                "",  # no corrective text for curiosity events
+                intent_class,
+            ),
+        )
+        await conn.commit()
+    except Exception as exc:
+        logger.warning(
+            "curiosity_log_failed concept=%s error=%s:%s",
+            session.concept_id, type(exc).__name__, exc,
+        )
 
 
 async def _step_predict(

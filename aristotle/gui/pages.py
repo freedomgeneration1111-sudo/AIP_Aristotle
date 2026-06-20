@@ -458,11 +458,22 @@ async def aristotle_settings_page():
                 )
 
         async def _save():
-            # TODO: wire /aristotle/settings POST route — does not exist yet.
-            ui.notify(
-                "Settings API not yet wired — coming soon",
-                color="info", timeout=3000,
-            )
+            payload = {
+                "display_name": name_inp.value,
+                "primary_language": lang_inp.value,
+                "alt_language": alt_lang_inp.value,
+                "session_length": int(session_len.value or 5),
+                "mastery_threshold": float(mastery_thresh.value or 0.85),
+                "hint_aggressiveness": hint_mode.value,
+            }
+            result = await update_settings(settings=payload)
+            if result:
+                ui.notify("Settings saved.", color="positive", timeout=2000)
+            else:
+                ui.notify(
+                    "Save failed — check ARISTOTLE backend.",
+                    color="negative"
+                )
 
         save_btn.on("click", lambda: asyncio.create_task(_save()))
         asyncio.create_task(_load())

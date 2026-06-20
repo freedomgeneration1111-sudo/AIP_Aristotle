@@ -208,12 +208,22 @@ async def session_step_route(request: Request):
         except ImportError:
             pass  # Running outside Brain GUI — no-op
 
-    return {
+    # ADR-002 Amendment A1: include intent_class in response when available
+    # (curiosity/chat paths set it on result.data).
+    intent_class = None
+    if result.ok and result.data is not None and isinstance(result.data, dict):
+        intent_class = result.data.get("intent_class")
+
+    response = {
         "session": _session_to_dict(session),
         "output": result.error if result.ok else "",
         "ok": result.ok,
         "error": result.error if not result.ok else None,
     }
+    if intent_class:
+        response["intent_class"] = intent_class
+
+    return response
 
 
 @router.post("/session/run")

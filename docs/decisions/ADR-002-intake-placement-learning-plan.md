@@ -806,3 +806,63 @@ tutoring loop now, before any new learner walks in.
 
 *Commit to `docs/decisions/ADR-002-intake-placement-learning-plan.md`
 in AIP_Aristotle. Do not implement before DEFINER review and approval.*
+
+---
+
+## Amendment A1 — Open Learner Model: Curiosity Path
+*Date: 2026-06-20 | Status: ACCEPTED*
+
+### Context
+ADR-002 Rev 2 defines a structured tutoring loop
+(PREDICT → TEACH → EXAMINE → REMEDIATE) driven by a plan executor.
+In practice, effective tutoring requires following the learner's
+intrinsic motivation. Students ask questions, pursue tangents, and
+chat between formal exchanges. A rigid loop that treats all student
+input as answers to system questions fails pedagogically and breaks
+the conversational experience.
+
+### Decision
+ARISTOTLE operates with a dual-mode session: structured when the
+student is passive, conversational when the student takes initiative.
+
+Intent classes — every student message is classified before routing:
+
+  ANSWER   — default, responding to ARISTOTLE's prompt
+             → current evaluate path (PREDICT/EXAMINE/REMEDIATE)
+
+  QUESTION — ends with "?", question starters, "explain/tell me"
+             → curiosity path: answer fully, extract mastery signal
+               if concept touched, offer to continue or follow thread
+
+  TANGENT  — "what about", "but", "wait", "actually"
+             → follow thread, soft weave-back offer after response
+
+  CHAT     — short social response, acknowledgment
+             → brief conversational reply, maintain session state
+
+Curiosity path behavior:
+- ARISTOTLE answers the student's question fully — never a redirect
+- If the question touches a known concept in the plan, log as
+  intent_class='curiosity' in aristotle_misconception_log
+- Session position (concept/phase) is preserved — plan not advanced
+- After curiosity response, offer: "Want to keep exploring this, or
+  shall we continue where we left off?" — never forces return
+- CHAT responses keep session alive but advance no state
+
+Mastery tracking in curiosity mode:
+- EXAMINE path: normal BKT/SM-2 update (full weight, updates last_score)
+- Curiosity exchange: intent_class='curiosity' logged in misconception
+  log; updates repetitions only — cannot fail a concept through curiosity
+- No penalty for asking questions
+
+Principle: The learning map and plan are navigational suggestions,
+not enforced sequences. ARISTOTLE holds the map; the student holds
+the wheel.
+
+v1 classifier is heuristic (keyword/rule-based). LLM-based classifier
+is the v2 item noted in §TODO.
+
+### Consequences
+- session/step response gains intent_class field (non-breaking)
+- M006 adds intent_class column to aristotle_misconception_log
+- Teacher dashboard should surface curiosity event counts (Phase E)
