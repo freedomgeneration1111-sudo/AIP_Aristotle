@@ -223,3 +223,95 @@ async def test_upload_image_returns_extracted_text():
     assert result["source_type"] == "image"
     # tesseract may return empty string on a blank image — that's fine.
     assert isinstance(result["extracted_text"], str)
+
+
+# ---------------------------------------------------------------------------
+# Test 6: upload txt returns text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_txt_returns_text():
+    """POST /upload with body b'Hello world' + Content-Type text/plain."""
+    from aristotle.api import upload_route
+
+    container = _make_container(_FakeConn())
+    request = _make_request(
+        container,
+        body=b"Hello world",
+        headers={"content-type": "text/plain"},
+    )
+
+    result = await upload_route(request)
+    assert result["source_type"] == "text"
+    assert "Hello" in result["extracted_text"]
+
+
+# ---------------------------------------------------------------------------
+# Test 7: upload html strips tags
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_html_strips_tags():
+    """POST /upload with b'<h1>Title</h1><p>Body text</p>' Content-Type text/html."""
+    from aristotle.api import upload_route
+
+    container = _make_container(_FakeConn())
+    request = _make_request(
+        container,
+        body=b"<h1>Title</h1><p>Body text</p>",
+        headers={"content-type": "text/html"},
+    )
+
+    result = await upload_route(request)
+    assert result["source_type"] == "html"
+    assert "Title" in result["extracted_text"]
+    assert "<h1>" not in result["extracted_text"]
+
+
+# ---------------------------------------------------------------------------
+# Test 8: upload json returns text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_json_returns_text():
+    """POST /upload with b'{"key": "value"}' Content-Type application/json."""
+    from aristotle.api import upload_route
+
+    container = _make_container(_FakeConn())
+    request = _make_request(
+        container,
+        body=b'{"key": "value"}',
+        headers={"content-type": "application/json"},
+    )
+
+    result = await upload_route(request)
+    assert result["source_type"] == "text"
+    assert "key" in result["extracted_text"]
+
+
+# ---------------------------------------------------------------------------
+# Test 9: upload unsupported returns 415
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_unsupported_returns_415():
+    """POST /upload with Content-Type application/octet-stream + no magic bytes."""
+    from aristotle.api import upload_route
+    from fastapi import HTTPException
+
+    container = _make_container(_FakeConn())
+    request = _make_request(
+        container,
+        body=b"\x00\x01\x02\x03binary garbage",
+        headers={"content-type": "application/octet-stream"},
+    )
+
+    try:
+        await upload_route(request)
+        assert False, "should have raised HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 415

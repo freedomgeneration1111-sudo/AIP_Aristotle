@@ -13,6 +13,7 @@ dependencies = [
     "click>=8.0",
     "httpx>=0.24",
     "pyyaml>=6.0",
+    "python-docx>=1.0",
 ]
 
 # ADR-014 §6.4: the entry point the platform's ExtensionHost discovers.

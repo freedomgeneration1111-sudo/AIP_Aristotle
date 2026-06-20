@@ -877,26 +877,34 @@ async def update_settings_route(request: Request):
 
 @router.post("/upload")
 async def upload_route(request: Request):
-    """Extract text from uploaded PDF or image.
+    """Extract text from uploaded files in various formats.
 
     Accepts raw body bytes with Content-Type indicating the file type.
-    - PDF (application/pdf): pypdf PdfReader extracts text from all pages
-    - Image (image/*): pytesseract OCR extracts text
+    Supported formats:
+      - Text: .txt .md .markdown .csv .log .yaml .yml .json
+      - HTML: .html .htm (tags stripped)
+      - DOCX: .docx (python-docx)
+      - PDF: .pdf (pypdf)
+      - Image: .jpg .jpeg .png .webp .bmp .tiff (pytesseract OCR)
+
+    DEFERRED formats (not yet supported): .epub .pptx .xlsx .rtf .doc
 
     Returns:
         {
             "extracted_text": str,
-            "source_type": "pdf" | "image",
+            "source_type": "text" | "html" | "docx" | "pdf" | "image",
             "page_count": int | null,
             "char_count": int
         }
 
-    Errors return 400 with detail message.
+    Errors return 400/415 with detail message.
     Max file size: 10MB (reject with 413 if exceeded).
     """
     import io
+    import re
 
-    content_type = request.headers.get("content-type", "")
+    content_type = request.headers.get("content-type", "").lower()
+    content_disposition = request.headers.get("content-disposition", "")
     body = await request.body()
 
     if len(body) > 10 * 1024 * 1024:
@@ -905,35 +913,128 @@ async def upload_route(request: Request):
     if not body:
         raise HTTPException(status_code=400, detail="Empty body")
 
-    # Detect file type from Content-Type or first bytes.
-    if "application/pdf" in content_type or body[:4] == b"%PDF":
-        source_type = "pdf"
+    # Extract filename from Content-Disposition for extension fallback.
+    filename = ""
+    if content_disposition:
+        match = re.search(r'filename="?([^";\n]+)"?', content_disposition)
+        if match:
+            filename = match.group(1)
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    # Determine file type from Content-Type, then extension, then magic bytes.
+    # DEFERRED: .epub .pptx .xlsx .rtf .doc
+
+    # TEXT formats
+    text_content_types = {
+        "text/plain", "text/markdown", "text/csv", "text/yaml",
+        "application/json", "application/yaml", "application/x-yaml",
+    }
+    text_extensions = {"txt", "md", "markdown", "csv", "log", "yaml", "yml", "json"}
+
+    # HTML
+    html_content_types = {"text/html"}
+    html_extensions = {"html", "htm"}
+
+    # DOCX
+    docx_content_types = {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    }
+    docx_extensions = {"docx"}
+
+    # PDF
+    pdf_content_types = {"application/pdf"}
+    pdf_extensions = {"pdf"}
+
+    # Image
+    image_content_types = {
+        "image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff",
+    }
+    image_extensions = {"jpg", "jpeg", "png", "webp", "bmp", "tiff"}
+
+    # Detect type
+    detected = None
+
+    if content_type in text_content_types or ext in text_extensions:
+        detected = "text"
+    elif content_type in html_content_types or ext in html_extensions:
+        detected = "html"
+    elif content_type in docx_content_types or ext in docx_extensions:
+        detected = "docx"
+    elif content_type in pdf_content_types or ext in pdf_extensions or body[:4] == b"%PDF":
+        detected = "pdf"
+    elif content_type in image_content_types or ext in image_extensions:
+        detected = "image"
+    elif content_type.startswith("image/"):
+        detected = "image"
+
+    if detected is None:
+        supported = sorted(
+            text_extensions | html_extensions | docx_extensions
+            | pdf_extensions | image_extensions
+        )
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type. Content-Type: {content_type}, "
+                   f"extension: .{ext}. Supported: {', '.join(supported)}",
+        )
+
+    page_count = None
+
+    if detected == "text":
+        text = body.decode("utf-8", errors="replace")
+        source_type = "text"
+
+    elif detected == "html":
+        from html.parser import HTMLParser
+
+        class _TagStripper(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self._text_parts = []
+
+            def handle_data(self, data):
+                self._text_parts.append(data)
+
+            def get_text(self):
+                return re.sub(r"\s+", " ", " ".join(self._text_parts)).strip()
+
+        stripper = _TagStripper()
+        stripper.feed(body.decode("utf-8", errors="replace"))
+        text = stripper.get_text()
+        source_type = "html"
+
+    elif detected == "docx":
+        try:
+            from docx import Document
+
+            doc = Document(io.BytesIO(body))
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            source_type = "docx"
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"DOCX parse error: {exc}")
+
+    elif detected == "pdf":
         try:
             from pypdf import PdfReader
 
             reader = PdfReader(io.BytesIO(body))
-            text = "\n".join(
-                page.extract_text() or "" for page in reader.pages
-            )
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
             page_count = len(reader.pages)
+            source_type = "pdf"
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"PDF parse error: {exc}")
-    elif any(ct in content_type for ct in ["image/jpeg", "image/png", "image/webp", "image/bmp", "image/"]):
-        source_type = "image"
+
+    elif detected == "image":
         try:
             import pytesseract
             from PIL import Image
 
             img = Image.open(io.BytesIO(body))
             text = pytesseract.image_to_string(img)
-            page_count = None
+            source_type = "image"
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"OCR error: {exc}")
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported content type: {content_type}. Use application/pdf or image/*",
-        )
 
     return {
         "extracted_text": text,
