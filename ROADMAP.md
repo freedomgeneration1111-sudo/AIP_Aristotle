@@ -21,7 +21,7 @@ Architecture decisions are recorded in `docs/decisions/`.
 
 ## Current State (verified, not reconstructed)
 
-**Test count:** 124 passed, 0 warnings (last verified run 2026-06-20).
+**Test count:** 149 passed, 0 warnings (last verified run 2026-06-20).
 
 **What is built and passing:**
 
