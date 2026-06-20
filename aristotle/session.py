@@ -120,6 +120,14 @@ class SessionContext:
     # When NEXT_CONCEPT fires, queue[0] is popped; if non-empty, the
     # session advances to the next concept; if empty, SESSION_COMPLETE.
     concept_queue: list = field(default_factory=list)
+    # Phase D (plan executor bridge): the learning plan this session is
+    # driving. When set, _build_concept_queue reads the plan's
+    # concept_ids_json[current_concept_idx] as the primary concept (ignoring
+    # the caller-supplied primary_concept_id). _step_next_concept advances
+    # the plan cursor after each concept is mastered. When the queue empties
+    # but the plan has more concepts, the session continues (long-arc
+    # executor). When the plan is exhausted, SESSION_COMPLETE.
+    plan_id: str = ""
     # Phase B.5 (cold-start check, B.5 item 9): concepts in the queue that
     # need a cold-start check (skip PREDICT/TEACH, go directly to PROBE).
     # Populated by _build_concept_queue for review concepts whose SM-2
@@ -368,11 +376,18 @@ async def _build_concept_queue(
     ctx: ActorContext,
     primary_concept_id: str,
     student_id: str = "definer",
+    plan_id: str = "",
 ) -> tuple[list, set]:
     """Build the interleaved concept queue for a session (ADR-002 §6, B.5 item 5).
 
-    Slot 0 (primary): the concept_id passed by the caller (the new or
-    in-progress concept the learner wants to study).
+    Phase D (plan executor bridge): if plan_id is provided and non-empty,
+    reads the plan's concept_ids_json[current_concept_idx] as the primary
+    concept (ignoring the caller-supplied primary_concept_id). The review
+    concepts are still queried from aristotle_mastery (due for SM-2 review)
+    but filtered to plan concepts only (those that appear earlier in the
+    plan, idx < current_concept_idx).
+
+    Slot 0 (primary): from the plan (if plan_id set) or the caller's arg.
     Slots 1-2 (review): up to 2 concepts where next_review_at <= now
     AND concept_id != primary, ordered by next_review_at ASC. These are
     due for a spaced-repetition retrieval check — interleaved practice
@@ -394,6 +409,35 @@ async def _build_concept_queue(
     if registry is None:
         return [primary_concept_id], set()
 
+    # Phase D: if plan_id is set, read the plan to determine the primary concept.
+    actual_primary = primary_concept_id
+    plan_concept_set = None  # None = no plan filtering (all concepts eligible for review)
+    if plan_id:
+        try:
+            stores = await registry.get_stores("aristotle:textbook")
+            conn = stores.connection_manager.write_conn
+            cur = await conn.execute(
+                "SELECT concept_ids_json, current_concept_idx, status "
+                "FROM aristotle_learning_plan WHERE id = ?",
+                (plan_id,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if row is not None:
+                import json as _json
+                concept_ids = _json.loads(row[0]) if row[0] else []
+                current_idx = row[1] if row[1] is not None else 0
+                plan_status = row[2] if row[2] is not None else "active"
+                if plan_status == "complete":
+                    # Plan is complete — no new concepts to study.
+                    return [], set()
+                if current_idx < len(concept_ids):
+                    actual_primary = concept_ids[current_idx]
+                # Filter reviews to plan concepts only (those before current_idx).
+                plan_concept_set = set(concept_ids[:current_idx])
+        except Exception:
+            pass  # best-effort — fall back to caller's primary_concept_id
+
     try:
         stores = await registry.get_stores("aristotle:textbook")
         conn = stores.connection_manager.write_conn
@@ -407,16 +451,21 @@ async def _build_concept_queue(
             "WHERE student_id = ? AND concept_id != ? "
             "AND next_review_at IS NOT NULL AND next_review_at <= ? "
             "ORDER BY next_review_at ASC LIMIT 2",
-            (student_id, primary_concept_id, now_iso),
+            (student_id, actual_primary, now_iso),
         )
         rows = await cur.fetchall()
         await cur.close()
 
-        queue = [primary_concept_id]
+        queue = [actual_primary]
+        if rows is None:
+            rows = []
         cold_start_pending: set = set()
 
         for row in rows:
             review_concept_id = row[0]
+            # Phase D: if a plan is attached, filter reviews to plan concepts only.
+            if plan_concept_set is not None and review_concept_id not in plan_concept_set:
+                continue
             interval_days = row[1] if row[1] is not None else 0
             cold_start_passed = row[2] if row[2] is not None else 0
             queue.append(review_concept_id)
@@ -427,6 +476,55 @@ async def _build_concept_queue(
         return queue, cold_start_pending
     except Exception:
         return [primary_concept_id], set()
+
+
+async def _advance_plan_cursor(ctx: ActorContext, plan_id: str) -> None:
+    """Increment current_concept_idx on the learning plan (Phase D bridge).
+
+    If the new idx >= len(concept_ids_json): set status='complete'.
+    Best-effort — don't fail the session on DB error.
+    """
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+
+        # Read the plan to get concept count + current idx.
+        cur = await conn.execute(
+            "SELECT concept_ids_json, current_concept_idx "
+            "FROM aristotle_learning_plan WHERE id = ?",
+            (plan_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return
+
+        import json as _json
+        concept_ids = _json.loads(row[0]) if row[0] else []
+        current_idx = row[1] if row[1] is not None else 0
+        new_idx = current_idx + 1
+
+        if new_idx >= len(concept_ids):
+            # Plan exhausted — mark complete.
+            await conn.execute(
+                "UPDATE aristotle_learning_plan SET status = 'complete', "
+                "current_concept_idx = ? WHERE id = ?",
+                (new_idx, plan_id),
+            )
+        else:
+            await conn.execute(
+                "UPDATE aristotle_learning_plan SET current_concept_idx = ? "
+                "WHERE id = ?",
+                (new_idx, plan_id),
+            )
+        await conn.commit()
+    except Exception:
+        pass  # best-effort — never block the session
 
 
 async def _increment_mastery_column(
@@ -1015,8 +1113,19 @@ async def _step_next_concept(
     Cold-start handling: if the new concept_id is in cold_start_pending,
     the state is set to PROBE (not PREDICT) — the cold-start check skips
     PREDICT/TEACH and goes directly to unassisted retrieval (B.5 item 9).
+
+    Phase D (plan executor bridge): if session.plan_id is set, advances
+    the plan cursor after the primary concept is completed. When the queue
+    empties but the plan has more concepts, rebuilds the queue from the
+    plan (long-arc executor — the plan keeps driving sessions until
+    complete). When the plan is exhausted (status=complete),
+    SESSION_COMPLETE.
     """
     logger = ctx.logger
+
+    # Phase D: if a plan is attached, advance the plan cursor.
+    if session.plan_id:
+        await _advance_plan_cursor(ctx, session.plan_id)
 
     # Pop the just-completed concept from the queue.
     if session.concept_queue:
@@ -1064,7 +1173,49 @@ async def _step_next_concept(
             error=f"Advancing to concept {next_concept}. Cold-start: {next_concept in session.cold_start_pending}",
         )
     else:
-        # Queue empty — session complete.
+        # Queue empty. Phase D: if a plan is attached, check if the plan
+        # has more concepts. If so, rebuild the queue (long-arc executor).
+        if session.plan_id:
+            new_queue, new_cold_start = await _build_concept_queue(
+                ctx, "", plan_id=session.plan_id,
+            )
+            if new_queue:
+                # Plan has more concepts — continue the session.
+                session.concept_queue = new_queue
+                session.cold_start_pending = new_cold_start
+                session.concept_id = new_queue[0]
+                # Reset per-concept state.
+                session.hint_count = 0
+                session.hint_generated = False
+                session.last_diagnosis = None
+                session.last_question_type = "recognition"
+                session.predict_generated = False
+                session.last_prediction = ""
+                session.last_explanation = ""
+                session.last_probe_question = ""
+                session.last_quiz_question = ""
+                session.last_student_answer = ""
+                session.last_evaluation = ""
+                session.last_score = 0.0
+                session.mastered = False
+                session.retry_count = 0
+                session.quiz_generated = False
+                session.probe_generated = False
+                if session.concept_id in session.cold_start_pending:
+                    session.state = SessionState.PROBE
+                else:
+                    session.state = SessionState.PREDICT
+                logger.info(
+                    "session_step_next_concept long_arc concept=%s — rebuilt queue from plan",
+                    session.concept_id,
+                )
+                return ActorResult(
+                    ok=True,
+                    error=f"Long-arc: advancing to concept {session.concept_id} from plan.",
+                )
+            # else: plan exhausted (status=complete) → fall through to SESSION_COMPLETE.
+
+        # Queue empty AND no plan (or plan exhausted) — session complete.
         session.state = SessionState.SESSION_COMPLETE
         logger.info(
             "session_step_next_concept concept=%s mastered=%s — session complete (queue empty)",

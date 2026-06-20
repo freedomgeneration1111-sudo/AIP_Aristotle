@@ -149,20 +149,27 @@ async def session_start_route(request: Request):
     container = _get_container(request)
     body = await request.json()
     concept_id = body.get("concept_id", "")
-    if not concept_id:
-        raise HTTPException(status_code=400, detail="concept_id required")
+    plan_id = body.get("plan_id", "")
+    if not concept_id and not plan_id:
+        raise HTTPException(status_code=400, detail="concept_id or plan_id required")
 
     # Build the interleaved concept queue + cold-start pending set.
+    # Phase D: if plan_id is provided, the primary concept comes from the
+    # plan (concept_ids_json[current_concept_idx]), not the caller's concept_id.
     from aristotle.session import _build_concept_queue
     queue, cold_start_pending = await _build_concept_queue(
-        _make_ctx(container), concept_id,
+        _make_ctx(container), concept_id, plan_id=plan_id,
     )
 
+    # Determine the actual concept_id (from the queue if available).
+    actual_concept_id = queue[0] if queue else concept_id
+
     session = SessionContext(
-        concept_id=concept_id,
+        concept_id=actual_concept_id,
         state=SessionState.PREDICT,
         concept_queue=queue,
         cold_start_pending=cold_start_pending,
+        plan_id=plan_id,
     )
     return _session_to_dict(session)
 
@@ -687,6 +694,7 @@ def _session_to_dict(session: SessionContext) -> dict:
         "last_question_type": session.last_question_type,
         "concept_queue": list(session.concept_queue),
         "cold_start_pending": list(session.cold_start_pending),
+        "plan_id": session.plan_id,
     }
 
 
@@ -715,4 +723,5 @@ def _session_from_dict(d: dict) -> SessionContext:
         last_question_type=d.get("last_question_type", "recognition"),
         concept_queue=d.get("concept_queue", []),
         cold_start_pending=set(d.get("cold_start_pending", [])),
+        plan_id=d.get("plan_id", ""),
     )

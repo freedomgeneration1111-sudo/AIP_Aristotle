@@ -1444,3 +1444,187 @@ class TestSessionCoordinator:
             if "cold_start_passed = 1" in sql and "UPDATE" in sql.upper()
         ]
         assert len(update_calls) == 1, "expected one UPDATE setting cold_start_passed = 1"
+
+    # ------------------------------------------------------------------
+    # Phase D: plan executor bridge (plan_id on SessionContext)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_concept_queue_reads_from_plan_when_plan_id_set(self):
+        """When plan_id provided, primary concept comes from plan not caller arg.
+
+        Phase D: _build_concept_queue reads the plan's concept_ids_json
+        [current_concept_idx] as the primary concept, ignoring the
+        caller-supplied primary_concept_id.
+        """
+        from aristotle.session import _build_concept_queue
+
+        class _RoutingConn:
+            async def execute(self, sql, params=()):
+                if "aristotle_learning_plan" in sql.lower():
+                    # Plan: 3 concepts, current_idx=1 → primary = "c2"
+                    import json as _json
+                    return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 1, "active")])
+                if "aristotle_mastery" in sql.lower() and "next_review_at" in sql.lower():
+                    return _FakeCursor(None)  # no due reviews
+                return _FakeCursor(None)
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        # Caller passes "ignored_concept" but plan says primary is "c2"
+        queue, cold_start = await _build_concept_queue(ctx, "ignored_concept", plan_id="plan-1")
+        assert queue[0] == "c2", f"primary should be c2 (from plan), got {queue[0]}"
+        assert "ignored_concept" not in queue
+
+    @pytest.mark.asyncio
+    async def test_next_concept_advances_plan_cursor(self):
+        """After completing a concept with plan attached, plan cursor moves.
+
+        Phase D: _step_next_concept calls _advance_plan_cursor which
+        increments current_concept_idx on the plan.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "aristotle_learning_plan" in sql.lower() and "concept_ids_json" in sql.lower():
+                    import json as _json
+                    return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 0, "active")])
+                return _FakeCursor(None)
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider()
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.NEXT_CONCEPT,
+            concept_queue=["c1", "c2"],
+            plan_id="plan-1",
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        # The cursor should have been advanced — look for the UPDATE.
+        update_calls = [
+            sql for sql, _ in conn._executed
+            if "UPDATE aristotle_learning_plan SET current_concept_idx" in sql
+        ]
+        assert len(update_calls) == 1, "expected one UPDATE on current_concept_idx"
+
+    @pytest.mark.asyncio
+    async def test_long_arc_continues_to_next_plan_concept(self):
+        """When queue empties but plan has more concepts, session continues.
+
+        Phase D (long-arc executor): after the queue empties, if the plan
+        has more concepts, the session rebuilds the queue from the plan
+        instead of going to SESSION_COMPLETE.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "aristotle_learning_plan" in sql.lower() and "concept_ids_json" in sql.lower():
+                    import json as _json
+                    return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 1, "active")])
+                if "aristotle_mastery" in sql.lower() and "next_review_at" in sql.lower():
+                    return _FakeCursor(None)  # no due reviews
+                return _FakeCursor(None)
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider()
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c1",
+            state=SessionState.NEXT_CONCEPT,
+            concept_queue=["c1"],  # only 1 concept — will be empty after pop
+            plan_id="plan-1",  # plan has c2, c3 remaining (current_idx was 0, now 1)
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        # Should NOT be SESSION_COMPLETE — should have rebuilt from plan
+        assert session.state != SessionState.SESSION_COMPLETE, (
+            "long-arc should continue, not complete"
+        )
+        assert session.concept_id == "c2", (
+            f"should have advanced to c2 from plan, got {session.concept_id}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_completes_when_plan_exhausted(self):
+        """When the plan is complete, session goes to SESSION_COMPLETE.
+
+        Phase D: if the plan's status='complete' (all concepts done),
+        _build_concept_queue returns an empty queue, and the session
+        goes to SESSION_COMPLETE.
+        """
+        from aristotle.session import SessionContext, SessionState, run_session_step
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "aristotle_learning_plan" in sql.lower() and "concept_ids_json" in sql.lower():
+                    import json as _json
+                    return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 3, "complete")])
+                return _FakeCursor(None)
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider()
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            "extensions": type("H", (), {"registry": "fake"})(),
+        })()
+        ctx = ActorContext(
+            container=container, config=None,
+            logger=__import__("logging").getLogger("test"),
+            cancel_event=asyncio.Event(),
+        )
+        session = SessionContext(
+            concept_id="c3",
+            state=SessionState.NEXT_CONCEPT,
+            concept_queue=["c3"],  # last concept — will be empty after pop
+            plan_id="plan-1",  # plan status='complete'
+        )
+        result = await run_session_step(ctx, session)
+        assert result.ok
+        assert session.state == SessionState.SESSION_COMPLETE
