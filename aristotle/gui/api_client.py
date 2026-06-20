@@ -93,3 +93,18 @@ async def update_settings(
             return r.json()
     except Exception:
         return {}
+
+
+async def get_session_history(limit: int = 15) -> list:
+    """GET /aristotle/session-history — list of session dicts."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{_BASE}/aristotle/session-history",
+                params={"limit": limit},
+                timeout=3.0,
+            )
+            r.raise_for_status()
+            return r.json().get("sessions", [])
+    except Exception:
+        return []

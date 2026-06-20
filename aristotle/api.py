@@ -944,6 +944,82 @@ async def upload_route(request: Request):
 
 
 # ------------------------------------------------------------------
+# Session history route (Phase D — teacher dashboard data)
+# ------------------------------------------------------------------
+
+
+@router.get("/session-history")
+async def session_history_route(
+    request: Request, limit: int = 15
+):
+    """Session activity reconstructed from misconception log.
+
+    Groups misconception_log entries by session_id to produce
+    a timeline of tutoring sessions.
+
+    Returns:
+        {"sessions": [
+            {
+                "session_id": str,
+                "concept_id": str,
+                "started_at": str,
+                "last_activity": str,
+                "event_count": int,
+                "answer_count": int,
+                "curiosity_count": int,
+                "chat_count": int
+            }
+        ]}
+    """
+    container = _get_container(request)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return {"sessions": []}
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+
+        cur = await conn.execute(
+            "SELECT "
+            "  session_id, "
+            "  concept_id, "
+            "  COUNT(*) as event_count, "
+            "  MIN(created_at) as started_at, "
+            "  MAX(created_at) as last_activity, "
+            "  SUM(CASE WHEN intent_class = 'ANSWER' THEN 1 ELSE 0 END) as answer_count, "
+            "  SUM(CASE WHEN intent_class IN ('QUESTION', 'TANGENT') THEN 1 ELSE 0 END) as curiosity_count, "
+            "  SUM(CASE WHEN intent_class = 'CHAT' THEN 1 ELSE 0 END) as chat_count "
+            "FROM aristotle_misconception_log "
+            "WHERE session_id IS NOT NULL AND session_id != '' "
+            "GROUP BY session_id "
+            "ORDER BY last_activity DESC "
+            "LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        sessions = [
+            {
+                "session_id": row[0],
+                "concept_id": row[1],
+                "event_count": row[2],
+                "started_at": row[3],
+                "last_activity": row[4],
+                "answer_count": row[5] or 0,
+                "curiosity_count": row[6] or 0,
+                "chat_count": row[7] or 0,
+            }
+            for row in rows
+        ]
+
+        return {"sessions": sessions}
+    except Exception:
+        return {"sessions": []}
+
+
+# ------------------------------------------------------------------
 # Serialization helpers
 # ------------------------------------------------------------------
 

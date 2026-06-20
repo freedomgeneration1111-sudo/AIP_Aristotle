@@ -56,6 +56,7 @@ from aristotle.gui.api_client import (
     get_concepts,
     get_settings,
     update_settings,
+    get_session_history,
 )
 
 log = logging.getLogger("aristotle.gui.pages")
@@ -476,4 +477,327 @@ async def aristotle_settings_page():
                 )
 
         save_btn.on("click", lambda: asyncio.create_task(_save()))
+        asyncio.create_task(_load())
+
+
+# ---------------------------------------------------------------------------
+# Helper functions for teacher dashboard
+# ---------------------------------------------------------------------------
+
+
+def _stat_tile(label: str, value: str, color: str) -> None:
+    """Render a quick stat tile."""
+    with (
+        ui.column()
+        .classes("items-center")
+        .style(
+            f"background:{C_SURFACE}; border:0.5px solid {C_INK40}; "
+            f"border-radius:{R_LG}; padding:14px 20px; "
+            f"min-width:120px; flex:1;"
+        )
+    ):
+        ui.label(value).style(
+            f"font-size:22px; font-weight:700; "
+            f"color:{color}; font-family:{F_MONO};"
+        )
+        ui.label(label).style(
+            f"font-size:10px; letter-spacing:1px; "
+            f"color:{C_MUTED}; text-transform:uppercase; "
+            f"margin-top:2px;"
+        )
+
+
+def _section_hdr(text: str) -> None:
+    """Render a section label."""
+    ui.label(text).style(
+        f"font-size:10px; font-weight:700; letter-spacing:2px; "
+        f"color:{C_MUTED}; text-transform:uppercase; "
+        f"margin-bottom:10px;"
+    )
+
+
+def _mini_stat(label: str, value: int, color: str | None = None) -> None:
+    """Render a small inline stat."""
+    c = color or C_MUTED
+    ui.label(f"{value} {label}").style(
+        f"font-size:10px; color:{c}; font-family:{F_MONO};"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page D — /aristotle/teacher (Komal's dashboard)
+# ---------------------------------------------------------------------------
+
+
+@ui.page("/aristotle/teacher")
+async def aristotle_teacher_page():
+    """ARISTOTLE Teacher Dashboard — Komal's view.
+
+    Shows: quick stat tiles (total/mastered/due/not started),
+    needs-attention list, struggle pattern, recent sessions timeline,
+    full mastery table.
+    """
+    if not _BRAIN_GUI:
+        ui.label("Brain GUI not available").style("color:red")
+        return
+
+    state = get_session_state()
+    build_top_bar(state)
+    build_left_nav(state, active_page="/aristotle/teacher")
+    build_right_rail(state)
+
+    with (
+        ui.column()
+        .classes("flex-1")
+        .style(
+            f"background:{C_GROUND}; padding:24px; "
+            f"overflow-y:auto; min-height:calc(100vh - 44px);"
+        )
+    ):
+        ui.label("ARISTOTLE - Teacher Dashboard").style(
+            f"font-family:{F_SANS}; font-size:24px; "
+            f"font-weight:700; color:{C_CREAM}; margin-bottom:4px;"
+        )
+        ui.label("Student progress overview - Freedom Generation").style(
+            f"font-size:12px; color:{C_MUTED}; margin-bottom:24px;"
+        )
+
+        # Row 1: Quick stat tiles
+        stats_row = ui.row().classes("w-full gap-4").style(
+            "flex-wrap:wrap; margin-bottom:24px;"
+        )
+
+        # Row 2: Two-column layout
+        with ui.row().classes("w-full gap-6").style(
+            "flex-wrap:wrap; align-items:flex-start;"
+        ):
+            left_col = ui.column().style(
+                "flex:1; min-width:280px; gap:0;"
+            )
+            right_col = ui.column().style(
+                "flex:1; min-width:280px; gap:0;"
+            )
+
+        # Row 3: Full mastery table
+        ui.separator().style(
+            f"background:{C_INK40}; margin:24px 0 16px;"
+        )
+        ui.label("ALL CONCEPTS").style(
+            f"font-size:10px; font-weight:700; letter-spacing:2px; "
+            f"color:{C_MUTED}; margin-bottom:12px;"
+        )
+        table_col = ui.column().classes("w-full")
+
+        async def _load():
+            import asyncio as _asyncio
+            dashboard, sessions = await _asyncio.gather(
+                get_mastery(),
+                get_session_history(),
+                return_exceptions=True,
+            )
+            if isinstance(dashboard, Exception):
+                dashboard = {}
+            if isinstance(sessions, Exception):
+                sessions = []
+
+            total = dashboard.get("total_concepts", 0)
+            mastered = dashboard.get("mastered_count", 0)
+            due = dashboard.get("due_count", 0)
+            not_start = sum(
+                1 for c in dashboard.get("mastery_by_concept", [])
+                if c.get("repetitions", 0) == 0
+            )
+            struggle = dashboard.get("struggle_pattern")
+            concepts = dashboard.get("mastery_by_concept", [])
+
+            # Stat tiles
+            stats_row.clear()
+            with stats_row:
+                _stat_tile("Total", str(total), C_CREAM)
+                _stat_tile(
+                    "Mastered",
+                    f"{mastered} ({round(mastered / total * 100) if total else 0}%)",
+                    C_OK_FG,
+                )
+                _stat_tile(
+                    "Due for Review", str(due),
+                    C_AMBER if due > 0 else C_MUTED,
+                )
+                _stat_tile(
+                    "Not Started", str(not_start),
+                    C_ERR_FG if not_start > 0 else C_MUTED,
+                )
+
+            # Left col: Needs Attention
+            left_col.clear()
+            with left_col:
+                _section_hdr("NEEDS ATTENTION")
+                attention = [
+                    c for c in concepts
+                    if c.get("is_due") or c.get("repetitions", 0) == 0
+                ][:12]
+                if not attention:
+                    ui.label("Nothing urgent - student is on track.").style(
+                        f"font-size:12px; color:{C_OK_FG}; padding:8px 0;"
+                    )
+                for c in attention:
+                    is_due = c.get("is_due", False)
+                    not_yet = c.get("repetitions", 0) == 0
+                    topic = c.get("topic", c.get("concept_id", "?"))
+                    score = c.get("last_score")
+                    score_txt = f"{round(score * 100)}%" if score else "-"
+                    badge = "DUE" if is_due else "NEW"
+                    badge_c = C_AMBER if is_due else C_MUTED
+                    with (
+                        ui.row()
+                        .classes("w-full items-center gap-2")
+                        .style(
+                            f"padding:6px 10px; "
+                            f"border-left:2px solid {badge_c}; "
+                            f"margin-bottom:4px; "
+                            f"background:{C_SURFACE}; "
+                            f"border-radius:0 4px 4px 0;"
+                        )
+                    ):
+                        ui.label(badge).style(
+                            f"font-size:9px; font-family:{F_MONO}; "
+                            f"color:{badge_c}; min-width:28px; "
+                            f"font-weight:700;"
+                        )
+                        ui.label(topic).style(
+                            f"font-size:11px; color:{C_CREAM}; flex:1;"
+                        )
+                        ui.label(score_txt).style(
+                            f"font-size:11px; color:{C_MUTED}; "
+                            f"font-family:{F_MONO};"
+                        )
+
+                # Struggle Pattern
+                if struggle:
+                    ui.separator().style(
+                        f"background:{C_INK40}; margin:16px 0 12px;"
+                    )
+                    _section_hdr("STRUGGLE PATTERN")
+                    with (
+                        ui.card()
+                        .classes("w-full")
+                        .style(
+                            f"background:{C_SURFACE}; "
+                            f"border:0.5px solid {C_AMBER}; "
+                            f"border-radius:{R_LG}; padding:12px 14px;"
+                        )
+                    ):
+                        ui.label(struggle).style(
+                            f"font-size:12px; color:{C_CREAM}; "
+                            f"line-height:1.6;"
+                        )
+
+            # Right col: Recent Sessions
+            right_col.clear()
+            with right_col:
+                _section_hdr("RECENT SESSIONS")
+                if not sessions:
+                    ui.label("No sessions recorded yet.").style(
+                        f"font-size:12px; color:{C_MUTED}; padding:8px 0;"
+                    )
+                for s in sessions[:10]:
+                    concept = s.get("concept_id", "?")
+                    started = (s.get("started_at") or "")[:16].replace("T", " ")
+                    events = s.get("event_count", 0)
+                    answers = s.get("answer_count", 0)
+                    curiosity = s.get("curiosity_count", 0)
+                    with (
+                        ui.card()
+                        .classes("w-full")
+                        .style(
+                            f"background:{C_SURFACE}; "
+                            f"border:0.5px solid {C_INK40}; "
+                            f"border-radius:{R_LG}; "
+                            f"padding:10px 12px; margin-bottom:6px;"
+                        )
+                    ):
+                        with ui.row().classes("w-full items-center gap-2"):
+                            ui.label(concept).style(
+                                f"font-size:12px; font-weight:600; "
+                                f"color:{C_AMBER}; flex:1;"
+                            )
+                            ui.label(started).style(
+                                f"font-size:10px; color:{C_MUTED}; "
+                                f"font-family:{F_MONO};"
+                            )
+                        with ui.row().classes("w-full gap-3").style(
+                            "margin-top:4px;"
+                        ):
+                            _mini_stat("exchanges", events)
+                            _mini_stat("answers", answers)
+                            if curiosity:
+                                _mini_stat("questions asked", curiosity, C_AMBER)
+
+            # Full mastery table
+            table_col.clear()
+            with table_col:
+                if not concepts:
+                    ui.label("No concepts in curriculum yet.").style(
+                        f"color:{C_MUTED}; font-size:12px;"
+                    )
+                    return
+                with (
+                    ui.element("table")
+                    .classes("w-full")
+                    .style(
+                        f"border-collapse:collapse; "
+                        f"font-family:{F_MONO}; font-size:11px; "
+                        f"color:{C_MUTED};"
+                    )
+                ):
+                    with ui.element("thead"):
+                        with ui.element("tr").style(
+                            f"border-bottom:0.5px solid {C_INK40};"
+                        ):
+                            for col in [
+                                "Concept", "Score", "Reps",
+                                "Next Review", "Status"
+                            ]:
+                                th = ui.element("th").style(
+                                    f"text-align:left; padding:4px 8px; "
+                                    f"font-size:10px; letter-spacing:.5px; "
+                                    f"color:{C_MUTED}; font-weight:500;"
+                                )
+                                th.text = col
+                    with ui.element("tbody"):
+                        for c in concepts:
+                            topic = c.get("topic", c.get("concept_id", "?"))
+                            score = c.get("last_score")
+                            reps = c.get("repetitions", 0)
+                            due_dt = (c.get("next_review_at") or "")[:10]
+                            mastered = c.get("mastered", False)
+                            is_due = c.get("is_due", False)
+
+                            score_txt = (
+                                f"{round(score * 100)}%" if score else "-"
+                            )
+                            if mastered:
+                                status, sc = "Mastered", C_OK_FG
+                            elif is_due:
+                                status, sc = "Due", C_AMBER
+                            elif reps > 0:
+                                status, sc = "In progress", C_AMBER
+                            else:
+                                status, sc = "Not started", C_MUTED
+
+                            with ui.element("tr").style(
+                                f"border-bottom:0.5px solid {C_INK40};"
+                            ):
+                                for txt, color in [
+                                    (topic, C_CREAM),
+                                    (score_txt, C_CREAM),
+                                    (str(reps), C_MUTED),
+                                    (due_dt or "-", C_MUTED),
+                                    (status, sc),
+                                ]:
+                                    td = ui.element("td").style(
+                                        f"padding:5px 8px; color:{color};"
+                                    )
+                                    td.text = txt
+
         asyncio.create_task(_load())
