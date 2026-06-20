@@ -648,3 +648,345 @@ def intake_session_from_dict(d: dict) -> IntakeSession:
         schedule_minutes=d.get("schedule_minutes", 30),
         responses=d.get("responses", []),
     )
+
+
+# ---------------------------------------------------------------------------
+# PLACER — placement calibration (ADR-002 §9 stage 5, §11)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PlacerSession:
+    """Per-placement-calibration state (passed between steps).
+
+    PLACER probes a sample of concepts across the plan to determine what
+    the learner already knows, then sets the starting point
+    (learning_plan.current_concept_idx). Reuses ExaminerActor — no new
+    model slots needed.
+    """
+    plan_id: str = ""
+    concepts_to_assess: list = field(default_factory=list)
+    current_idx: int = 0
+    current_question: str = ""
+    question_generated: bool = False
+    results: list = field(default_factory=list)
+    # Each entry in results: {concept_id, score, mastery_achieved}
+    state: str = "PROBING"  # or "COMPLETE"
+
+
+def _sample_concepts_for_placement(
+    concept_ids: list, n: int = 7
+) -> list:
+    """Select n concepts distributed evenly across the list.
+
+    Distributes the sample across beginning, middle, and end — not just
+    the first n. If len(concept_ids) <= n, returns all.
+
+    Pure function, no DB. Used by run_placer_step to select which concepts
+    to probe during placement calibration.
+    """
+    if len(concept_ids) <= n:
+        return list(concept_ids)
+
+    # Evenly spaced indices: i * len / n for i in range(n).
+    step = len(concept_ids) / n
+    indices = [int(i * step) for i in range(n)]
+    # Deduplicate (can happen if step < 1, though we guard against that above).
+    seen = set()
+    result = []
+    for idx in indices:
+        if idx not in seen and idx < len(concept_ids):
+            seen.add(idx)
+            result.append(concept_ids[idx])
+    return result
+
+
+async def run_placer_step(
+    session: PlacerSession,
+    student_input: str,
+    ctx: ActorContext,
+) -> dict:
+    """Dispatch one placement step based on session state.
+
+    Two-phase per concept (same pattern as QUIZ):
+      Phase 1 (question_generated=False): call examiner.probe(ctx,
+        concept_id) for the current concept. Set question_generated=True.
+        Return {"state": "PROBING", "question": ...}.
+      Phase 2 (question_generated=True, student_input provided): call
+        examiner.evaluate(ctx, concept_id, student_input). Parse score +
+        mastery_achieved from result.data. Write one row to
+        aristotle_placement_event (best-effort). Append to session.results.
+        If mastery_achieved: upsert aristotle_mastery (repetitions=3 so
+        SM-2 treats it as known). Advance to next concept. If all concepts
+        assessed: call _finalize_placement + set state="COMPLETE".
+
+    Returns: {"state": "PROBING"|"COMPLETE", "question": ...,
+              "concepts_placed": len(results)} or
+              {"state": "COMPLETE", "concepts_placed": N,
+               "concepts_known": M, "starting_concept_idx": K}.
+    """
+    from aristotle.actors.examiner import ExaminerActor
+
+    examiner = ExaminerActor()
+    logger = ctx.logger
+
+    if session.state == "COMPLETE":
+        return {
+            "state": "COMPLETE",
+            "concepts_placed": len(session.results),
+            "concepts_known": sum(1 for r in session.results if r.get("mastery_achieved")),
+        }
+
+    if session.current_idx >= len(session.concepts_to_assess):
+        # All concepts assessed — finalize.
+        await _finalize_placement(session, ctx)
+        session.state = "COMPLETE"
+        return {
+            "state": "COMPLETE",
+            "concepts_placed": len(session.results),
+            "concepts_known": sum(1 for r in session.results if r.get("mastery_achieved")),
+        }
+
+    concept_id = session.concepts_to_assess[session.current_idx]
+
+    if not session.question_generated:
+        # Phase 1: generate the probe question.
+        result = await examiner.probe(ctx, concept_id)
+        if result.ok and result.data:
+            session.current_question = result.data.get("question", "")
+            session.question_generated = True
+            logger.info(
+                "placer_probe_generated concept=%s idx=%d",
+                concept_id, session.current_idx,
+            )
+            return {
+                "state": "PROBING",
+                "question": session.current_question,
+                "concepts_placed": len(session.results),
+            }
+        else:
+            return {
+                "state": "PROBING",
+                "error": result.error or "probe failed",
+                "concepts_placed": len(session.results),
+            }
+    else:
+        # Phase 2: evaluate the learner's answer.
+        eval_result = await examiner.evaluate(
+            ctx, concept_id,
+            student_answer=student_input,
+            quiz_question=session.current_question,
+        )
+
+        if not eval_result.ok:
+            return {
+                "state": "PROBING",
+                "error": eval_result.error or "evaluate failed",
+                "concepts_placed": len(session.results),
+            }
+
+        # Parse score + mastery from result.data.
+        eval_data = eval_result.data or {}
+        score = float(eval_data.get("score", 0.0))
+        mastery_achieved = bool(eval_data.get("mastery_achieved", False))
+
+        # Record the result.
+        session.results.append({
+            "concept_id": concept_id,
+            "score": score,
+            "mastery_achieved": mastery_achieved,
+        })
+
+        # Write placement_event row (best-effort).
+        container: Any = ctx.container
+        registry = getattr(container, "corpus_registry", None)
+        if registry is not None:
+            try:
+                stores = await registry.get_stores("aristotle:textbook")
+                conn = stores.connection_manager.write_conn
+                now = datetime.now(timezone.utc).isoformat()
+                await conn.execute(
+                    "INSERT INTO aristotle_placement_event "
+                    "(plan_id, concept_id, score, mastery_achieved, assessed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        session.plan_id,
+                        concept_id,
+                        score,
+                        1 if mastery_achieved else 0,
+                        now,
+                    ),
+                )
+                await conn.commit()
+            except Exception as exc:
+                logger.warning(
+                    "placer_placement_event_write_failed concept=%s error=%s:%s",
+                    concept_id, type(exc).__name__, exc,
+                )
+
+            # If mastered, upsert aristotle_mastery (repetitions=3 so SM-2
+            # treats it as known — skips the early TEACH steps).
+            if mastery_achieved:
+                try:
+                    stores = await registry.get_stores("aristotle:textbook")
+                    conn = stores.connection_manager.write_conn
+                    now = datetime.now(timezone.utc).isoformat()
+                    await conn.execute(
+                        "INSERT OR REPLACE INTO aristotle_mastery "
+                        "(student_id, concept_id, easiness_factor, interval_days, "
+                        "repetitions, next_review_at, last_score, mastered, updated_at) "
+                        "VALUES (?, ?, 2.5, 6, 3, ?, ?, 1, ?)",
+                        (
+                            "definer",
+                            concept_id,
+                            now,  # next_review_at = now (due immediately for cold-start)
+                            score,
+                            now,
+                        ),
+                    )
+                    await conn.commit()
+                    logger.info(
+                        "placer_mastery_upserted concept=%s score=%.2f",
+                        concept_id, score,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "placer_mastery_upsert_failed concept=%s error=%s:%s",
+                        concept_id, type(exc).__name__, exc,
+                    )
+
+        # Advance to the next concept.
+        session.current_idx += 1
+        session.question_generated = False
+        session.current_question = ""
+
+        if session.current_idx >= len(session.concepts_to_assess):
+            # All concepts assessed — finalize.
+            await _finalize_placement(session, ctx)
+            session.state = "COMPLETE"
+            return {
+                "state": "COMPLETE",
+                "concepts_placed": len(session.results),
+                "concepts_known": sum(1 for r in session.results if r.get("mastery_achieved")),
+            }
+
+        # More concepts to assess — generate the next question immediately
+        # (non-interactive mode: the caller can provide the next answer on
+        # the next call).
+        next_concept = session.concepts_to_assess[session.current_idx]
+        next_result = await examiner.probe(ctx, next_concept)
+        if next_result.ok and next_result.data:
+            session.current_question = next_result.data.get("question", "")
+            session.question_generated = True
+        return {
+            "state": "PROBING",
+            "question": session.current_question if session.question_generated else "",
+            "concepts_placed": len(session.results),
+        }
+
+
+async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None:
+    """Find the first non-mastered concept + set current_concept_idx on the plan.
+
+    Reads aristotle_learning_plan.concept_ids_json, finds the first concept
+    that did NOT achieve mastery in placement, updates
+    current_concept_idx to that position. If all concepts mastered, sets
+    status='complete'.
+
+    Best-effort — non-fatal on DB error.
+    """
+    logger = ctx.logger
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+
+        # Read the plan's concept sequence.
+        cur = await conn.execute(
+            "SELECT concept_ids_json FROM aristotle_learning_plan WHERE id = ?",
+            (session.plan_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
+        if row is None:
+            return
+
+        concept_ids = json.loads(row[0]) if row[0] else []
+
+        # Build a set of mastered concept_ids from placement results.
+        mastered_ids = {
+            r["concept_id"] for r in session.results if r.get("mastery_achieved")
+        }
+
+        # Find the first non-mastered concept.
+        starting_idx = 0
+        all_mastered = True
+        for idx, cid in enumerate(concept_ids):
+            if cid not in mastered_ids:
+                starting_idx = idx
+                all_mastered = False
+                break
+
+        if all_mastered:
+            # All concepts mastered — mark plan complete.
+            await conn.execute(
+                "UPDATE aristotle_learning_plan SET status = 'complete' WHERE id = ?",
+                (session.plan_id,),
+            )
+            logger.info(
+                "placer_finalized plan=%s — all %d concepts mastered, plan complete",
+                session.plan_id, len(concept_ids),
+            )
+        else:
+            await conn.execute(
+                "UPDATE aristotle_learning_plan SET current_concept_idx = ? WHERE id = ?",
+                (starting_idx, session.plan_id),
+            )
+            logger.info(
+                "placer_finalized plan=%s — starting at idx=%d (concept=%s)",
+                session.plan_id, starting_idx,
+                concept_ids[starting_idx] if starting_idx < len(concept_ids) else "?",
+            )
+
+        await conn.commit()
+    except Exception as exc:
+        logger.warning(
+            "placer_finalize_failed plan=%s error=%s:%s",
+            session.plan_id, type(exc).__name__, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# PLACER serialization helpers (used by api.py)
+# ---------------------------------------------------------------------------
+
+
+def placer_session_to_dict(session: PlacerSession) -> dict:
+    """Serialize a PlacerSession to a JSON-safe dict."""
+    return {
+        "plan_id": session.plan_id,
+        "concepts_to_assess": list(session.concepts_to_assess),
+        "current_idx": session.current_idx,
+        "current_question": session.current_question,
+        "question_generated": session.question_generated,
+        "results": list(session.results),
+        "state": session.state,
+    }
+
+
+def placer_session_from_dict(d: dict) -> PlacerSession:
+    """Deserialize a PlacerSession from a dict."""
+    return PlacerSession(
+        plan_id=d.get("plan_id", ""),
+        concepts_to_assess=d.get("concepts_to_assess", []),
+        current_idx=d.get("current_idx", 0),
+        current_question=d.get("current_question", ""),
+        question_generated=d.get("question_generated", False),
+        results=d.get("results", []),
+        state=d.get("state", "PROBING"),
+    )

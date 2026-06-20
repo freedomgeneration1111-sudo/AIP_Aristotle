@@ -377,6 +377,121 @@ async def intake_step_route(request: Request):
 
 
 # ------------------------------------------------------------------
+# Placer routes (Phase D — placement calibration, ADR-002 §9 stage 5)
+# ------------------------------------------------------------------
+
+
+@router.post("/placer/start")
+async def placer_start_route(request: Request):
+    """Start a placement calibration session.
+
+    Request body: {"plan_id": str}
+    Returns: {"session": dict, "question": str | None, "state": str,
+              "concepts_placed": int}
+
+    Phase D (ADR-002 §9 stage 5): reads the learning_plan by plan_id,
+    samples concepts for placement via _sample_concepts_for_placement,
+    creates a PlacerSession, and generates the first probe question.
+    """
+    container = _get_container(request)
+    body = await request.json()
+    plan_id = body.get("plan_id", "")
+    if not plan_id:
+        raise HTTPException(status_code=400, detail="plan_id required")
+
+    ctx = _make_ctx(container)
+
+    from aristotle.actors.intake import (
+        PlacerSession,
+        _sample_concepts_for_placement,
+        run_placer_step,
+        placer_session_to_dict,
+    )
+    import json as _json
+
+    # Read the plan's concept_ids_json.
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        cur = await conn.execute(
+            "SELECT concept_ids_json FROM aristotle_learning_plan WHERE id = ?",
+            (plan_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"plan {plan_id!r} not found")
+
+        concept_ids = _json.loads(row[0]) if row[0] else []
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"plan read failed: {exc}")
+
+    # Sample concepts for placement.
+    sampled = _sample_concepts_for_placement(concept_ids, n=7)
+    session = PlacerSession(
+        plan_id=plan_id,
+        concepts_to_assess=sampled,
+    )
+
+    # Generate the first question.
+    result = await run_placer_step(session, "", ctx)
+    return {
+        "session": placer_session_to_dict(session),
+        "question": result.get("question"),
+        "state": result.get("state"),
+        "concepts_placed": result.get("concepts_placed", 0),
+    }
+
+
+@router.post("/placer/step")
+async def placer_step_route(request: Request):
+    """Advance a placement calibration session one step.
+
+    Request body: {"session": dict, "student_input": str}
+    Returns: {"session": dict, "question": str | None, "state": str,
+              "concepts_placed": int, "concepts_known": int | None,
+              "starting_concept_idx": int | None}
+
+    When state="COMPLETE", the response includes concepts_known +
+    starting_concept_idx (from _finalize_placement).
+    """
+    container = _get_container(request)
+    body = await request.json()
+    session_dict = body.get("session", {})
+    student_input = body.get("student_input", "")
+
+    ctx = _make_ctx(container)
+
+    from aristotle.actors.intake import (
+        run_placer_step,
+        placer_session_to_dict,
+        placer_session_from_dict,
+    )
+
+    session = placer_session_from_dict(session_dict)
+    result = await run_placer_step(session, student_input, ctx)
+
+    response = {
+        "session": placer_session_to_dict(session),
+        "question": result.get("question"),
+        "state": result.get("state"),
+        "concepts_placed": result.get("concepts_placed", 0),
+    }
+
+    if result.get("state") == "COMPLETE":
+        response["concepts_known"] = result.get("concepts_known", 0)
+
+    return response
+
+
+# ------------------------------------------------------------------
 # Dashboard route (Phase B — teacher view, ADR-001 §8)
 # ------------------------------------------------------------------
 

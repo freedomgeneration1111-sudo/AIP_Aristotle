@@ -48,6 +48,24 @@ class _FakeConn:
         pass
 
 
+class _FakeModelProvider:
+    """Fake ModelProvider that returns canned responses by slot."""
+
+    def __init__(self, responses: dict[str, str] | None = None):
+        self._responses = responses or {}
+        self.calls: list[tuple[str, list[dict]]] = []
+
+    async def call(self, slot_name: str, messages: list[dict], **kwargs) -> dict:
+        self.calls.append((slot_name, messages))
+        content = self._responses.get(slot_name, f"[fake {slot_name} response]")
+        return {
+            "content": content,
+            "model": "fake-model",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+            "latency_ms": 5,
+        }
+
+
 class _FakeCursor:
     def __init__(self, rows):
         self._rows = rows
@@ -344,3 +362,277 @@ class TestIntakeSessionFlow:
         assert result["state"] == "PRIOR_KNOWLEDGE"
         assert result["prompt"] is not None
         assert result["pivot"] is None  # no intent detected
+
+
+# ---------------------------------------------------------------------------
+# PLACER tests (Phase D — placement calibration, ADR-002 §9 stage 5)
+# ---------------------------------------------------------------------------
+
+
+class TestPlacerSampling:
+    """Tests for _sample_concepts_for_placement (pure function, no async)."""
+
+    def test_sample_concepts_distributed_evenly(self):
+        """20 concepts, n=7 → returns 7 spaced indices, not first 7."""
+        from aristotle.actors.intake import _sample_concepts_for_placement
+        concept_ids = [f"c{i}" for i in range(20)]
+        sampled = _sample_concepts_for_placement(concept_ids, n=7)
+        assert len(sampled) == 7
+        # Should NOT be the first 7
+        assert sampled != concept_ids[:7]
+        # Should include concepts from the end of the list
+        assert any(int(cid[1:]) >= 15 for cid in sampled)
+        # Should include concepts from the beginning
+        assert any(int(cid[1:]) <= 5 for cid in sampled)
+
+    def test_sample_concepts_small_list(self):
+        """4 concepts, n=7 → returns all 4."""
+        from aristotle.actors.intake import _sample_concepts_for_placement
+        concept_ids = [f"c{i}" for i in range(4)]
+        sampled = _sample_concepts_for_placement(concept_ids, n=7)
+        assert len(sampled) == 4
+        assert set(sampled) == set(concept_ids)
+
+
+class TestPlacerStep:
+    """Tests for run_placer_step (uses ExaminerActor via fake model)."""
+
+    @pytest.mark.asyncio
+    async def test_placer_step_phase1_returns_question(self):
+        """Phase 1: run_placer_step with no student_input generates a probe question."""
+        from aristotle.actors.intake import PlacerSession, run_placer_step
+
+        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        fake = _FakeModelProvider(responses={
+            "evaluation": "Explain inertia in your own words.",  # probe question
+        })
+        # FakeConn returns concept rows for examiner._fetch_concept
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+        )
+        result = await run_placer_step(session, "", ctx)
+        assert result["state"] == "PROBING"
+        assert "question" in result
+        assert len(result["question"]) > 0
+        assert session.question_generated is True
+
+    @pytest.mark.asyncio
+    async def test_placer_step_phase2_writes_placement_event(self):
+        """Phase 2: evaluates the answer + writes a placement_event row."""
+        from aristotle.actors.intake import PlacerSession, run_placer_step
+
+        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+        result = await run_placer_step(session, "objects resist changes in motion", ctx)
+        assert result["concepts_placed"] == 1
+        # Verify the INSERT into aristotle_placement_event was issued.
+        insert_calls = [
+            sql for sql, _ in conn._executed
+            if "INSERT INTO aristotle_placement_event" in sql
+        ]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_placer_step_phase2_mastered_upserts_mastery(self):
+        """Phase 2: when mastery_achieved, upserts aristotle_mastery (repetitions=3)."""
+        from aristotle.actors.intake import PlacerSession, run_placer_step
+
+        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+        result = await run_placer_step(session, "objects resist changes in motion", ctx)
+        # Verify the INSERT OR REPLACE into aristotle_mastery was issued.
+        mastery_calls = [
+            sql for sql, _ in conn._executed
+            if "INSERT OR REPLACE INTO aristotle_mastery" in sql
+        ]
+        assert len(mastery_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_placer_advances_to_complete_after_last_concept(self):
+        """After the last concept is assessed, state becomes COMPLETE."""
+        from aristotle.actors.intake import PlacerSession, run_placer_step
+
+        eval_json = json.dumps({"score": 0.3, "mastery_achieved": False, "feedback": "Try again", "diagnosis": None})
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+        })
+        # Routing conn: returns concept row for fetch_concept, plan row for finalize
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2"]',)])
+                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1"],  # only 1 concept — will complete after this
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+        result = await run_placer_step(session, "I don't know", ctx)
+        assert result["state"] == "COMPLETE"
+        assert result["concepts_placed"] == 1
+        assert session.state == "COMPLETE"
+
+    @pytest.mark.asyncio
+    async def test_finalize_sets_current_concept_idx(self):
+        """_finalize_placement sets current_concept_idx to the first non-mastered concept."""
+        from aristotle.actors.intake import PlacerSession, _finalize_placement
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2", "c3"]',)])
+                return _FakeCursor(None)
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            results=[
+                {"concept_id": "c1", "score": 0.9, "mastery_achieved": True},
+                {"concept_id": "c3", "score": 0.3, "mastery_achieved": False},
+            ],
+        )
+        await _finalize_placement(session, ctx)
+        # Should have issued an UPDATE setting current_concept_idx = 1 (c2 is the first non-mastered)
+        update_calls = [
+            (sql, params) for sql, params in conn._executed
+            if "UPDATE aristotle_learning_plan SET current_concept_idx" in sql
+        ]
+        assert len(update_calls) == 1
+        _sql, params = update_calls[0]
+        assert params[0] == 1  # starting_concept_idx
+
+
+class TestPlacerRoutes:
+    """Tests for the PLACER API routes."""
+
+    @pytest.mark.asyncio
+    async def test_placer_start_route_returns_first_question(self):
+        """POST /placer/start reads the plan + returns the first probe question."""
+        from aristotle.api import placer_start_route
+
+        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        fake = _FakeModelProvider(responses={
+            "evaluation": "Explain inertia in your own words.",
+        })
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2"]',)])
+                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+        })()
+        request = type("R", (), {
+            "app": type("A", (), {
+                "state": type("S", (), {"container": container})(),
+            })(),
+        })()
+
+        async def _json():
+            return {"plan_id": "plan-1"}
+        request.json = _json
+
+        result = await placer_start_route(request)
+        assert result["state"] == "PROBING"
+        assert result["question"] is not None
+        assert len(result["question"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_placer_step_route_advances_session(self):
+        """POST /placer/step with an answer advances the session."""
+        from aristotle.api import placer_step_route
+        from aristotle.actors.intake import PlacerSession, placer_session_to_dict
+
+        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        fake = _FakeModelProvider(responses={
+            "evaluation": eval_json,
+        })
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2"]',)])
+                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        container = type("C", (), {
+            "model_provider": fake,
+            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+        })()
+        request = type("R", (), {
+            "app": type("A", (), {
+                "state": type("S", (), {"container": container})(),
+            })(),
+        })()
+
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        async def _json():
+            return {"session": placer_session_to_dict(session), "student_input": "objects resist changes in motion"}
+        request.json = _json
+
+        result = await placer_step_route(request)
+        assert result["concepts_placed"] == 1
+        # The session should have advanced (either to next question or COMPLETE)
+        assert result["session"]["current_idx"] >= 1
