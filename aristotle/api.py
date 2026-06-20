@@ -171,6 +171,14 @@ async def session_start_route(request: Request):
         cold_start_pending=cold_start_pending,
         plan_id=plan_id,
     )
+
+    # Notify Brain GUI that an ARISTOTLE session is active.
+    try:
+        from gui.components.layout import set_active_extension
+        set_active_extension("aristotle", "Tutoring")
+    except ImportError:
+        pass  # Running outside Brain GUI — no-op
+
     return _session_to_dict(session)
 
 
@@ -190,6 +198,15 @@ async def session_step_route(request: Request):
     ctx = _make_ctx(container)
 
     result = await run_session_step(ctx, session, student_input)
+
+    # Notify Brain GUI when session completes.
+    if session.state.value == "SESSION_COMPLETE":
+        try:
+            from gui.components.layout import clear_active_extension
+            clear_active_extension()
+        except ImportError:
+            pass  # Running outside Brain GUI — no-op
+
     return {
         "session": _session_to_dict(session),
         "output": result.error if result.ok else "",
