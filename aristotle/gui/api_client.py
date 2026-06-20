@@ -29,14 +29,16 @@ async def get_mastery(student_id: str | None = None) -> dict:
 async def get_misconceptions(
     student_id: str | None = None, limit: int = 20
 ) -> list:
-    """GET misconception log.
-
-    TODO: wire /aristotle/misconceptions route — does not exist yet.
-    The dashboard route returns struggle_pattern (a single string),
-    not the misconception log. For now, return [].
-    """
-    # TODO: add GET /aristotle/misconceptions route to api.py
-    return []
+    """GET /aristotle/misconceptions — recent misconception log entries."""
+    params = {"limit": limit}
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{_BASE}/aristotle/misconceptions",
+                            params=params, timeout=3.0)
+            r.raise_for_status()
+            return r.json().get("misconceptions", [])
+    except Exception:
+        return []
 
 
 async def get_struggle_patterns(
@@ -69,20 +71,25 @@ async def get_concepts() -> list:
 
 
 async def get_settings(student_id: str | None = None) -> dict:
-    """GET ARISTOTLE settings/profile.
-
-    TODO: wire /aristotle/settings route — does not exist yet.
-    """
-    # TODO: add GET /aristotle/settings route to api.py
-    return {}
+    """GET /aristotle/settings — student settings or defaults."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{_BASE}/aristotle/settings", timeout=3.0)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return {}
 
 
 async def update_settings(
     student_id: str | None = None, settings: dict = {}
 ) -> dict:
-    """POST/PATCH ARISTOTLE settings.
-
-    TODO: wire /aristotle/settings route — does not exist yet.
-    """
-    # TODO: add POST /aristotle/settings route to api.py
-    return {}
+    """POST /aristotle/settings — create or update settings (upsert)."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post(f"{_BASE}/aristotle/settings",
+                             json=settings, timeout=3.0)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return {}

@@ -40,6 +40,7 @@ The platform's app.py sets `app.state.container` in the lifespan.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import yaml
@@ -678,6 +679,257 @@ async def dashboard_route(request: Request):
         "due_count": due_count,
         "struggle_pattern": struggle_pattern,
         "mastery_by_concept": mastery_by_concept,
+    }
+
+
+# ------------------------------------------------------------------
+# Misconception log route (Phase D — GUI data)
+# ------------------------------------------------------------------
+
+
+@router.get("/misconceptions")
+async def misconceptions_route(
+    request: Request, limit: int = 20
+):
+    """Misconception log — recent entries for the default student.
+
+    Returns:
+        {"misconceptions": [
+            {
+                "id": int,
+                "concept_id": str,
+                "misconception_text": str,
+                "corrective_text": str,
+                "created_at": str
+            }
+        ]}
+    """
+    container = _get_container(request)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"corpus access failed: {exc}")
+
+    conn = stores.connection_manager.write_conn
+
+    cur = await conn.execute(
+        "SELECT id, concept_id, misconception_text, corrective_text, created_at "
+        "FROM aristotle_misconception_log "
+        "ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+
+    misconceptions = [
+        {
+            "id": row[0],
+            "concept_id": row[1],
+            "misconception_text": row[2],
+            "corrective_text": row[3],
+            "created_at": row[4],
+        }
+        for row in rows
+    ]
+
+    return {"misconceptions": misconceptions}
+
+
+# ------------------------------------------------------------------
+# Settings routes (Phase D — GUI data)
+# ------------------------------------------------------------------
+
+
+_DEFAULT_SETTINGS = {
+    "student_id": "definer",
+    "display_name": "",
+    "primary_language": "English",
+    "alt_language": "",
+    "session_length": 5,
+    "mastery_threshold": 0.85,
+    "hint_aggressiveness": "balanced",
+    "updated_at": None,
+}
+
+
+@router.get("/settings")
+async def get_settings_route(request: Request):
+    """Return current student settings (or defaults if not set).
+
+    Returns the aristotle_settings row for student_id='definer',
+    or default values if no row exists yet.
+    """
+    container = _get_container(request)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"corpus access failed: {exc}")
+
+    conn = stores.connection_manager.write_conn
+
+    cur = await conn.execute(
+        "SELECT student_id, display_name, primary_language, alt_language, "
+        "session_length, mastery_threshold, hint_aggressiveness, updated_at "
+        "FROM aristotle_settings WHERE student_id = ?",
+        ("definer",),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+
+    if row is None:
+        return dict(_DEFAULT_SETTINGS)
+
+    return {
+        "student_id": row[0],
+        "display_name": row[1] or "",
+        "primary_language": row[2] or "English",
+        "alt_language": row[3] or "",
+        "session_length": row[4] if row[4] is not None else 5,
+        "mastery_threshold": row[5] if row[5] is not None else 0.85,
+        "hint_aggressiveness": row[6] or "balanced",
+        "updated_at": row[7],
+    }
+
+
+@router.post("/settings")
+async def update_settings_route(request: Request):
+    """Create or update student settings (upsert).
+
+    Request body:
+        {
+            "display_name": str | null,
+            "primary_language": str,
+            "alt_language": str | null,
+            "session_length": int,
+            "mastery_threshold": float,
+            "hint_aggressiveness": str
+        }
+
+    Returns: updated settings dict
+    """
+    container = _get_container(request)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"corpus access failed: {exc}")
+
+    conn = stores.connection_manager.write_conn
+    body = await request.json()
+
+    display_name = body.get("display_name", "")
+    primary_language = body.get("primary_language", "English")
+    alt_language = body.get("alt_language", "")
+    session_length = int(body.get("session_length", 5))
+    mastery_threshold = float(body.get("mastery_threshold", 0.85))
+    hint_aggressiveness = body.get("hint_aggressiveness", "balanced")
+    now = datetime.now(timezone.utc).isoformat()
+
+    await conn.execute(
+        "INSERT OR REPLACE INTO aristotle_settings "
+        "(student_id, display_name, primary_language, alt_language, "
+        "session_length, mastery_threshold, hint_aggressiveness, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "definer", display_name, primary_language, alt_language,
+            session_length, mastery_threshold, hint_aggressiveness, now,
+        ),
+    )
+    await conn.commit()
+
+    return {
+        "student_id": "definer",
+        "display_name": display_name,
+        "primary_language": primary_language,
+        "alt_language": alt_language,
+        "session_length": session_length,
+        "mastery_threshold": mastery_threshold,
+        "hint_aggressiveness": hint_aggressiveness,
+        "updated_at": now,
+    }
+
+
+# ------------------------------------------------------------------
+# Upload route (OCR — Phase D surface layer)
+# ------------------------------------------------------------------
+
+
+@router.post("/upload")
+async def upload_route(request: Request):
+    """Extract text from uploaded PDF or image.
+
+    Accepts raw body bytes with Content-Type indicating the file type.
+    - PDF (application/pdf): pypdf PdfReader extracts text from all pages
+    - Image (image/*): pytesseract OCR extracts text
+
+    Returns:
+        {
+            "extracted_text": str,
+            "source_type": "pdf" | "image",
+            "page_count": int | null,
+            "char_count": int
+        }
+
+    Errors return 400 with detail message.
+    Max file size: 10MB (reject with 413 if exceeded).
+    """
+    import io
+
+    content_type = request.headers.get("content-type", "")
+    body = await request.body()
+
+    if len(body) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty body")
+
+    # Detect file type from Content-Type or first bytes.
+    if "application/pdf" in content_type or body[:4] == b"%PDF":
+        source_type = "pdf"
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(body))
+            text = "\n".join(
+                page.extract_text() or "" for page in reader.pages
+            )
+            page_count = len(reader.pages)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"PDF parse error: {exc}")
+    elif any(ct in content_type for ct in ["image/jpeg", "image/png", "image/webp", "image/bmp", "image/"]):
+        source_type = "image"
+        try:
+            import pytesseract
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(body))
+            text = pytesseract.image_to_string(img)
+            page_count = None
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"OCR error: {exc}")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported content type: {content_type}. Use application/pdf or image/*",
+        )
+
+    return {
+        "extracted_text": text,
+        "source_type": source_type,
+        "page_count": page_count,
+        "char_count": len(text),
     }
 
 
