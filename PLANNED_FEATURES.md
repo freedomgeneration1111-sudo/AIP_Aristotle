@@ -171,15 +171,33 @@ Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
 
 ### Phase D Surface Layer — 🔲 PLANNED (no blockers)
 
+Per `docs/UI_CONVENTIONS.md` (AIP_Brain): the INTAKE interview runs in
+the main Brain chat — NOT a separate /intake page. Chat IS the intake
+surface. ARISTOTLE registers three pages only:
+
 | # | Deliverable | Why it matters | Dependencies |
 |---|-------------|----------------|--------------|
-| 3 | **INTAKE GUI page** at `/intake` | Conversational UI mirroring the tutoring loop's polish. | Platform v1.1 GUI mount (built). |
-| 4 | **`ui.upload` for PDF + image** | Learner uploads their textbook / worksheet / handwritten problem. | Platform NiceGUI `ui.upload` (built). |
-| 5 | **OCR path** via `pytesseract` | Extracts text from uploaded images / scanned PDFs into the ingestor. `pypdf` for native PDFs. | None. `pytesseract` + `Pillow` installed. |
-| 7 | **Voice mode toggle** | Browser Web Speech API for STT (zero-dep path). Optional Whisper slot for Urdu / noisy sessions. | None for browser path. |
+| 3a | **`/aristotle/stats`** — mastery, misconceptions, struggle patterns | Teacher/learner analytics view. Surfaces the data already in the DB (aristotle_mastery, aristotle_misconception_log, aristotle_struggle_pattern). | Brain GUI phase: three-panel shell + ADR-014 A1 sidebar visibility. |
+| 3b | **`/aristotle/map`** — concept graph, progress visualization | Visual DAG of the learning plan with mastery state per concept. | Brain GUI phase: three-panel shell. |
+| 3c | **`/aristotle/settings`** — ARISTOTLE preferences | Bloom target, mastery threshold, primary/alt language, schedule. | Brain GUI phase: three-panel shell. |
+| 4 | **Right panel: mastery state + concept progress** | Collapses when not in extension session (per UI_CONVENTIONS.md). Shows the current concept, mastery level, score history. | Brain GUI phase: right drawer + extension mode shift. |
+| 5 | **OCR path** via `pytesseract` | Extracts text from uploaded images / scanned PDFs into the ingestor. `pypdf` for native PDFs (fix already committed — DEBT-012 resolved). | None. `pytesseract` + `Pillow` installed. Upload via Brain core + menu. |
+| 7 | **Voice mode toggle** | Browser Web Speech API for STT (zero-dep path). Contributed via Brain core + menu, not a separate ARISTOTLE UI element. | None for browser path. |
 
-**Gate:** None. The surface layer has no external blockers — all depend on
-platform capabilities that are already built (GUI mount, ui.upload, model slots).
+**Intake via Brain chat:** The INTAKE actor (already built — commit
+`5128caa`) drives the conversation via the `/intake/start` and
+`/intake/step` API routes. The Brain chat bar IS the intake surface —
+ARISTOTLE does not register a separate /intake page. The chat-primary
+extension pattern (UI_CONVENTIONS.md) means the chat bar stays as the
+main view during intake, with ARISTOTLE's mode label in the header.
+
+**+ menu:** ARISTOTLE does not register new + menu items — Upload PDF
+and Voice mode are Brain core features. ARISTOTLE consumes them via
+the standard upload → OCR → ingest pipeline.
+
+**Gate:** None. The surface layer depends on the Brain GUI phase
+(three-panel shell, ADR-014 A1 sidebar visibility, extension mode shift)
+which has no external blockers.
 
 ---
 
@@ -297,6 +315,7 @@ instructions.
 | 2026-06-19 | Added "Platform — Planned (Pre-ADR)" section with two entries: (1) Extension Corpus Isolation and Access Control — default isolation + configurable grants, enforcement at CorpusRegistry.get_stores(), ReadOnlyCorpusStores wrapper, ActorContext.extension_id, fully backwards-compatible; (2) Actor Prompt Customization — three-layer prompt composition (platform template + user instructions + per-actor override), ci_mode validation, extension_actor_instructions table, versioning on template bumps, UI in Phase D. Both pre-ADR — full spec before implementation. No code changes. | Super Z (main) |
 | 2026-06-19 | **Phase B.5 ✅ COMPLETE.** All 9 deliverables shipped across 8 commits: PREDICT step (6dfcb5d), HINT ladder (e75906e), error diagnosis (95d00d2+a6cd987), faded worked examples (b803ef9), session interleaving (2079f0c), transfer questions (0352708), misconception log wiring (1be28f7), extended mastery model + cold-start check (d20fd3a). ActorResult.data migration complete for all actors (ARISTOTLE-DEBT-011 resolved). 89 tests, 0 warnings. | Super Z (main) |
 | 2026-06-19 | **Phase D backend ✅ COMPLETE.** 5 deliverables shipped: M004 schema (fc7c89d), INTAKE actor + intent detection + API routes (5128caa), PLACER actor + placement calibration (2322f0f), plan executor bridge — long-arc sessions (228d440), MENTOR pattern recognition — synthesize struggle patterns from misconception log (a72e3db). Phase D surface layer (GUI, upload, OCR, voice) remains planned — no blockers. 124 tests, 0 warnings. | Super Z (main) |
+| 2026-06-20 | Phase D surface layer revised per UI_CONVENTIONS.md (AIP_Brain): no /intake page — intake runs in Brain main chat. ARISTOTLE registers three pages only: /aristotle/stats, /aristotle/map, /aristotle/settings. Right panel: mastery state + concept progress. + menu: no new items (upload + voice are Brain core). No code changes. | Super Z (main) |
 
 ---
 
