@@ -1,8 +1,8 @@
 # AIP_Aristotle — Status
 
-**Last Updated:** 2026-06-18
-**Phase:** Phase B complete / Phase C planning
-**Operational State:** Pre-alpha — Phase A tutoring loop + Phase B teacher dashboard shipped
+**Last Updated:** 2026-06-20
+**Phase:** GUI Phase ✅ COMPLETE / Phase E (multi-student) deferred / Phase C (HERALD) blocked
+**Operational State:** Pre-alpha — Phase A tutoring loop + Phase B teacher dashboard + Phase B.5 pedagogical upgrades + Phase D onboarding + GUI surface layer shipped. 149 tests, 0 warnings. Most recent milestone: GUI phase completion + ADR-001 Research Annex (2026-06-20).
 
 ---
 
@@ -22,19 +22,25 @@ tasks.
 - Three actors conform to the foundation Actor Protocol (isinstance-validated)
 - Real model calls: SOCRATES.teach(), EXAMINER.probe()/quiz()/evaluate(), MENTOR.update_struggle_pattern()
 - SM-2 spaced repetition module (aristotle/sm2.py) + aristotle_mastery table
-- Session coordinator drives TEACH→PROBE→QUIZ→EVALUATE→REMEDIATE state machine
+- Session coordinator drives PREDICT→TEACH→PROBE→QUIZ→EVALUATE→[HINT_1→HINT_2→]REMEDIATE state machine
+- Curiosity path — open learner model (ADR-002 Amendment A1): dual-mode session (structured ANSWER vs conversational QUESTION/TANGENT/CHAT)
 - Content ingestor (YAML → aristotle_concept, bilingual)
 - CLI (HTTP client): health, list-concepts, ingest, session (interactive + non-interactive)
-- API routes: /concepts, /ingest, /session/{start,step,run}, /dashboard
+- API routes: /concepts, /ingest, /session/{start,step,run}, /intake/{start,step}, /placer/{start,step}, /dashboard, /misconceptions, /settings (GET+POST), /upload, /session-history
+- Expanded /upload endpoint: PDF (pypdf), images (pytesseract OCR), txt/md/csv/html/json/yaml/docx
 - GUI learning view at /learn (concept selector + tutoring session)
 - GUI teacher dashboard at /dashboard (stats header, struggle pattern, mastery table)
+- ARISTOTLE GUI pages: /aristotle/stats, /aristotle/map, /aristotle/settings (save wired), /aristotle/teacher (Komal's view: mastery heatmap, struggle patterns, session history reconstruction)
+- Brain + menu: real file upload (UI → ARISTOTLE /upload via hidden ui.upload), voice mode (Web Speech API)
 - Dashboard LEFT JOIN: all concepts appear including unstarted; sort: due → unstarted → mastered
 - Nav items dynamic via /health/extensions nav_items (no hardcoded extension names)
 - Health surfaces via the platform's /health/extensions endpoint
 - Import boundary machine-enforced (extensions import only the allowlist; gui/ scanned too)
+- ADR-001 Research Annex committed (2026-06-20) — full evidence base underlying every design decision
 
 **What doesn't work yet:**
 - Phase C (HERALD): field awareness — blocked on platform web/feed layer (ADR-014 §3.4)
+- Phase E (multi-student): deferred per ADR-014 §1 (one install per learner pre-alpha; multi-tenant is the deferred enterprise version)
 - SOCRATES uses raw SQL on aristotle_concept, not the Brain's retrieval pipeline (ARISTOTLE-DEBT-007)
 - GUI coupling to Brain's gui/ package (ARISTOTLE-DEBT-008)
 
@@ -135,9 +141,14 @@ Aristotle depends on these platform capabilities (all shipped in AIP_Brain
 ## Pilot Readiness
 
 **Ready for dogfood testing.** Phase A (tutoring loop) + Phase B (teacher
-dashboard) are shipped. The tutoring loop runs end-to-end with real model
-calls, SM-2 scheduling, struggle_pattern tracking, and a GUI learning view.
-The teacher dashboard shows mastery, due items, and the struggle pattern.
+dashboard) + Phase B.5 (9 pedagogical upgrades) + Phase D backend
+(onboarding: intake + placement + long-arc plan) + GUI surface layer
+(stats, map, settings, teacher dashboard, session history, curiosity
+path, expanded upload, Brain + menu + voice wired) are all shipped. 149
+tests pass with 0 warnings. The tutoring loop runs end-to-end with real
+model calls, SM-2 scheduling, struggle_pattern tracking, and a GUI
+learning view. The teacher dashboard shows mastery, due items, and the
+struggle pattern.
 
 **What to test:**
 1. Install both repos (pip install -e)
@@ -149,3 +160,5 @@ The teacher dashboard shows mastery, due items, and the struggle pattern.
 **Next major milestone: Phase C (HERALD)** — field awareness. Blocked on
 the platform's web/feed layer (ADR-014 §3.4), which is not yet built.
 The tutoring loop ships without it; HERALD layers on when feeds land.
+**Phase E (multi-student)** is deferred per ADR-014 §1 (one install per
+learner pre-alpha) — not blocked, just not yet scheduled.

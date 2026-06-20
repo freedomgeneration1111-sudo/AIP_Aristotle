@@ -127,6 +127,7 @@ and Voice mode are Brain core features.
 | 2026-06-19 | **Phase B.5 ✅ COMPLETE.** All 9 deliverables shipped. ActorResult.data migration complete. 89 tests, 0 warnings. | Super Z (main) |
 | 2026-06-19 | **Phase D backend ✅ COMPLETE.** 5 deliverables shipped: M004, INTAKE, PLACER, plan executor, pattern recognition. 124 tests, 0 warnings. | Super Z (main) |
 | 2026-06-20 | Phase D surface layer revised per UI_CONVENTIONS.md: no /intake page — intake via Brain chat. Three registered pages only (stats, map, settings). Roadmap rewritten to reflect current state + GUI phase as immediate next. | Super Z (main) |
+| 2026-06-20 | **GUI Phase ✅ COMPLETE.** Stats, map, settings, teacher dashboard, session history, curiosity path (ADR-002 A1), upload expansion, Brain + menu wired, voice mode (Web Speech API). 149 tests, 0 warnings. ADR-001 research annex filed. | Moses + Claude (main) |
 
 ---
 
