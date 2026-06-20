@@ -148,7 +148,7 @@ ARISTOTLE-DEBT-011).
 
 ---
 
-## Status: Planned (Phase D — Onboarding: Intake + Placement + Long-Arc Plan)
+## Status: ✅ Backend COMPLETE / Surface Layer Planned (Phase D — Onboarding)
 
 Phase D is the ADR-002 Rev 2 onboarding system. New learners walk through a
 five-stage intake interview, take a placement calibration, and receive a
@@ -159,31 +159,27 @@ capabilities for material upload.
 Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
 (Part B — Onboarding, §§9–13; Part C — New capabilities, §§12–13).
 
-**Core Phase D has no external dependencies.** Web search unlocks material
-sourcing (fetching a PDF from a publisher's page); the intake/placement
-loop itself runs without it.
+### Phase D Backend — ✅ COMPLETE (5 commits)
 
-Internal build order (from ADR-002 §15):
+| # | Deliverable | Status | Commit |
+|---|-------------|--------|--------|
+| 1 | **M004 schema** (`aristotle_intake_session`, `aristotle_learning_plan`, `aristotle_placement_event`) | ✅ | `fc7c89d` |
+| 2 | **INTAKE actor** + intent detection + trigger checking + API routes | ✅ | `5128caa` |
+| 6 | **PLACER actor** + PlacerSession + placement calibration + API routes | ✅ | `2322f0f` |
+| 8 | **Long-arc plan executor** — plan_id on SessionContext, concept queue reads from plan, cursor advances, long-arc continuation | ✅ | `228d440` |
+| — | **MENTOR pattern recognition** — synthesize struggle patterns from misconception log (ADR-002 §7) | ✅ | `a72e3db` |
+
+### Phase D Surface Layer — 🔲 PLANNED (no blockers)
 
 | # | Deliverable | Why it matters | Dependencies |
 |---|-------------|----------------|--------------|
-| 1 | **M003 full schema** (`aristotle_learning_plan`, `aristotle_placement_event`, `aristotle_intake_session` + the B.5 tables) | Versioned, append-only long-arc plan + placement history + intake session log. | None. |
-| 2 | **INTAKE actor** (ADR-002 §11) + intake session API route | Conducts the five-stage intake interview (context, goals, prior exposure, time, friction). Uses the `synthesis` slot. | None. |
 | 3 | **INTAKE GUI page** at `/intake` | Conversational UI mirroring the tutoring loop's polish. | Platform v1.1 GUI mount (built). |
 | 4 | **`ui.upload` for PDF + image** | Learner uploads their textbook / worksheet / handwritten problem. | Platform NiceGUI `ui.upload` (built). |
-| 5 | **OCR path** via `pytesseract` | Extracts text from uploaded images / scanned PDFs into the ingestor. `pypdf` for native PDFs (DEBT-012 resolved). | None. `pytesseract` + `Pillow` installed (ADR-002 §17). |
-| 6 | **PLACER actor** (ADR-002 §11) + placement API route | Calibrates starting mastery per concept after intake. Writes `aristotle_placement_event`. Uses the `evaluation` slot. | INTAKE actor (item 2). |
-| 7 | **Voice mode toggle** | Browser Web Speech API for STT (zero-dep path). Optional Whisper slot for Urdu / noisy sessions. | None for browser path. Whisper needs platform model slot. |
-| 8 | **Long-arc plan executor** | Session coordinator consults the versioned `aristotle_learning_plan` to pick the next concept + session type. | M003 schema (item 1) + Phase B.5 cold-start check (B.5 item 9). |
+| 5 | **OCR path** via `pytesseract` | Extracts text from uploaded images / scanned PDFs into the ingestor. `pypdf` for native PDFs. | None. `pytesseract` + `Pillow` installed. |
+| 7 | **Voice mode toggle** | Browser Web Speech API for STT (zero-dep path). Optional Whisper slot for Urdu / noisy sessions. | None for browser path. |
 
-**Gate:** None for core (items 1–7). Item 8 (long-arc plan executor) benefits
-from Phase B.5's cold-start check but can ship a simpler version first.
-
-**Open DEFINER decisions blocking Phase D** (ADR-002 §16):
-- #1: Backup strategy A/B/C (ADR-014 §9.7) — **blocking**. Recommended: Option A.
-- #2: OCR quality — `pytesseract` (local, free) vs vision model slot. Recommended: `pytesseract` for Phase D.
-- #3: Voice STT — browser Web Speech API (zero-dep) vs Whisper slot (Urdu, noisy). Recommended: browser for Phase D.
-- #5: Intake conversation language — English-only intake, bilingual tutoring? Recommended: English-only intake for Phase D.
+**Gate:** None. The surface layer has no external blockers — all depend on
+platform capabilities that are already built (GUI mount, ui.upload, model slots).
 
 ---
 
@@ -300,6 +296,7 @@ instructions.
 | 2026-06-19 | ADR-002 Rev 2 committed (`docs/decisions/ADR-002-intake-placement-learning-plan.md`). Added Phase B.5 (research-grounded pedagogical improvements — PREDICT, hints, error diagnosis, faded examples, interleaving, transfer questions, misconception log, mastery model extension, cold-start check) and Phase D (intake, placement, long-arc plan, OCR, voice) as planned phases with their ADR-002 §15 build orders. No code changes. | Super Z (main) |
 | 2026-06-19 | Added "Platform — Planned (Pre-ADR)" section with two entries: (1) Extension Corpus Isolation and Access Control — default isolation + configurable grants, enforcement at CorpusRegistry.get_stores(), ReadOnlyCorpusStores wrapper, ActorContext.extension_id, fully backwards-compatible; (2) Actor Prompt Customization — three-layer prompt composition (platform template + user instructions + per-actor override), ci_mode validation, extension_actor_instructions table, versioning on template bumps, UI in Phase D. Both pre-ADR — full spec before implementation. No code changes. | Super Z (main) |
 | 2026-06-19 | **Phase B.5 ✅ COMPLETE.** All 9 deliverables shipped across 8 commits: PREDICT step (6dfcb5d), HINT ladder (e75906e), error diagnosis (95d00d2+a6cd987), faded worked examples (b803ef9), session interleaving (2079f0c), transfer questions (0352708), misconception log wiring (1be28f7), extended mastery model + cold-start check (d20fd3a). ActorResult.data migration complete for all actors (ARISTOTLE-DEBT-011 resolved). 89 tests, 0 warnings. | Super Z (main) |
+| 2026-06-19 | **Phase D backend ✅ COMPLETE.** 5 deliverables shipped: M004 schema (fc7c89d), INTAKE actor + intent detection + API routes (5128caa), PLACER actor + placement calibration (2322f0f), plan executor bridge — long-arc sessions (228d440), MENTOR pattern recognition — synthesize struggle patterns from misconception log (a72e3db). Phase D surface layer (GUI, upload, OCR, voice) remains planned — no blockers. 124 tests, 0 warnings. | Super Z (main) |
 
 ---
 

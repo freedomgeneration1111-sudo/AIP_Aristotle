@@ -139,7 +139,7 @@ The tutoring loop ships without HERALD; HERALD layers on when feeds land.
 
 ## Phase D — Onboarding (Intake + Placement + Long-Arc Plan)
 *Five-stage intake, placement calibration, versioned long-arc plan. ADR-002 Rev 2.*
-*Status: 🔲 PLANNED (spec committed 2026-06-19; awaiting DEFINER review of ADR-002)*
+*Status: ✅ Backend COMPLETE / 🔲 Surface Layer PLANNED*
 
 Phase D is the ADR-002 Rev 2 onboarding system. New learners walk through a
 five-stage intake interview (context, goals, prior exposure, time, friction),
@@ -147,20 +147,27 @@ take a placement calibration, and receive a versioned long-arc learning plan
 that drives session selection across weeks. Two new actors (INTAKE, PLACER),
 three new tables, OCR + voice capabilities for material upload.
 
-Source spec: `docs/decisions/ADR-002-intake-placement-learning-plan.md`
-(Part B — §§9–13; Part C — §§12–13). Build order: ADR-002 §15 (8 items,
-listed in PLANNED_FEATURES.md → Phase D table).
+### Phase D Backend — ✅ COMPLETE (5 commits)
 
-**Gate:** None for core (M003 schema, INTAKE actor + GUI, `ui.upload`, OCR,
-PLACER actor, voice toggle). The long-arc plan executor benefits from
-Phase B.5's cold-start check but can ship a simpler version first.
-Web search (a platform-side capability) unlocks material sourcing —
-fetching a PDF from a publisher's page — but the intake/placement loop
-itself runs without it.
+| Deliverable | Commit |
+|-------------|--------|
+| M004 schema (intake_session, learning_plan, placement_event) | `fc7c89d` |
+| INTAKE actor + intent detection + trigger checking + API routes | `5128caa` |
+| PLACER actor + PlacerSession + placement calibration + API routes | `2322f0f` |
+| Plan executor bridge — long-arc sessions driven by learning_plan | `228d440` |
+| MENTOR pattern recognition — synthesize struggle patterns (ADR-002 §7) | `a72e3db` |
 
-**Open DEFINER decisions blocking Phase D:** ADR-002 §16 #1 (backup
-strategy — blocking), #2 (OCR quality), #3 (voice STT), #5 (intake
-language).
+### Phase D Surface Layer — 🔲 PLANNED (no blockers)
+
+| Deliverable | Dependencies |
+|-------------|--------------|
+| INTAKE GUI page at `/intake` | Platform v1.1 GUI mount (built) |
+| `ui.upload` for PDF + image | Platform NiceGUI `ui.upload` (built) |
+| OCR path via `pytesseract` | None (installed) |
+| Voice mode toggle | Browser Web Speech API (zero-dep) |
+
+**Gate:** None. The surface layer has no external blockers — all depend on
+platform capabilities already built.
 
 ---
 
@@ -200,6 +207,7 @@ ARISTOTLE depends on these platform capabilities (all in AIP_Brain `feat/multi-c
 | 2026-06-18 | Created roadmap. Seeded with Phase A/B/C from ADR-001 §11. Phase A foundation done; near-term gates identified. | Super Z (main) |
 | 2026-06-19 | ADR-002 Rev 2 committed. Phase A and Phase B marked COMPLETE (verified via 2026-06-19 dogfood run). Phase B.5 added (research-grounded pedagogical improvements — no external dependencies). Phase D added (intake, placement, long-arc plan, OCR, voice — no external dependencies for core; web search unlocks material sourcing). Phase C unchanged (still gated on platform web/feed layer). | Super Z (main) |
 | 2026-06-19 | **Phase B.5 ✅ COMPLETE.** All 9 deliverables shipped: PREDICT step, HINT ladder, error diagnosis, faded worked examples, session interleaving, transfer questions, misconception log wiring, extended mastery model (mastery_probability), cold-start check. ActorResult.data migration complete for all actors. 89 tests, 0 warnings. Phase C unchanged (still gated on platform web/feed layer). | Super Z (main) |
+| 2026-06-19 | **Phase D backend ✅ COMPLETE.** 5 deliverables shipped: M004 schema (fc7c89d), INTAKE actor + API routes (5128caa), PLACER actor + placement calibration (2322f0f), plan executor bridge — long-arc sessions (228d440), MENTOR pattern recognition (a72e3db). Phase D surface layer (GUI, upload, OCR, voice) remains planned — no blockers. 124 tests, 0 warnings. Phase C unchanged. | Super Z (main) |
 
 ---
 
