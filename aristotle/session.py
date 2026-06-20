@@ -561,6 +561,100 @@ async def _increment_mastery_column(
         pass  # best-effort — analytics counter, never block the session
 
 
+async def _check_and_synthesize_pattern(
+    ctx: ActorContext, concept_id: str
+) -> None:
+    """Check if pattern synthesis should fire + synthesize if so (ADR-002 §7).
+
+    Fires when the misconception count for a concept is a multiple of 3
+    AND >= 3 (i.e. at 3, 6, 9, ...). This catches persistent patterns
+    without synthesizing on every session.
+
+    When synthesis fires:
+    1. Fetch up to 9 most recent misconception_text entries for the concept.
+    2. Call mentor.synthesize_struggle_pattern() (model does the synthesis).
+    3. Write the result to aristotle_struggle_pattern.
+
+    Best-effort throughout — DB errors and model errors are swallowed.
+    The session must NEVER fail on this.
+    """
+    logger = ctx.logger
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+
+        # Count misconception entries for this concept.
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM aristotle_misconception_log WHERE concept_id = ?",
+            (concept_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        count = row[0] if row is not None else 0
+
+        # Fire at 3, 6, 9 — multiples of 3, >= 3.
+        if count < 3 or count % 3 != 0:
+            return
+
+        # Fetch up to 9 most recent misconception_text entries.
+        cur = await conn.execute(
+            "SELECT misconception_text FROM aristotle_misconception_log "
+            "WHERE concept_id = ? ORDER BY id DESC LIMIT 9",
+            (concept_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            return
+
+        misconceptions = [r[0] for r in rows if r[0]]
+
+        # Call MENTOR to synthesize the pattern.
+        from aristotle.actors.mentor import MentorActor
+        mentor = MentorActor()
+        result = await mentor.synthesize_struggle_pattern(
+            ctx, concept_id, misconceptions,
+        )
+
+        pattern = ""
+        if result.ok and result.data:
+            pattern = result.data.get("pattern", "")
+
+        if not pattern:
+            logger.info(
+                "session_pattern_synthesize_empty concept=%s count=%d",
+                concept_id, count,
+            )
+            return
+
+        # Write the synthesized pattern to aristotle_struggle_pattern.
+        # The struggle_pattern table is keyed by student_id (single-tenant
+        # pre-alpha — student_id='definer'). The pattern is a concept-
+        # specific synthesis, but for pre-alpha we write it as the
+        # student's overall struggle_pattern (the most recent concept's
+        # pattern takes precedence — a future revision may key by concept).
+        await conn.execute(
+            "INSERT OR REPLACE INTO aristotle_struggle_pattern "
+            "(student_id, pattern_text) VALUES (?, ?)",
+            ("definer", pattern),
+        )
+        await conn.commit()
+        logger.info(
+            "session_pattern_synthesized concept=%s count=%d pattern_len=%d",
+            concept_id, count, len(pattern),
+        )
+    except Exception as exc:
+        logger.warning(
+            "session_pattern_synthesize_failed concept=%s error=%s:%s",
+            concept_id, type(exc).__name__, exc,
+        )
+
+
 async def _step_teach(
     ctx: ActorContext,
     session: SessionContext,
@@ -854,6 +948,19 @@ async def _step_evaluate(
             # over an analytics row.
             logger.warning(
                 "session_misconception_log_failed concept=%s error=%s:%s",
+                session.concept_id, type(exc).__name__, exc,
+            )
+
+        # Phase D (MENTOR pattern recognition, ADR-002 §7): after logging
+        # the misconception, check if pattern synthesis should fire. This
+        # is a second independent fire-and-forget call — it runs after
+        # log_misconception so the new entry is included in the count.
+        # Best-effort: DB errors and model errors are swallowed.
+        try:
+            await _check_and_synthesize_pattern(ctx, session.concept_id)
+        except Exception as exc:
+            logger.warning(
+                "session_pattern_check_failed concept=%s error=%s:%s",
                 session.concept_id, type(exc).__name__, exc,
             )
 

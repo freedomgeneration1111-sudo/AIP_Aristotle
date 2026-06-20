@@ -961,6 +961,177 @@ class TestMentorLogMisconception:
 
 
 # --------------------------------------------------------------------------
+# MENTOR pattern recognition tests (ADR-002 §7, Phase D)
+# --------------------------------------------------------------------------
+
+
+class TestMentorPatternRecognition:
+    """Phase D: MENTOR synthesizes struggle patterns from misconception log.
+
+    After 3+ misconception entries for the same concept, MENTOR calls the
+    model to synthesize the underlying pattern. Fires at count 3, 6, 9 —
+    not at 1, 2, 4, 5, etc.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mentor_synthesize_pattern_returns_pattern_string(self):
+        """synthesize_struggle_pattern() returns ok=True with data.pattern as a string."""
+        fake = _FakeModelProvider(responses={
+            "mentor": "The learner consistently confuses force as a cause of motion rather than a change in motion.",
+        })
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        mentor = MentorActor()
+        result = await mentor.synthesize_struggle_pattern(
+            ctx, "c1",
+            ["thinks force sustains motion", "confuses inertia with friction"],
+        )
+        assert result.ok
+        assert result.data is not None
+        assert "pattern" in result.data
+        assert isinstance(result.data["pattern"], str)
+        assert len(result.data["pattern"]) > 0
+        # The model should have been called with the mentor slot
+        assert len(fake.calls) == 1
+        assert fake.calls[0][0] == "mentor"
+
+    @pytest.mark.asyncio
+    async def test_mentor_synthesize_pattern_concept_not_found_returns_ok(self):
+        """synthesize_struggle_pattern() returns ok=True even when concept is not found.
+
+        Best-effort: returns ok=True with data.pattern (the model still
+        generates a pattern — it just uses the concept_id as the name
+        instead of the topic).
+        """
+        fake = _FakeModelProvider(responses={
+            "mentor": "Some pattern sentence.",
+        })
+        conn = _FakeConn(rows=None)  # no concept row → concept_id used as name
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        mentor = MentorActor()
+        result = await mentor.synthesize_struggle_pattern(
+            ctx, "nonexistent",
+            ["some misconception"],
+        )
+        assert result.ok
+        assert result.data["pattern"] == "Some pattern sentence."
+
+    @pytest.mark.asyncio
+    async def test_check_synthesize_fires_at_count_3(self):
+        """_check_and_synthesize_pattern fires when count=3 (3 % 3 == 0)."""
+        from aristotle.session import _check_and_synthesize_pattern
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "COUNT(*)" in sql:
+                    return _FakeCursor([(3,)])  # count = 3
+                if "misconception_text" in sql.lower():
+                    return _FakeCursor([("m1",), ("m2",), ("m3",)])
+                if "topic" in sql.lower():
+                    return _FakeCursor([("Inertia",)])
+                return _FakeCursor(None)
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider(responses={"mentor": "Underlying pattern."})
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        await _check_and_synthesize_pattern(ctx, "c1")
+        # Should have issued an INSERT OR REPLACE into struggle_pattern
+        insert_calls = [
+            sql for sql, _ in conn._executed
+            if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
+        ]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_check_synthesize_fires_at_count_6(self):
+        """_check_and_synthesize_pattern fires when count=6 (6 % 3 == 0)."""
+        from aristotle.session import _check_and_synthesize_pattern
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "COUNT(*)" in sql:
+                    return _FakeCursor([(6,)])  # count = 6
+                if "misconception_text" in sql.lower():
+                    return _FakeCursor([("m1",), ("m2",), ("m3",)])
+                if "topic" in sql.lower():
+                    return _FakeCursor([("Inertia",)])
+                return _FakeCursor(None)
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider(responses={"mentor": "Pattern at 6."})
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        await _check_and_synthesize_pattern(ctx, "c1")
+        insert_calls = [
+            sql for sql, _ in conn._executed
+            if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
+        ]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_check_synthesize_skips_at_count_4(self):
+        """_check_and_synthesize_pattern does NOT fire when count=4 (4 % 3 != 0)."""
+        from aristotle.session import _check_and_synthesize_pattern
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "COUNT(*)" in sql:
+                    return _FakeCursor([(4,)])  # count = 4 — NOT a multiple of 3
+                return _FakeCursor(None)
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider(responses={"mentor": "Should not fire."})
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        await _check_and_synthesize_pattern(ctx, "c1")
+        # Should NOT have issued any INSERT OR REPLACE — count=4 is not a multiple of 3
+        insert_calls = [
+            sql for sql, _ in conn._executed
+            if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
+        ]
+        assert len(insert_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_check_synthesize_skips_below_threshold(self):
+        """_check_and_synthesize_pattern does NOT fire when count < 3."""
+        from aristotle.session import _check_and_synthesize_pattern
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "COUNT(*)" in sql:
+                    return _FakeCursor([(2,)])  # count = 2 — below threshold
+                return _FakeCursor(None)
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        fake = _FakeModelProvider(responses={"mentor": "Should not fire."})
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        await _check_and_synthesize_pattern(ctx, "c1")
+        insert_calls = [
+            sql for sql, _ in conn._executed
+            if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
+        ]
+        assert len(insert_calls) == 0
+
+
+# --------------------------------------------------------------------------
 # Session coordinator tests
 # --------------------------------------------------------------------------
 

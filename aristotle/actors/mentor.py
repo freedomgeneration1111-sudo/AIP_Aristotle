@@ -260,6 +260,104 @@ class MentorActor:
                 data={"logged": False, "error": f"{type(exc).__name__}: {exc}"},
             )
 
+    async def synthesize_struggle_pattern(
+        self,
+        ctx: ActorContext,
+        concept_id: str,
+        misconceptions: list,
+    ) -> ActorResult:
+        """Synthesize the underlying pattern from 3+ misconception entries.
+
+        ADR-002 §7 pattern recognition: after 3+ entries in
+        aristotle_misconception_log for the same concept, MENTOR calls the
+        model to synthesize the underlying pattern in one concise sentence.
+        The model does the synthesis — no brittle string matching.
+
+        The result is written to aristotle_struggle_pattern by the caller
+        (_check_and_synthesize_pattern in session.py). This method only
+        produces the pattern string — it doesn't write to the DB.
+
+        Args:
+            ctx: ActorContext with container + logger.
+            concept_id: the concept the learner has been struggling with.
+            misconceptions: list of misconception_text strings (up to 9
+                most recent from aristotle_misconception_log).
+
+        Returns:
+            ActorResult(ok=True, data={"pattern": <str>}). Best-effort:
+            returns ok=True even if the model call fails, with
+            data={"pattern": ""}. The caller checks for empty string
+            before writing to the DB.
+        """
+        logger = ctx.logger
+        container: Any = ctx.container
+
+        # Fetch the concept name for context.
+        concept_name = concept_id
+        registry = getattr(container, "corpus_registry", None)
+        if registry is not None:
+            try:
+                stores = await registry.get_stores("aristotle:textbook")
+                conn = stores.connection_manager.write_conn
+                cur = await conn.execute(
+                    "SELECT topic FROM aristotle_concept WHERE id = ?",
+                    (concept_id,),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if row is not None:
+                    concept_name = row[0]
+            except Exception:
+                pass  # best-effort — use concept_id as fallback
+
+        # Build the prompt.
+        misconceptions_text = "\n".join(
+            f"  {i+1}. {m}" for i, m in enumerate(misconceptions)
+        )
+        system_prompt = (
+            "You are Aristotle's MENTOR mode — the tutor's internal memory "
+            "of who this learner is. The learner has had the following "
+            "misconceptions about a concept. In ONE concise sentence, name "
+            "the underlying pattern in their thinking. Be specific and "
+            "actionable — the sentence feeds every re-teaching prompt. "
+            "One sentence only. No preamble."
+        )
+        user_prompt = (
+            f"Concept: {concept_name}\n"
+            f"Misconceptions (most recent first):\n{misconceptions_text}\n"
+            f"Write the underlying pattern (one sentence):"
+        )
+
+        # Call the model (mentor slot — same as update_struggle_pattern).
+        model_provider = getattr(container, "model_provider", None)
+        if model_provider is None:
+            logger.warning(
+                "mentor_synthesize_skipped reason=no_model concept=%s",
+                concept_id,
+            )
+            return ActorResult(ok=True, data={"pattern": ""})
+
+        try:
+            result = await model_provider.call(
+                slot_name="mentor",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            pattern = result.get("content", "").strip()
+            logger.info(
+                "mentor_synthesize_ok concept=%s misconception_count=%d pattern_len=%d",
+                concept_id, len(misconceptions), len(pattern),
+            )
+            return ActorResult(ok=True, data={"pattern": pattern})
+        except Exception as exc:
+            logger.warning(
+                "mentor_synthesize_failed concept=%s error=%s:%s",
+                concept_id, type(exc).__name__, exc,
+            )
+            return ActorResult(ok=True, data={"pattern": ""})
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
