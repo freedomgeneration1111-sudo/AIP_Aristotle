@@ -315,3 +315,24 @@ async def test_upload_unsupported_returns_415():
         assert False, "should have raised HTTPException"
     except HTTPException as exc:
         assert exc.status_code == 415
+
+
+# ---------------------------------------------------------------------------
+# Test 9: health route returns 200 + minimal JSON (GUI sidebar liveness probe)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_health_route_returns_ok():
+    """GET /aristotle/health — must return 200-shaped payload without
+    touching the container or DB. Used by Brain's GUI sidebar health
+    poller (_poll_extension_health in gui/components/layout.py) to
+    decide whether to render this extension's nav items.
+    """
+    from aristotle.api import health_route
+
+    # health_route takes no request arg — it's a pure liveness probe.
+    result = await health_route()
+    assert isinstance(result, dict)
+    assert result.get("status") == "ok"
+    assert result.get("extension") == "aristotle"

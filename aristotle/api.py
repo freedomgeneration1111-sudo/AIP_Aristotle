@@ -59,6 +59,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/aristotle", tags=["aristotle"])
 
 
+# ------------------------------------------------------------------
+# Health route (liveness probe for the GUI sidebar health poller)
+# ------------------------------------------------------------------
+
+
+@router.get("/health")
+async def health_route():
+    """Liveness probe.
+
+    Returns HTTP 200 + a minimal JSON payload. Used by Brain's GUI
+    sidebar (_poll_extension_health in gui/components/layout.py) to
+    decide whether to show this extension's nav items. Does NOT
+    touch the container or DB — a healthy process is enough.
+    """
+    return {"status": "ok", "extension": "aristotle"}
+
+
 def _get_container(request: Request) -> Any:
     """Get the AipContainer from the FastAPI app state."""
     container = getattr(request.app.state, "container", None)
