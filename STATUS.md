@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-06-20
 **Phase:** GUI Phase ✅ COMPLETE / Phase E (multi-student) deferred / Phase C (HERALD) blocked
-**Operational State:** Pre-alpha — Phase A tutoring loop + Phase B teacher dashboard + Phase B.5 pedagogical upgrades + Phase D onboarding + GUI surface layer shipped. 149 tests, 0 warnings. Most recent milestone: GUI phase completion + ADR-001 Research Annex (2026-06-20).
+**Operational State:** Pre-alpha — Phase A tutoring loop + Phase B teacher dashboard + Phase B.5 pedagogical upgrades + Phase D onboarding + GUI surface layer shipped. 140 tests collected (1 collection error in sandbox without aiosqlite — CI collects all). Most recent milestone: GUI phase completion + ADR-001 Research Annex (2026-06-20).
 
 ---
 
@@ -144,8 +144,9 @@ Aristotle depends on these platform capabilities (all shipped in AIP_Brain
 dashboard) + Phase B.5 (9 pedagogical upgrades) + Phase D backend
 (onboarding: intake + placement + long-arc plan) + GUI surface layer
 (stats, map, settings, teacher dashboard, session history, curiosity
-path, expanded upload, Brain + menu + voice wired) are all shipped. 149
-tests pass with 0 warnings. The tutoring loop runs end-to-end with real
+path, expanded upload, Brain + menu + voice wired) are all shipped. 140 tests collected
+(1 collection error in sandbox without aiosqlite — CI collects all).
+The tutoring loop runs end-to-end with real
 model calls, SM-2 scheduling, struggle_pattern tracking, and a GUI
 learning view. The teacher dashboard shows mastery, due items, and the
 struggle pattern.
