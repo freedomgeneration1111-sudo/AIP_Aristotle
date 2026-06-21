@@ -26,6 +26,7 @@ so the boundary is enforced from both sides.
 
 Run:  pytest tests/test_import_boundary.py -v
 """
+
 from __future__ import annotations
 
 import ast
@@ -42,9 +43,9 @@ ARISTOTLE_ROOT = PROJECT_ROOT / "aristotle"
 # ---------------------------------------------------------------------------
 
 ALLOWED_AIP_IMPORT_PREFIXES: tuple[str, ...] = (
-    "aip.foundation.protocols",   # Actor Protocol + future Protocols
-    "aip.adapter.extensions",     # public extension API (Manifest, etc.)
-    "aip.foundation.schemas",     # dataclasses extensions may use
+    "aip.foundation.protocols",  # Actor Protocol + future Protocols
+    "aip.adapter.extensions",  # public extension API (Manifest, etc.)
+    "aip.foundation.schemas",  # dataclasses extensions may use
 )
 
 
@@ -100,7 +101,11 @@ def _collect_imports(filepath: Path) -> list[tuple[str, int, str]]:
                 func = child.func
                 mod_name: str | None = None
 
-                if isinstance(func, ast.Attribute) and func.attr == "import_module" and child.args:
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "import_module"
+                    and child.args
+                ):
                     arg = child.args[0]
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         mod_name = arg.value
@@ -108,7 +113,11 @@ def _collect_imports(filepath: Path) -> list[tuple[str, int, str]]:
                 if mod_name:
                     imports.append((mod_name, child.lineno, "importlib"))
 
-                if isinstance(func, ast.Name) and func.id == "__import__" and child.args:
+                if (
+                    isinstance(func, ast.Name)
+                    and func.id == "__import__"
+                    and child.args
+                ):
                     arg = child.args[0]
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         imports.append((arg.value, child.lineno, "importlib"))

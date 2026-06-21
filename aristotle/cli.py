@@ -38,12 +38,10 @@ calls the API.
 This file is the HTTP-client CLI. It requires the AIP_Brain server to be
 running (./start.sh from AIP_Brain).
 """
+
 from __future__ import annotations
 
-import json
 import sys
-from pathlib import Path
-from typing import Any
 
 import click
 import httpx
@@ -84,9 +82,14 @@ def health(ctx: click.Context) -> None:
                 click.echo(f"  {ext['id']} v{ext['version']} — state={ext['state']}")
                 if ext.get("failures"):
                     for f in ext["failures"]:
-                        click.echo(f"    failure: {f['stage']}/{f['contribution']}: {f['reason']}")
+                        click.echo(
+                            f"    failure: {f['stage']}/{f['contribution']}: {f['reason']}"
+                        )
         except httpx.ConnectError:
-            click.echo("ERROR: Cannot connect to AIP_Brain server. Is it running? (./start.sh)", err=True)
+            click.echo(
+                "ERROR: Cannot connect to AIP_Brain server. Is it running? (./start.sh)",
+                err=True,
+            )
             sys.exit(1)
         except Exception as exc:
             click.echo(f"ERROR: {exc}", err=True)
@@ -103,11 +106,19 @@ def list_concepts(ctx: click.Context) -> None:
             resp.raise_for_status()
             concepts = resp.json()
             if not concepts:
-                click.echo("No concepts ingested. Run: python -m aristotle.cli ingest <yaml_file>")
+                click.echo(
+                    "No concepts ingested. Run: python -m aristotle.cli ingest <yaml_file>"
+                )
                 return
             for c in concepts:
-                prereq = f" (requires: {c['prerequisite_concept_id']})" if c.get("prerequisite_concept_id") else ""
-                click.echo(f"  {c['id']}: {c['topic']} — bloom={c['bloom_target']}{prereq}")
+                prereq = (
+                    f" (requires: {c['prerequisite_concept_id']})"
+                    if c.get("prerequisite_concept_id")
+                    else ""
+                )
+                click.echo(
+                    f"  {c['id']}: {c['topic']} — bloom={c['bloom_target']}{prereq}"
+                )
         except httpx.ConnectError:
             click.echo("ERROR: Cannot connect to AIP_Brain server.", err=True)
             sys.exit(1)
@@ -148,7 +159,12 @@ def ingest(ctx: click.Context, yaml_path: str) -> None:
 
 @cli.command("session")
 @click.argument("concept_id")
-@click.option("--answer", "-a", multiple=True, help="Pre-provided answer(s) for quiz steps. If not provided, runs in interactive mode.")
+@click.option(
+    "--answer",
+    "-a",
+    multiple=True,
+    help="Pre-provided answer(s) for quiz steps. If not provided, runs in interactive mode.",
+)
 @click.pass_context
 def session(
     ctx: click.Context,
@@ -220,14 +236,14 @@ def _run_interactive_session(client: httpx.Client, concept_id: str) -> None:
             if step.get("output"):
                 click.echo(f"\n{step['output']}")
 
-    click.echo(f"\n=== Session Complete ===")
+    click.echo("\n=== Session Complete ===")
     click.echo(f"Mastered: {session['mastered']}")
     click.echo(f"Score: {session['last_score']}")
 
 
 def _print_session_result(result: dict) -> None:
     """Print a full-session result."""
-    click.echo(f"\n=== Session Complete ===")
+    click.echo("\n=== Session Complete ===")
     click.echo(f"Concept: {result['concept_id']}")
     click.echo(f"Mastered: {result['mastered']}")
     click.echo(f"Final score: {result['last_score']}")

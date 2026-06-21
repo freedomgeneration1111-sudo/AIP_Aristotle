@@ -12,6 +12,7 @@ This is the production discovery path — replaces the filesystem + sys.path
 hack. The extension is pip-installable: `pip install git+https://github.com/
 freedomgeneration1111-sudo/AIP_Aristotle.git`.
 """
+
 from __future__ import annotations
 
 from importlib import resources

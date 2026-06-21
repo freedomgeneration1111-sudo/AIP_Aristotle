@@ -20,6 +20,7 @@ ActorContext). The container is accessed via ctx.container (duck-typed).
 SQL is executed via the corpus's write connection
 (stores.connection_manager.write_conn).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -49,13 +50,17 @@ class MentorActor:
         registry = getattr(container, "corpus_registry", None)
         if registry is None:
             logger.warning("mentor_corpus_registry_missing")
-            return ActorResult(ok=False, error="corpus_registry not available on container")
+            return ActorResult(
+                ok=False, error="corpus_registry not available on container"
+            )
 
         try:
             stores = await registry.get_stores("aristotle:textbook")
             if stores is None:
                 logger.warning("mentor_corpus_not_found")
-                return ActorResult(ok=False, error="corpus aristotle:textbook not found")
+                return ActorResult(
+                    ok=False, error="corpus aristotle:textbook not found"
+                )
         except Exception as exc:
             logger.warning("mentor_corpus_access_failed error=%s", exc)
             return ActorResult(ok=False, error=f"corpus access failed: {exc}")
@@ -121,7 +126,9 @@ class MentorActor:
 
         model_provider = getattr(container, "model_provider", None)
         if model_provider is None:
-            return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+            return ActorResult(
+                ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
+            )
 
         # Read the current pattern (to build on it, not replace blindly)
         current_pattern = await self._read_struggle_pattern(ctx, student_id)
@@ -152,20 +159,25 @@ class MentorActor:
             )
             new_pattern = result.get("content", "").strip()
             if not new_pattern:
-                return ActorResult(ok=False, error="model returned empty struggle_pattern")
+                return ActorResult(
+                    ok=False, error="model returned empty struggle_pattern"
+                )
 
             # Persist the new pattern
             await self._write_struggle_pattern(ctx, student_id, new_pattern)
             logger.info(
                 "mentor_struggle_pattern_updated student=%s concept=%s pattern=%s",
-                student_id, concept_id,
+                student_id,
+                concept_id,
                 new_pattern[:80] + "..." if len(new_pattern) > 80 else new_pattern,
             )
             return ActorResult(ok=True, error=new_pattern)
         except Exception as exc:
             logger.warning(
                 "mentor_struggle_pattern_update_failed student=%s error=%s:%s",
-                student_id, type(exc).__name__, exc,
+                student_id,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
 
@@ -216,14 +228,25 @@ class MentorActor:
 
         # Defensive: extract the two fields we store. Missing keys default
         # to empty string so a partial diagnosis doesn't KeyError.
-        misconception_text = str(diagnosis.get("misconception", "")) if isinstance(diagnosis, dict) else ""
-        corrective_text = str(diagnosis.get("corrective", "")) if isinstance(diagnosis, dict) else ""
+        misconception_text = (
+            str(diagnosis.get("misconception", ""))
+            if isinstance(diagnosis, dict)
+            else ""
+        )
+        corrective_text = (
+            str(diagnosis.get("corrective", "")) if isinstance(diagnosis, dict) else ""
+        )
 
         registry = getattr(container, "corpus_registry", None)
         if registry is None:
             # Best-effort: log + return ok=True (never break the session).
-            logger.warning("mentor_log_misconception_skipped reason=registry_none concept=%s", concept_id)
-            return ActorResult(ok=True, data={"logged": False, "reason": "registry_none"})
+            logger.warning(
+                "mentor_log_misconception_skipped reason=registry_none concept=%s",
+                concept_id,
+            )
+            return ActorResult(
+                ok=True, data={"logged": False, "reason": "registry_none"}
+            )
 
         try:
             stores = await registry.get_stores("aristotle:textbook")
@@ -237,7 +260,9 @@ class MentorActor:
             await conn.commit()
             logger.info(
                 "mentor_misconception_logged concept=%s session=%s misconception_len=%d",
-                concept_id, session_id, len(misconception_text),
+                concept_id,
+                session_id,
+                len(misconception_text),
             )
             return ActorResult(
                 ok=True,
@@ -253,7 +278,9 @@ class MentorActor:
             # Log at WARNING for observability + return ok=True.
             logger.warning(
                 "mentor_log_misconception_failed concept=%s error=%s:%s",
-                concept_id, type(exc).__name__, exc,
+                concept_id,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(
                 ok=True,
@@ -312,7 +339,7 @@ class MentorActor:
 
         # Build the prompt.
         misconceptions_text = "\n".join(
-            f"  {i+1}. {m}" for i, m in enumerate(misconceptions)
+            f"  {i + 1}. {m}" for i, m in enumerate(misconceptions)
         )
         system_prompt = (
             "You are Aristotle's MENTOR mode — the tutor's internal memory "
@@ -348,13 +375,17 @@ class MentorActor:
             pattern = result.get("content", "").strip()
             logger.info(
                 "mentor_synthesize_ok concept=%s misconception_count=%d pattern_len=%d",
-                concept_id, len(misconceptions), len(pattern),
+                concept_id,
+                len(misconceptions),
+                len(pattern),
             )
             return ActorResult(ok=True, data={"pattern": pattern})
         except Exception as exc:
             logger.warning(
                 "mentor_synthesize_failed concept=%s error=%s:%s",
-                concept_id, type(exc).__name__, exc,
+                concept_id,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(ok=True, data={"pattern": ""})
 

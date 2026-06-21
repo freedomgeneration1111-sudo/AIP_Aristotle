@@ -13,6 +13,7 @@ doesn't exist — the GUI degrades gracefully.
 Layer: this module imports from nicegui (GUI framework) + httpx (HTTP
 client to the backend API). No aip.* imports — the GUI is API-first.
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,7 +27,6 @@ from gui.state import GuiState
 from gui.theme import (
     C_AMBER,
     C_CREAM,
-    C_SURFACE,
     C_RAISED,
     C_MUTED,
     F_SANS,
@@ -74,9 +74,11 @@ def learn_page():
                 options=[],
                 label="Select a concept",
                 value=None,
-            ).style(f"min-width:300px;")
+            ).style("min-width:300px;")
 
-            start_btn = ui.button("Start Session", on_click=lambda: start_session(concept_select.value))
+            start_btn = ui.button(
+                "Start Session", on_click=lambda: start_session(concept_select.value)
+            )
             start_btn.style(
                 f"background:{C_AMBER}; color:#0d1117; "
                 f"font-family:{F_SANS}; font-weight:600; border-radius:{R_SM};"
@@ -101,9 +103,13 @@ def learn_page():
             status_label.text = f"Starting session for {concept_id}..."
 
             try:
-                async with httpx.AsyncClient(base_url=_BACKEND_URL, timeout=60.0) as client:
+                async with httpx.AsyncClient(
+                    base_url=_BACKEND_URL, timeout=60.0
+                ) as client:
                     # Start the session
-                    resp = await client.post("/aristotle/session/start", json={"concept_id": concept_id})
+                    resp = await client.post(
+                        "/aristotle/session/start", json={"concept_id": concept_id}
+                    )
                     resp.raise_for_status()
                     session = resp.json()
 
@@ -124,7 +130,6 @@ def learn_page():
 
         async def run_session_steps(client: httpx.AsyncClient, session: dict, area):
             """Run the tutoring session step by step, displaying each step."""
-            import json as _json
 
             answer_input = None
             step_count = 0
@@ -150,7 +155,9 @@ def learn_page():
                         )
 
                 # If we're at PROBE or QUIZ, wait for student input
-                if session["state"] in ("PROBE", "QUIZ") and not session.get("quiz_generated"):
+                if session["state"] in ("PROBE", "QUIZ") and not session.get(
+                    "quiz_generated"
+                ):
                     # Generate the question first
                     continue
 
@@ -162,10 +169,13 @@ def learn_page():
                         )
                         answer_input = ui.input(
                             placeholder="Type your answer...",
-                        ).style(f"width:100%;")
-                        submit_btn = ui.button("Submit", on_click=lambda: submit_answer(
-                            client, session, answer_input, area
-                        ))
+                        ).style("width:100%;")
+                        submit_btn = ui.button(
+                            "Submit",
+                            on_click=lambda: submit_answer(
+                                client, session, answer_input, area
+                            ),
+                        )
                         submit_btn.style(
                             f"background:{C_AMBER}; color:#0d1117; border-radius:{R_SM};"
                         )
@@ -174,10 +184,12 @@ def learn_page():
             if session["state"] == "SESSION_COMPLETE":
                 with area:
                     ui.separator()
-                    ui.label(f"Session Complete").style(
+                    ui.label("Session Complete").style(
                         f"font-family:{F_SANS}; font-size:18px; font-weight:700; color:{C_CREAM};"
                     )
-                    mastered_text = "Mastered ✓" if session["mastered"] else "Not yet mastered"
+                    mastered_text = (
+                        "Mastered ✓" if session["mastered"] else "Not yet mastered"
+                    )
                     mastered_color = "#4A9B8E" if session["mastered"] else C_AMBER
                     ui.label(mastered_text).style(
                         f"font-family:{F_SANS}; font-size:14px; color:{mastered_color};"
@@ -221,16 +233,22 @@ def learn_page():
         async def load_concepts():
             """Fetch concepts from the backend and populate the selector."""
             try:
-                async with httpx.AsyncClient(base_url=_BACKEND_URL, timeout=5.0) as client:
+                async with httpx.AsyncClient(
+                    base_url=_BACKEND_URL, timeout=5.0
+                ) as client:
                     resp = await client.get("/aristotle/concepts")
                     if resp.status_code == 200:
                         concepts = resp.json()
                         if concepts:
-                            concept_select.options = {c["id"]: c["topic"] for c in concepts}
+                            concept_select.options = {
+                                c["id"]: c["topic"] for c in concepts
+                            }
                         else:
                             status_label.text = "No concepts ingested. Run: python -m aristotle.cli ingest concepts_sample.yaml"
                     else:
-                        status_label.text = "Backend reachable but /aristotle/concepts returned error."
+                        status_label.text = (
+                            "Backend reachable but /aristotle/concepts returned error."
+                        )
             except httpx.ConnectError:
                 status_label.text = "Backend not reachable. Start it with ./start.sh"
             except Exception as exc:
@@ -269,7 +287,9 @@ def dashboard_page():
         ui.label("Aristotle — Teacher Dashboard").style(
             f"font-family:{F_SANS}; font-size:24px; font-weight:700; color:{C_CREAM};"
         )
-        ui.label("Leverage, not surveillance — the tutor's memory of who this learner is.").style(
+        ui.label(
+            "Leverage, not surveillance — the tutor's memory of who this learner is."
+        ).style(
             f"font-family:{F_SANS}; font-size:14px; color:{C_MUTED}; font-style:italic;"
         )
 
@@ -313,7 +333,9 @@ def dashboard_page():
                             f"line-height:1.5; border-left:3px solid {C_AMBER};"
                         )
                     else:
-                        ui.label("No struggle pattern recorded yet — the tutor is still learning who this learner is.").style(
+                        ui.label(
+                            "No struggle pattern recorded yet — the tutor is still learning who this learner is."
+                        ).style(
                             f"font-family:{F_SANS}; font-size:14px; color:{C_MUTED}; "
                             f"font-style:italic; background:{C_RAISED}; padding:{SP_MD}; border-radius:{R_SM};"
                         )
@@ -328,32 +350,65 @@ def dashboard_page():
 
                     mastery = data.get("mastery_by_concept", [])
                     if not mastery:
-                        ui.label("No mastery records yet. Run a tutoring session first.").style(
+                        ui.label(
+                            "No mastery records yet. Run a tutoring session first."
+                        ).style(
                             f"font-family:{F_SANS}; font-size:14px; color:{C_MUTED}; font-style:italic;"
                         )
                     else:
                         # Build a table using NiceGUI's ui.table
                         columns = [
-                            {"name": "concept", "label": "Concept", "field": "concept", "align": "left"},
-                            {"name": "topic", "label": "Topic", "field": "topic", "align": "left"},
-                            {"name": "mastered", "label": "Mastered", "field": "mastered", "align": "center"},
-                            {"name": "score", "label": "Last Score", "field": "score", "align": "center"},
-                            {"name": "due", "label": "Next Due", "field": "due", "align": "left"},
+                            {
+                                "name": "concept",
+                                "label": "Concept",
+                                "field": "concept",
+                                "align": "left",
+                            },
+                            {
+                                "name": "topic",
+                                "label": "Topic",
+                                "field": "topic",
+                                "align": "left",
+                            },
+                            {
+                                "name": "mastered",
+                                "label": "Mastered",
+                                "field": "mastered",
+                                "align": "center",
+                            },
+                            {
+                                "name": "score",
+                                "label": "Last Score",
+                                "field": "score",
+                                "align": "center",
+                            },
+                            {
+                                "name": "due",
+                                "label": "Next Due",
+                                "field": "due",
+                                "align": "left",
+                            },
                         ]
                         rows = []
                         for m in mastery:
                             mastered_text = "✓" if m["mastered"] else "—"
-                            score_text = f"{m['last_score']:.0%}" if m.get("last_score") is not None else "—"
+                            score_text = (
+                                f"{m['last_score']:.0%}"
+                                if m.get("last_score") is not None
+                                else "—"
+                            )
                             due_text = m.get("next_review_at") or "Due now"
                             if m.get("is_due"):
                                 due_text = f"⚠ {due_text}"
-                            rows.append({
-                                "concept": m["concept_id"],
-                                "topic": m["topic"],
-                                "mastered": mastered_text,
-                                "score": score_text,
-                                "due": due_text,
-                            })
+                            rows.append(
+                                {
+                                    "concept": m["concept_id"],
+                                    "topic": m["topic"],
+                                    "mastered": mastered_text,
+                                    "score": score_text,
+                                    "due": due_text,
+                                }
+                            )
 
                         ui.table(
                             columns=columns,

@@ -12,6 +12,7 @@ production) + importlib.resources.files() for path-based assertions.
 
 Run:  CI=true uv run pytest tests/test_aristotle_extension.py -v
 """
+
 from __future__ import annotations
 
 import importlib.resources
@@ -152,7 +153,9 @@ async def host(tmp_path: Path, container):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_package_has_expected_files():
     """Sanity: the installed ARISTOTLE package has the expected files."""
@@ -163,7 +166,9 @@ async def test_aristotle_package_has_expected_files():
     assert (_ARISTOTLE_PKG_ROOT / "config.py").exists()
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_manifest_validates(host: ExtensionHost):
     """ARISTOTLE's manifest parses + validates (manifest_version=1, id=aristotle)."""
@@ -176,25 +181,34 @@ async def test_aristotle_manifest_validates(host: ExtensionHost):
     )
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_migrations_create_tables(host: ExtensionHost, container):
     """M001_aristotle.sql creates aristotle_concept + aristotle_struggle_pattern."""
     await host.start()
-    assert host.state("aristotle") in (ExtensionState.REGISTERED, ExtensionState.MOUNTED), (
+    assert host.state("aristotle") in (
+        ExtensionState.REGISTERED,
+        ExtensionState.MOUNTED,
+    ), (
         f"ARISTOTLE should reach REGISTERED or MOUNTED; failures="
         f"{[f.to_dict() for f in host.failures('aristotle')]}"
     )
 
     # The migration applies to the aristotle:textbook corpus (ADR-014 §6.2).
     stores = await container.corpus_registry.get_stores("aristotle:textbook")
-    assert await _table_exists(stores, "aristotle_concept"), \
+    assert await _table_exists(stores, "aristotle_concept"), (
         "M001_aristotle.sql should create aristotle_concept table"
-    assert await _table_exists(stores, "aristotle_struggle_pattern"), \
+    )
+    assert await _table_exists(stores, "aristotle_struggle_pattern"), (
         "M001_aristotle.sql should create aristotle_struggle_pattern table"
+    )
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_m003_creates_phase_b5_schema(host: ExtensionHost, container):
     """M003_aristotle_phase_b5.sql creates the Phase B.5 tables + extends mastery.
@@ -210,7 +224,10 @@ async def test_aristotle_m003_creates_phase_b5_schema(host: ExtensionHost, conta
     pattern of test_aristotle_migrations_create_tables above.
     """
     await host.start()
-    assert host.state("aristotle") in (ExtensionState.REGISTERED, ExtensionState.MOUNTED), (
+    assert host.state("aristotle") in (
+        ExtensionState.REGISTERED,
+        ExtensionState.MOUNTED,
+    ), (
         f"ARISTOTLE should reach REGISTERED or MOUNTED; failures="
         f"{[f.to_dict() for f in host.failures('aristotle')]}"
     )
@@ -218,10 +235,12 @@ async def test_aristotle_m003_creates_phase_b5_schema(host: ExtensionHost, conta
     stores = await container.corpus_registry.get_stores("aristotle:textbook")
 
     # New tables (ADR-002 §10.4, §10.5)
-    assert await _table_exists(stores, "aristotle_predict_event"), \
+    assert await _table_exists(stores, "aristotle_predict_event"), (
         "M003 should create aristotle_predict_event table"
-    assert await _table_exists(stores, "aristotle_misconception_log"), \
+    )
+    assert await _table_exists(stores, "aristotle_misconception_log"), (
         "M003 should create aristotle_misconception_log table"
+    )
 
     # Extended aristotle_mastery columns (ADR-002 §10.6)
     expected_new_columns = [
@@ -237,13 +256,17 @@ async def test_aristotle_m003_creates_phase_b5_schema(host: ExtensionHost, conta
         )
 
     # Sanity: the pre-existing M002 columns are still there (M003 is additive).
-    assert await _column_exists(stores, "aristotle_mastery", "easiness_factor"), \
+    assert await _column_exists(stores, "aristotle_mastery", "easiness_factor"), (
         "M002 easiness_factor column should still exist after M003"
-    assert await _column_exists(stores, "aristotle_mastery", "mastered"), \
+    )
+    assert await _column_exists(stores, "aristotle_mastery", "mastered"), (
         "M002 mastered column should still exist after M003"
+    )
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_m004_creates_phase_d_schema(host: ExtensionHost, container):
     """M004_aristotle_phase_d.sql creates the Phase D onboarding tables.
@@ -258,7 +281,10 @@ async def test_aristotle_m004_creates_phase_d_schema(host: ExtensionHost, contai
     the pattern of test_aristotle_migrations_create_tables above.
     """
     await host.start()
-    assert host.state("aristotle") in (ExtensionState.REGISTERED, ExtensionState.MOUNTED), (
+    assert host.state("aristotle") in (
+        ExtensionState.REGISTERED,
+        ExtensionState.MOUNTED,
+    ), (
         f"ARISTOTLE should reach REGISTERED or MOUNTED; failures="
         f"{[f.to_dict() for f in host.failures('aristotle')]}"
     )
@@ -266,21 +292,28 @@ async def test_aristotle_m004_creates_phase_d_schema(host: ExtensionHost, contai
     stores = await container.corpus_registry.get_stores("aristotle:textbook")
 
     # Phase D tables (ADR-002 §10.1, §10.2, §10.3)
-    assert await _table_exists(stores, "aristotle_intake_session"), \
+    assert await _table_exists(stores, "aristotle_intake_session"), (
         "M004 should create aristotle_intake_session table"
-    assert await _table_exists(stores, "aristotle_learning_plan"), \
+    )
+    assert await _table_exists(stores, "aristotle_learning_plan"), (
         "M004 should create aristotle_learning_plan table"
-    assert await _table_exists(stores, "aristotle_placement_event"), \
+    )
+    assert await _table_exists(stores, "aristotle_placement_event"), (
         "M004 should create aristotle_placement_event table"
+    )
 
     # Sanity: the pre-existing M001 tables are still there (M004 is additive).
-    assert await _table_exists(stores, "aristotle_concept"), \
+    assert await _table_exists(stores, "aristotle_concept"), (
         "M001 aristotle_concept table should still exist after M004"
-    assert await _table_exists(stores, "aristotle_mastery"), \
+    )
+    assert await _table_exists(stores, "aristotle_mastery"), (
         "M002 aristotle_mastery table should still exist after M004"
+    )
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_registers_actors(host: ExtensionHost):
     """All three actors are registered via hooks.py::on_load."""
@@ -291,7 +324,9 @@ async def test_aristotle_registers_actors(host: ExtensionHost):
     assert "mentor" in actors, f"MENTOR should be registered; actors={actors}"
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_socrates_conforms_to_actor_protocol():
     """SOCRATES conforms to the foundation Actor Protocol (ADR-014 §5.2)."""
@@ -307,7 +342,9 @@ async def test_aristotle_socrates_conforms_to_actor_protocol():
     assert actor.cadence == 0.0  # manual-only (ADR-001 §3)
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_config_schema_loads(host: ExtensionHost):
     """config.schema (aristotle.config:AristotleSettings) loads + instantiates."""
@@ -324,7 +361,9 @@ async def test_aristotle_config_schema_loads(host: ExtensionHost):
     assert rec.config.alt_language == "ur"
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_health_surfaces_in_health(host: ExtensionHost):
     """ARISTOTLE appears in host.health() with state=REGISTERED or MOUNTED."""
@@ -336,7 +375,9 @@ async def test_aristotle_health_surfaces_in_health(host: ExtensionHost):
     assert by_id["aristotle"]["version"] == "0.1.0"
 
 
-@pytest.mark.skipif(_ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed")
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
 @pytest.mark.asyncio
 async def test_aristotle_stop_cancels_actors(host: ExtensionHost):
     """host.stop() cancels all actors + marks ARISTOTLE DISABLED."""

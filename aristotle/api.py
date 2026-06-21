@@ -37,12 +37,12 @@ functions that receive the container via `request.app.state.container`.
 This is the standard FastAPI pattern and doesn't import anything from aip.*.
 The platform's app.py sets `app.state.container` in the lifespan.
 """
+
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-import yaml
 from fastapi import APIRouter, HTTPException, Request
 
 from aip.foundation.protocols.actors import ActorContext
@@ -79,6 +79,7 @@ def _get_container(request: Request) -> Any:
 def _make_ctx(container: Any, config: Any = None) -> ActorContext:
     """Build an ActorContext from the container."""
     import asyncio
+
     return ActorContext(
         container=container,
         config=config,
@@ -115,6 +116,7 @@ async def ingest_route(request: Request):
 
     # Write to a temp file (the ingestor takes a path)
     import tempfile
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(yaml_content)
         temp_path = f.name
@@ -125,6 +127,7 @@ async def ingest_route(request: Request):
         return result
     finally:
         import os
+
         os.unlink(temp_path)
 
 
@@ -204,16 +207,22 @@ async def session_run_route(request: Request):
             break
 
         student_input = ""
-        if session.state == SessionState.QUIZ and session.quiz_generated and answer_idx < len(answers):
+        if (
+            session.state == SessionState.QUIZ
+            and session.quiz_generated
+            and answer_idx < len(answers)
+        ):
             student_input = answers[answer_idx]
             answer_idx += 1
 
         result = await run_session_step(ctx, session, student_input)
-        steps.append({
-            "state": session.state.value,
-            "output": result.error if result.ok else "",
-            "ok": result.ok,
-        })
+        steps.append(
+            {
+                "state": session.state.value,
+                "output": result.error if result.ok else "",
+                "ok": result.ok,
+            }
+        )
 
         if not result.ok:
             break
@@ -360,22 +369,28 @@ async def dashboard_route(request: Request):
         else:
             sort_priority = 3
 
-        mastery_by_concept.append({
-            "concept_id": concept_id,
-            "topic": topic,
-            "mastered": mastered,
-            "last_score": last_score,
-            "repetitions": repetitions,
-            "next_review_at": next_review_at,
-            "is_due": is_due,
-            "updated_at": updated_at,
-            "_sort_priority": sort_priority,
-        })
+        mastery_by_concept.append(
+            {
+                "concept_id": concept_id,
+                "topic": topic,
+                "mastered": mastered,
+                "last_score": last_score,
+                "repetitions": repetitions,
+                "next_review_at": next_review_at,
+                "is_due": is_due,
+                "updated_at": updated_at,
+                "_sort_priority": sort_priority,
+            }
+        )
 
     # Sort: due first, then unstarted, then mastered, then not-due.
     # Within each priority, sort by next_review_at ascending (nulls first), then concept_id.
     mastery_by_concept.sort(
-        key=lambda m: (m["_sort_priority"], m["next_review_at"] or "0000", m["concept_id"])
+        key=lambda m: (
+            m["_sort_priority"],
+            m["next_review_at"] or "0000",
+            m["concept_id"],
+        )
     )
 
     # Strip the internal sort key before returning

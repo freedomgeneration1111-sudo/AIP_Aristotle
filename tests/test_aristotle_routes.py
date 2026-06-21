@@ -2,12 +2,12 @@
 
 Run: pytest tests/test_aristotle_routes.py -v
 """
+
 from __future__ import annotations
 
 import io
-import json
 import warnings
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -67,19 +67,27 @@ def _make_request(container, body=None, headers=None):
     request.app.state.container = container
     if body is not None:
         if isinstance(body, dict):
+
             async def _json():
                 return body
+
             request.json = _json
         elif isinstance(body, bytes):
+
             async def _body():
                 return body
+
             request.body = _body
     else:
+
         async def _json():
             return {}
+
         request.json = _json
+
         async def _body():
             return b""
+
         request.body = _body
     request.headers = headers or {}
     return request
@@ -102,10 +110,24 @@ async def test_misconceptions_route_returns_list():
     """Mock DB to return 2 rows. GET /aristotle/misconceptions."""
     from aristotle.api import misconceptions_route
 
-    conn = _FakeConn(rows=[
-        (1, "c1", "thinks force sustains motion", "force changes motion", "2026-01-01"),
-        (2, "c2", "confuses inertia with friction", "inertia is mass property", "2026-01-02"),
-    ])
+    conn = _FakeConn(
+        rows=[
+            (
+                1,
+                "c1",
+                "thinks force sustains motion",
+                "force changes motion",
+                "2026-01-01",
+            ),
+            (
+                2,
+                "c2",
+                "confuses inertia with friction",
+                "inertia is mass property",
+                "2026-01-02",
+            ),
+        ]
+    )
     container = _make_container(conn)
     request = _make_request(container)
 
@@ -114,7 +136,10 @@ async def test_misconceptions_route_returns_list():
     assert isinstance(result["misconceptions"], list)
     assert len(result["misconceptions"]) == 2
     assert result["misconceptions"][0]["concept_id"] == "c1"
-    assert result["misconceptions"][0]["misconception_text"] == "thinks force sustains motion"
+    assert (
+        result["misconceptions"][0]["misconception_text"]
+        == "thinks force sustains motion"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,12 +175,15 @@ async def test_post_settings_upserts_and_returns():
 
     conn = _FakeConn(rows=None)
     container = _make_container(conn)
-    request = _make_request(container, body={
-        "primary_language": "Urdu",
-        "session_length": 7,
-        "mastery_threshold": 0.9,
-        "hint_aggressiveness": "generous",
-    })
+    request = _make_request(
+        container,
+        body={
+            "primary_language": "Urdu",
+            "session_length": 7,
+            "mastery_threshold": 0.9,
+            "hint_aggressiveness": "generous",
+        },
+    )
 
     result = await update_settings_route(request)
     assert result["primary_language"] == "Urdu"
@@ -164,7 +192,8 @@ async def test_post_settings_upserts_and_returns():
     assert result["hint_aggressiveness"] == "generous"
     # Verify the INSERT OR REPLACE was issued.
     insert_calls = [
-        sql for sql, _ in conn._executed
+        sql
+        for sql, _ in conn._executed
         if "INSERT OR REPLACE INTO aristotle_settings" in sql
     ]
     assert len(insert_calls) == 1
@@ -189,7 +218,9 @@ async def test_upload_pdf_returns_extracted_text():
     pdf_bytes = pdf_buffer.getvalue()
 
     container = _make_container(_FakeConn())
-    request = _make_request(container, body=pdf_bytes, headers={"content-type": "application/pdf"})
+    request = _make_request(
+        container, body=pdf_bytes, headers={"content-type": "application/pdf"}
+    )
 
     result = await upload_route(request)
     assert "extracted_text" in result
@@ -216,7 +247,9 @@ async def test_upload_image_returns_extracted_text():
     img_bytes = img_buffer.getvalue()
 
     container = _make_container(_FakeConn())
-    request = _make_request(container, body=img_bytes, headers={"content-type": "image/png"})
+    request = _make_request(
+        container, body=img_bytes, headers={"content-type": "image/png"}
+    )
 
     result = await upload_route(request)
     assert "extracted_text" in result

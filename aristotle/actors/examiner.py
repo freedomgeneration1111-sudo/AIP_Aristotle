@@ -16,6 +16,7 @@ disabled in production — platform gap logged in TECH_DEBT).
 Layer: imports from aip.foundation.protocols.actors only (ActorResult,
 ActorContext). The container is accessed via ctx.container (duck-typed).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -44,7 +45,9 @@ class ExaminerActor:
         registry = getattr(container, "corpus_registry", None)
         if registry is None:
             logger.warning("examiner_corpus_registry_missing")
-            return ActorResult(ok=False, error="corpus_registry not available on container")
+            return ActorResult(
+                ok=False, error="corpus_registry not available on container"
+            )
 
         try:
             stores = await registry.get_stores(corpus_id)
@@ -52,7 +55,9 @@ class ExaminerActor:
                 logger.warning("examiner_corpus_not_found corpus=%s", corpus_id)
                 return ActorResult(ok=False, error=f"corpus {corpus_id!r} not found")
         except Exception as exc:
-            logger.warning("examiner_corpus_access_failed corpus=%s error=%s", corpus_id, exc)
+            logger.warning(
+                "examiner_corpus_access_failed corpus=%s error=%s", corpus_id, exc
+            )
             return ActorResult(ok=False, error=f"corpus access failed: {exc}")
 
         model_provider = getattr(container, "model_provider", None)
@@ -73,7 +78,9 @@ class ExaminerActor:
         Governance: if no model provider, returns NEEDS_CONFIGURATION.
         """
         return await self._generate_question(
-            ctx, concept_id, question_type="probe",
+            ctx,
+            concept_id,
+            question_type="probe",
             system_prompt=(
                 "You are Aristotle. Ask the learner to explain the concept "
                 "in their own words. This is a low-stakes probe — warm, "
@@ -128,7 +135,9 @@ class ExaminerActor:
                 "concept's Bloom's taxonomy level. One question only."
             )
         return await self._generate_question(
-            ctx, concept_id, question_type=question_type,
+            ctx,
+            concept_id,
+            question_type=question_type,
             system_prompt=system_prompt,
         )
 
@@ -181,7 +190,9 @@ class ExaminerActor:
 
         model_provider = getattr(container, "model_provider", None)
         if model_provider is None:
-            return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+            return ActorResult(
+                ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
+            )
 
         # Fetch the concept (for context)
         concept = await self._fetch_concept(ctx, concept_id)
@@ -246,6 +257,7 @@ class ExaminerActor:
             # error-as-payload: the caller (session coordinator) reads
             # result.data, not result.error.
             import json
+
             try:
                 eval_data = json.loads(evaluation_text)
                 # Normalize: ensure all four fields exist. diagnosis may be
@@ -256,7 +268,9 @@ class ExaminerActor:
                     "score": float(eval_data.get("score", 0.0)),
                     "mastery_achieved": bool(eval_data.get("mastery_achieved", False)),
                     "feedback": str(eval_data.get("feedback", "")),
-                    "diagnosis": eval_data.get("diagnosis") if eval_data.get("diagnosis") is not None else None,
+                    "diagnosis": eval_data.get("diagnosis")
+                    if eval_data.get("diagnosis") is not None
+                    else None,
                 }
                 # If diagnosis is present, ensure it has the three expected
                 # keys (defensive — the model may omit one). Missing keys
@@ -275,7 +289,9 @@ class ExaminerActor:
 
                 logger.info(
                     "examiner_evaluate_ok concept=%s score=%.2f mastered=%s has_diagnosis=%s",
-                    concept_id, normalized["score"], normalized["mastery_achieved"],
+                    concept_id,
+                    normalized["score"],
+                    normalized["mastery_achieved"],
                     normalized["diagnosis"] is not None,
                 )
                 return ActorResult(ok=True, data=normalized)
@@ -286,7 +302,9 @@ class ExaminerActor:
                 # score=0.0 as "not mastered" and routes to hints/remediate).
                 logger.warning(
                     "examiner_evaluate_parse_failed concept=%s error=%s raw=%s",
-                    concept_id, parse_exc, evaluation_text[:200],
+                    concept_id,
+                    parse_exc,
+                    evaluation_text[:200],
                 )
                 return ActorResult(
                     ok=True,
@@ -300,7 +318,9 @@ class ExaminerActor:
         except Exception as exc:
             logger.warning(
                 "examiner_evaluate_failed concept=%s error=%s:%s",
-                concept_id, type(exc).__name__, exc,
+                concept_id,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
 
@@ -343,7 +363,9 @@ class ExaminerActor:
 
         model_provider = getattr(container, "model_provider", None)
         if model_provider is None:
-            return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+            return ActorResult(
+                ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
+            )
 
         concept = await self._fetch_concept(ctx, concept_id)
         if concept is None:
@@ -370,8 +392,7 @@ class ExaminerActor:
             )
 
         user_prompt = (
-            f"Concept: {concept['topic']}\n"
-            f"Subtopic: {concept.get('subtopic', 'n/a')}\n"
+            f"Concept: {concept['topic']}\nSubtopic: {concept.get('subtopic', 'n/a')}\n"
         )
         if concept.get("content_primary"):
             user_prompt += f"Textbook passage:\n{concept['content_primary'][:500]}\n"
@@ -392,14 +413,19 @@ class ExaminerActor:
             hint_text = result.get("content", "")
             logger.info(
                 "examiner_generate_hint_ok concept=%s hint_count=%d hint_len=%d",
-                concept_id, hint_count, len(hint_text),
+                concept_id,
+                hint_count,
+                len(hint_text),
             )
             # Phase B.5: use the new data field, not error-as-payload.
             return ActorResult(ok=True, data={"hint": hint_text})
         except Exception as exc:
             logger.warning(
                 "examiner_generate_hint_failed concept=%s hint_count=%d error=%s:%s",
-                concept_id, hint_count, type(exc).__name__, exc,
+                concept_id,
+                hint_count,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
 
@@ -421,7 +447,9 @@ class ExaminerActor:
 
         model_provider = getattr(container, "model_provider", None)
         if model_provider is None:
-            return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+            return ActorResult(
+                ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
+            )
 
         concept = await self._fetch_concept(ctx, concept_id)
         if concept is None:
@@ -446,7 +474,10 @@ class ExaminerActor:
             question = result.get("content", "")
             logger.info(
                 "examiner_%s_ok concept=%s question_type=%s question_len=%d",
-                question_type, concept_id, question_type, len(question),
+                question_type,
+                concept_id,
+                question_type,
+                len(question),
             )
             # Phase B.5: use the data field, not error-as-payload.
             # This migrates both quiz() AND probe() (which share this helper).
@@ -457,7 +488,10 @@ class ExaminerActor:
         except Exception as exc:
             logger.warning(
                 "examiner_%s_failed concept=%s error=%s:%s",
-                question_type, concept_id, type(exc).__name__, exc,
+                question_type,
+                concept_id,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
 

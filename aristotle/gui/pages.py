@@ -7,6 +7,7 @@ from gui.components.layout.
 All Brain GUI imports are wrapped in try/except — the extension must be
 importable headlessly (e.g. in tests) without Brain's GUI layer present.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +39,7 @@ try:
         F_SANS,
         R_LG,
     )
+
     _BRAIN_GUI = True
 except ImportError:
     _BRAIN_GUI = False
@@ -48,6 +50,7 @@ except ImportError:
 
     def clear_active_extension() -> None:
         pass
+
 
 from aristotle.gui.api_client import (
     get_mastery,
@@ -138,11 +141,7 @@ async def aristotle_stats_page():
                     else:
                         pct = 0
                     due = item.get("is_due", False)
-                    color = (
-                        C_OK_FG if pct >= 80
-                        else C_AMBER if pct >= 40
-                        else C_ERR_FG
-                    )
+                    color = C_OK_FG if pct >= 80 else C_AMBER if pct >= 40 else C_ERR_FG
                     with (
                         ui.row()
                         .classes("w-full items-center gap-3")
@@ -205,8 +204,10 @@ async def aristotle_stats_page():
                     concept = m.get("concept_name", m.get("concept_id", "?"))
                     text = m.get("misconception_text", m.get("text", ""))
                     ts = (m.get("created_at", "") or "")[:10]
-                    with ui.row().classes("w-full items-baseline gap-2").style(
-                        "padding:2px 0;"
+                    with (
+                        ui.row()
+                        .classes("w-full items-baseline gap-2")
+                        .style("padding:2px 0;")
                     ):
                         ui.label(f"[{concept}]").style(
                             f"font-size:10px; color:{C_AMBER}; "
@@ -216,8 +217,7 @@ async def aristotle_stats_page():
                             f"font-size:11px; color:{C_CREAM}; flex:1;"
                         )
                         ui.label(ts).style(
-                            f"font-size:10px; color:{C_MUTED}; "
-                            f"font-family:{F_MONO};"
+                            f"font-size:10px; color:{C_MUTED}; font-family:{F_MONO};"
                         )
 
         asyncio.create_task(_load())
@@ -252,10 +252,9 @@ async def aristotle_map_page():
             f"font-family:{F_SANS}; font-size:24px; font-weight:700; "
             f"color:{C_CREAM}; margin-bottom:4px;"
         )
-        ui.label("Concept graph with mastery state. "
-                 "Click a concept to start a session.").style(
-            f"font-size:12px; color:{C_MUTED}; margin-bottom:24px;"
-        )
+        ui.label(
+            "Concept graph with mastery state. Click a concept to start a session."
+        ).style(f"font-size:12px; color:{C_MUTED}; margin-bottom:24px;")
 
         # Legend
         with ui.row().classes("gap-4").style("margin-bottom:16px;"):
@@ -267,9 +266,7 @@ async def aristotle_map_page():
             ]:
                 with ui.row().classes("items-center gap-1"):
                     ui.label("●").style(f"color:{color}; font-size:12px;")
-                    ui.label(label).style(
-                        f"font-size:10px; color:{C_MUTED};"
-                    )
+                    ui.label(label).style(f"font-size:10px; color:{C_MUTED};")
 
         concept_grid = ui.column().classes("w-full gap-2")
 
@@ -284,10 +281,9 @@ async def aristotle_map_page():
             concept_grid.clear()
             with concept_grid:
                 if not concepts:
-                    ui.label("No concepts loaded yet. "
-                             "Ingest course material first.").style(
-                        f"color:{C_MUTED}; font-size:12px;"
-                    )
+                    ui.label(
+                        "No concepts loaded yet. Ingest course material first."
+                    ).style(f"color:{C_MUTED}; font-size:12px;")
                     return
 
                 for concept in concepts:
@@ -304,9 +300,7 @@ async def aristotle_map_page():
                         pct = round(score * 100)
                         pct_label = f"{pct}%"
                         color = (
-                            C_OK_FG if pct >= 80
-                            else C_AMBER if pct >= 40
-                            else C_ERR_FG
+                            C_OK_FG if pct >= 80 else C_AMBER if pct >= 40 else C_ERR_FG
                         )
 
                     due = m.get("is_due", False)
@@ -325,13 +319,10 @@ async def aristotle_map_page():
                     ):
                         with ui.column().classes("flex-1").style("gap:2px;"):
                             ui.label(name).style(
-                                f"font-size:13px; color:{C_CREAM}; "
-                                f"font-weight:500;"
+                                f"font-size:13px; color:{C_CREAM}; font-weight:500;"
                             )
                             if prereq:
-                                ui.label(
-                                    f"Requires: {prereq}"
-                                ).style(
+                                ui.label(f"Requires: {prereq}").style(
                                     f"font-size:10px; color:{C_MUTED}; "
                                     f"font-family:{F_MONO};"
                                 )
@@ -380,8 +371,7 @@ async def aristotle_settings_page():
             f"color:{C_CREAM}; margin-bottom:24px;"
         )
 
-        def _field(label: str, value: str = "",
-                   placeholder: str = "") -> ui.input:
+        def _field(label: str, value: str = "", placeholder: str = "") -> ui.input:
             ui.label(label).style(
                 f"font-size:10px; font-weight:700; letter-spacing:1px; "
                 f"color:{C_MUTED}; text-transform:uppercase; margin-bottom:4px;"
@@ -390,7 +380,7 @@ async def aristotle_settings_page():
                 ui.input(value=value, placeholder=placeholder)
                 .props("outlined dense")
                 .classes("w-full")
-                .style(f"max-width:400px;")
+                .style("max-width:400px;")
             )
             return inp
 
@@ -404,20 +394,14 @@ async def aristotle_settings_page():
         # Student profile
         _section("STUDENT PROFILE")
         name_inp = _field("Display Name", placeholder="e.g. Ramesh")
-        lang_inp = _field(
-            "Primary Language", placeholder="e.g. English"
-        )
-        alt_lang_inp = _field(
-            "Alt Language (optional)", placeholder="e.g. Urdu"
-        )
+        lang_inp = _field("Primary Language", placeholder="e.g. English")
+        alt_lang_inp = _field("Alt Language (optional)", placeholder="e.g. Urdu")
 
         _section("SESSION PREFERENCES")
         ui.label("Session length (questions per session)").style(
             f"font-size:10px; color:{C_MUTED}; margin-bottom:4px;"
         )
-        session_len = ui.number(value=5, min=3, max=20, step=1).props(
-            "outlined dense"
-        )
+        session_len = ui.number(value=5, min=3, max=20, step=1).props("outlined dense")
 
         ui.label("Mastery threshold (0.0 - 1.0)").style(
             f"font-size:10px; color:{C_MUTED}; margin-bottom:4px; margin-top:12px;"
@@ -430,8 +414,7 @@ async def aristotle_settings_page():
             f"font-size:10px; color:{C_MUTED}; margin-bottom:4px; margin-top:12px;"
         )
         hint_mode = ui.select(
-            ["conservative", "balanced", "generous"],
-            value="balanced"
+            ["conservative", "balanced", "generous"], value="balanced"
         ).props("outlined dense")
 
         save_btn = (
@@ -451,12 +434,8 @@ async def aristotle_settings_page():
                 lang_inp.value = settings.get("primary_language", "")
                 alt_lang_inp.value = settings.get("alt_language", "")
                 session_len.value = settings.get("session_length", 5)
-                mastery_thresh.value = settings.get(
-                    "mastery_threshold", 0.85
-                )
-                hint_mode.value = settings.get(
-                    "hint_aggressiveness", "balanced"
-                )
+                mastery_thresh.value = settings.get("mastery_threshold", 0.85)
+                hint_mode.value = settings.get("hint_aggressiveness", "balanced")
 
         async def _save():
             payload = {
@@ -471,10 +450,7 @@ async def aristotle_settings_page():
             if result:
                 ui.notify("Settings saved.", color="positive", timeout=2000)
             else:
-                ui.notify(
-                    "Save failed — check ARISTOTLE backend.",
-                    color="negative"
-                )
+                ui.notify("Save failed — check ARISTOTLE backend.", color="negative")
 
         save_btn.on("click", lambda: asyncio.create_task(_save()))
         asyncio.create_task(_load())
@@ -497,8 +473,7 @@ def _stat_tile(label: str, value: str, color: str) -> None:
         )
     ):
         ui.label(value).style(
-            f"font-size:22px; font-weight:700; "
-            f"color:{color}; font-family:{F_MONO};"
+            f"font-size:22px; font-weight:700; color:{color}; font-family:{F_MONO};"
         )
         ui.label(label).style(
             f"font-size:10px; letter-spacing:1px; "
@@ -563,25 +538,23 @@ async def aristotle_teacher_page():
         )
 
         # Row 1: Quick stat tiles
-        stats_row = ui.row().classes("w-full gap-4").style(
-            "flex-wrap:wrap; margin-bottom:24px;"
+        stats_row = (
+            ui.row()
+            .classes("w-full gap-4")
+            .style("flex-wrap:wrap; margin-bottom:24px;")
         )
 
         # Row 2: Two-column layout
-        with ui.row().classes("w-full gap-6").style(
-            "flex-wrap:wrap; align-items:flex-start;"
+        with (
+            ui.row()
+            .classes("w-full gap-6")
+            .style("flex-wrap:wrap; align-items:flex-start;")
         ):
-            left_col = ui.column().style(
-                "flex:1; min-width:280px; gap:0;"
-            )
-            right_col = ui.column().style(
-                "flex:1; min-width:280px; gap:0;"
-            )
+            left_col = ui.column().style("flex:1; min-width:280px; gap:0;")
+            right_col = ui.column().style("flex:1; min-width:280px; gap:0;")
 
         # Row 3: Full mastery table
-        ui.separator().style(
-            f"background:{C_INK40}; margin:24px 0 16px;"
-        )
+        ui.separator().style(f"background:{C_INK40}; margin:24px 0 16px;")
         ui.label("ALL CONCEPTS").style(
             f"font-size:10px; font-weight:700; letter-spacing:2px; "
             f"color:{C_MUTED}; margin-bottom:12px;"
@@ -590,6 +563,7 @@ async def aristotle_teacher_page():
 
         async def _load():
             import asyncio as _asyncio
+
             dashboard, sessions = await _asyncio.gather(
                 get_mastery(),
                 get_session_history(),
@@ -604,7 +578,8 @@ async def aristotle_teacher_page():
             mastered = dashboard.get("mastered_count", 0)
             due = dashboard.get("due_count", 0)
             not_start = sum(
-                1 for c in dashboard.get("mastery_by_concept", [])
+                1
+                for c in dashboard.get("mastery_by_concept", [])
                 if c.get("repetitions", 0) == 0
             )
             struggle = dashboard.get("struggle_pattern")
@@ -620,11 +595,13 @@ async def aristotle_teacher_page():
                     C_OK_FG,
                 )
                 _stat_tile(
-                    "Due for Review", str(due),
+                    "Due for Review",
+                    str(due),
                     C_AMBER if due > 0 else C_MUTED,
                 )
                 _stat_tile(
-                    "Not Started", str(not_start),
+                    "Not Started",
+                    str(not_start),
                     C_ERR_FG if not_start > 0 else C_MUTED,
                 )
 
@@ -633,7 +610,8 @@ async def aristotle_teacher_page():
             with left_col:
                 _section_hdr("NEEDS ATTENTION")
                 attention = [
-                    c for c in concepts
+                    c
+                    for c in concepts
                     if c.get("is_due") or c.get("repetitions", 0) == 0
                 ][:12]
                 if not attention:
@@ -668,15 +646,12 @@ async def aristotle_teacher_page():
                             f"font-size:11px; color:{C_CREAM}; flex:1;"
                         )
                         ui.label(score_txt).style(
-                            f"font-size:11px; color:{C_MUTED}; "
-                            f"font-family:{F_MONO};"
+                            f"font-size:11px; color:{C_MUTED}; font-family:{F_MONO};"
                         )
 
                 # Struggle Pattern
                 if struggle:
-                    ui.separator().style(
-                        f"background:{C_INK40}; margin:16px 0 12px;"
-                    )
+                    ui.separator().style(f"background:{C_INK40}; margin:16px 0 12px;")
                     _section_hdr("STRUGGLE PATTERN")
                     with (
                         ui.card()
@@ -688,8 +663,7 @@ async def aristotle_teacher_page():
                         )
                     ):
                         ui.label(struggle).style(
-                            f"font-size:12px; color:{C_CREAM}; "
-                            f"line-height:1.6;"
+                            f"font-size:12px; color:{C_CREAM}; line-height:1.6;"
                         )
 
             # Right col: Recent Sessions
@@ -725,9 +699,7 @@ async def aristotle_teacher_page():
                                 f"font-size:10px; color:{C_MUTED}; "
                                 f"font-family:{F_MONO};"
                             )
-                        with ui.row().classes("w-full gap-3").style(
-                            "margin-top:4px;"
-                        ):
+                        with ui.row().classes("w-full gap-3").style("margin-top:4px;"):
                             _mini_stat("exchanges", events)
                             _mini_stat("answers", answers)
                             if curiosity:
@@ -755,8 +727,11 @@ async def aristotle_teacher_page():
                             f"border-bottom:0.5px solid {C_INK40};"
                         ):
                             for col in [
-                                "Concept", "Score", "Reps",
-                                "Next Review", "Status"
+                                "Concept",
+                                "Score",
+                                "Reps",
+                                "Next Review",
+                                "Status",
                             ]:
                                 th = ui.element("th").style(
                                     f"text-align:left; padding:4px 8px; "
@@ -773,9 +748,7 @@ async def aristotle_teacher_page():
                             mastered = c.get("mastered", False)
                             is_due = c.get("is_due", False)
 
-                            score_txt = (
-                                f"{round(score * 100)}%" if score else "-"
-                            )
+                            score_txt = f"{round(score * 100)}%" if score else "-"
                             if mastered:
                                 status, sc = "Mastered", C_OK_FG
                             elif is_due:

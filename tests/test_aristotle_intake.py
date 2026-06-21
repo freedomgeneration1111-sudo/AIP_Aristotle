@@ -6,6 +6,7 @@ and the two API routes (/intake/start, /intake/step).
 
 Run:  pytest tests/test_aristotle_intake.py -v
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -14,17 +15,15 @@ from typing import Any
 
 import pytest
 
-from aip.foundation.protocols.actors import ActorContext, ActorResult
+from aip.foundation.protocols.actors import ActorContext
 from aristotle.actors.intake import (
     IntakeActor,
     IntakeSession,
     IntakeState,
-    IntakeTrigger,
     _detect_intake_intent,
     check_intake_triggers,
     run_intake_step,
     intake_session_to_dict,
-    intake_session_from_dict,
 )
 
 
@@ -99,10 +98,14 @@ def _make_ctx(
     stores: Any | None = None,
 ) -> ActorContext:
     """Build a minimal ActorContext for testing."""
-    container = type("C", (), {
-        "model_provider": model_provider,
-        "corpus_registry": _FakeRegistry(stores) if stores else None,
-    })()
+    container = type(
+        "C",
+        (),
+        {
+            "model_provider": model_provider,
+            "corpus_registry": _FakeRegistry(stores) if stores else None,
+        },
+    )()
     return ActorContext(
         container=container,
         config=config,
@@ -148,7 +151,8 @@ class TestIntakeActor:
         assert result.data["plan_id"]  # UUID generated
         # Verify the INSERT into aristotle_learning_plan was issued.
         insert_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT INTO aristotle_learning_plan" in sql
         ]
         assert len(insert_calls) == 1
@@ -169,13 +173,17 @@ class TestIntakeActor:
         assert result.ok
         # Verify the INSERT into aristotle_intake_session was issued.
         insert_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT INTO aristotle_intake_session" in sql
         ]
         assert len(insert_calls) == 1
         # The INSERT should include status='complete'.
-        sql, params = [(sql, params) for sql, params in conn._executed
-                       if "INSERT INTO aristotle_intake_session" in sql][0]
+        sql, params = [
+            (sql, params)
+            for sql, params in conn._executed
+            if "INSERT INTO aristotle_intake_session" in sql
+        ][0]
         assert "complete" in sql or "complete" in str(params)
 
 
@@ -241,6 +249,7 @@ class TestCheckIntakeTriggers:
     async def test_check_triggers_long_absence_returns_checkin(self):
         """days since last_session > 14 → checkin trigger at GREETING."""
         from datetime import datetime, timezone, timedelta
+
         old_date = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
         conn = _FakeConn(rows=[("Physics", "active", old_date, 0)])
         ctx = _make_ctx(stores=_FakeStores(conn))
@@ -319,17 +328,30 @@ class TestIntakeSessionFlow:
         """POST /intake/start with no plan_id returns a greeting prompt."""
         from aristotle.api import intake_start_route
 
-        container = type("C", (), {
-            "corpus_registry": _FakeRegistry(_FakeStores(_FakeConn())),
-        })()
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "corpus_registry": _FakeRegistry(_FakeStores(_FakeConn())),
+            },
+        )()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
 
         async def _json():
             return {"plan_id": None}
+
         request.json = _json
 
         result = await intake_start_route(request)
@@ -342,20 +364,35 @@ class TestIntakeSessionFlow:
         """POST /intake/step with a subject input advances to PRIOR_KNOWLEDGE."""
         from aristotle.api import intake_step_route
 
-        container = type("C", (), {
-            "corpus_registry": _FakeRegistry(_FakeStores(_FakeConn(rows=[("c1",)]))),
-        })()
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "corpus_registry": _FakeRegistry(
+                    _FakeStores(_FakeConn(rows=[("c1",)]))
+                ),
+            },
+        )()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
 
         # Start with a session at SUBJECT state (after GREETING was done).
         session_dict = intake_session_to_dict(IntakeSession(state=IntakeState.SUBJECT))
 
         async def _json():
             return {"session": session_dict, "student_input": "Physics"}
+
         request.json = _json
 
         result = await intake_step_route(request)
@@ -375,6 +412,7 @@ class TestPlacerSampling:
     def test_sample_concepts_distributed_evenly(self):
         """20 concepts, n=7 → returns 7 spaced indices, not first 7."""
         from aristotle.actors.intake import _sample_concepts_for_placement
+
         concept_ids = [f"c{i}" for i in range(20)]
         sampled = _sample_concepts_for_placement(concept_ids, n=7)
         assert len(sampled) == 7
@@ -388,6 +426,7 @@ class TestPlacerSampling:
     def test_sample_concepts_small_list(self):
         """4 concepts, n=7 → returns all 4."""
         from aristotle.actors.intake import _sample_concepts_for_placement
+
         concept_ids = [f"c{i}" for i in range(4)]
         sampled = _sample_concepts_for_placement(concept_ids, n=7)
         assert len(sampled) == 4
@@ -402,10 +441,19 @@ class TestPlacerStep:
         """Phase 1: run_placer_step with no student_input generates a probe question."""
         from aristotle.actors.intake import PlacerSession, run_placer_step
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
-        fake = _FakeModelProvider(responses={
-            "evaluation": "Explain inertia in your own words.",  # probe question
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": "Explain inertia in your own words.",  # probe question
+            }
+        )
         # FakeConn returns concept rows for examiner._fetch_concept
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
@@ -424,10 +472,19 @@ class TestPlacerStep:
         """Phase 2: evaluates the answer + writes a placement_event row."""
         from aristotle.actors.intake import PlacerSession, run_placer_step
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         session = PlacerSession(
@@ -441,7 +498,8 @@ class TestPlacerStep:
         assert result["concepts_placed"] == 1
         # Verify the INSERT into aristotle_placement_event was issued.
         insert_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT INTO aristotle_placement_event" in sql
         ]
         assert len(insert_calls) == 1
@@ -451,10 +509,19 @@ class TestPlacerStep:
         """Phase 2: when mastery_achieved, upserts aristotle_mastery (repetitions=3)."""
         from aristotle.actors.intake import PlacerSession, run_placer_step
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         session = PlacerSession(
@@ -467,7 +534,8 @@ class TestPlacerStep:
         result = await run_placer_step(session, "objects resist changes in motion", ctx)
         # Verify the INSERT OR REPLACE into aristotle_mastery was issued.
         mastery_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT OR REPLACE INTO aristotle_mastery" in sql
         ]
         assert len(mastery_calls) == 1
@@ -477,19 +545,33 @@ class TestPlacerStep:
         """After the last concept is assessed, state becomes COMPLETE."""
         from aristotle.actors.intake import PlacerSession, run_placer_step
 
-        eval_json = json.dumps({"score": 0.3, "mastery_achieved": False, "feedback": "Try again", "diagnosis": None})
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.3,
+                "mastery_achieved": False,
+                "feedback": "Try again",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+            }
+        )
+
         # Routing conn: returns concept row for fetch_concept, plan row for finalize
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "concept_ids_json" in sql.lower():
                     return _FakeCursor([('["c1", "c2"]',)])
-                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
+
             async def commit(self):
                 pass
 
@@ -515,11 +597,13 @@ class TestPlacerStep:
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "concept_ids_json" in sql.lower():
                     return _FakeCursor([('["c1", "c2", "c3"]',)])
                 return _FakeCursor(None)
+
             async def commit(self):
                 pass
 
@@ -535,7 +619,8 @@ class TestPlacerStep:
         await _finalize_placement(session, ctx)
         # Should have issued an UPDATE setting current_concept_idx = 1 (c2 is the first non-mastered)
         update_calls = [
-            (sql, params) for sql, params in conn._executed
+            (sql, params)
+            for sql, params in conn._executed
             if "UPDATE aristotle_learning_plan SET current_concept_idx" in sql
         ]
         assert len(update_calls) == 1
@@ -551,35 +636,61 @@ class TestPlacerRoutes:
         """POST /placer/start reads the plan + returns the first probe question."""
         from aristotle.api import placer_start_route
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
-        fake = _FakeModelProvider(responses={
-            "evaluation": "Explain inertia in your own words.",
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": "Explain inertia in your own words.",
+            }
+        )
 
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "concept_ids_json" in sql.lower():
                     return _FakeCursor([('["c1", "c2"]',)])
-                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
+
             async def commit(self):
                 pass
 
         conn = _RoutingConn()
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-        })()
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            },
+        )()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
 
         async def _json():
             return {"plan_id": "plan-1"}
+
         request.json = _json
 
         result = await placer_start_route(request)
@@ -593,32 +704,57 @@ class TestPlacerRoutes:
         from aristotle.api import placer_step_route
         from aristotle.actors.intake import PlacerSession, placer_session_to_dict
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+            }
+        )
 
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "concept_ids_json" in sql.lower():
                     return _FakeCursor([('["c1", "c2"]',)])
-                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
+
             async def commit(self):
                 pass
 
         conn = _RoutingConn()
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-        })()
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            },
+        )()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
 
         session = PlacerSession(
             plan_id="plan-1",
@@ -629,7 +765,11 @@ class TestPlacerRoutes:
         )
 
         async def _json():
-            return {"session": placer_session_to_dict(session), "student_input": "objects resist changes in motion"}
+            return {
+                "session": placer_session_to_dict(session),
+                "student_input": "objects resist changes in motion",
+            }
+
         request.json = _json
 
         result = await placer_step_route(request)

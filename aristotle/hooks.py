@@ -8,6 +8,7 @@ page (ADR-014 §5.5: register_page for the learning view).
 The host sets `_current_ext_id` before calling on_load, so `host.config`
 and `host.manifest` resolve to ARISTOTLE's validated config + manifest.
 """
+
 from __future__ import annotations
 
 from aristotle.actors import ExaminerActor, MentorActor, SocratesActor

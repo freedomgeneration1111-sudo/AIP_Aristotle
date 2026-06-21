@@ -13,6 +13,7 @@ Layer: imports from aip.foundation.protocols.actors only (ActorContext)
 for type hints. The container is accessed via ctx.container (duck-typed).
 No aip.adapter or aip.orchestration imports.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -70,7 +71,11 @@ async def ingest_concepts_from_yaml(
     # Get the corpus stores
     registry = getattr(container, "corpus_registry", None)
     if registry is None:
-        return {"ingested": 0, "skipped": 0, "errors": ["corpus_registry not available"]}
+        return {
+            "ingested": 0,
+            "skipped": 0,
+            "errors": ["corpus_registry not available"],
+        }
 
     try:
         stores = await registry.get_stores("aristotle:textbook")
@@ -103,7 +108,9 @@ async def ingest_concepts_from_yaml(
 
         content_primary = concept.get("content_primary", "")
         if not content_primary:
-            errors.append(f"entry {i} (id={concept_id}): missing 'content_primary', skipping")
+            errors.append(
+                f"entry {i} (id={concept_id}): missing 'content_primary', skipping"
+            )
             skipped += 1
             continue
 
@@ -137,7 +144,9 @@ async def ingest_concepts_from_yaml(
 
     logger.info(
         "aristotle_ingest_complete ingested=%d skipped=%d errors=%d",
-        ingested, skipped, len(errors),
+        ingested,
+        skipped,
+        len(errors),
     )
 
     return {"ingested": ingested, "skipped": skipped, "errors": errors}

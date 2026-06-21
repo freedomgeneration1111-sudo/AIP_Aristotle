@@ -19,6 +19,7 @@ transitions directly.
 Layer: imports from aip.foundation.protocols.actors only (ActorResult,
 ActorContext). The container is accessed via ctx.container (duck-typed).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -54,7 +55,9 @@ class SocratesActor:
         registry = getattr(container, "corpus_registry", None)
         if registry is None:
             logger.warning("socrates_corpus_registry_missing")
-            return ActorResult(ok=False, error="corpus_registry not available on container")
+            return ActorResult(
+                ok=False, error="corpus_registry not available on container"
+            )
 
         try:
             stores = await registry.get_stores(corpus_id)
@@ -62,7 +65,9 @@ class SocratesActor:
                 logger.warning("socrates_corpus_not_found corpus=%s", corpus_id)
                 return ActorResult(ok=False, error=f"corpus {corpus_id!r} not found")
         except Exception as exc:
-            logger.warning("socrates_corpus_access_failed corpus=%s error=%s", corpus_id, exc)
+            logger.warning(
+                "socrates_corpus_access_failed corpus=%s error=%s", corpus_id, exc
+            )
             return ActorResult(ok=False, error=f"corpus access failed: {exc}")
 
         # Check model availability
@@ -70,7 +75,8 @@ class SocratesActor:
         model_status = "configured" if model_provider is not None else "NOT_CONFIGURED"
         logger.info(
             "socrates_cycle_ok corpus=%s model=%s — ready for tutoring",
-            corpus_id, model_status,
+            corpus_id,
+            model_status,
         )
         return ActorResult(ok=True)
 
@@ -123,18 +129,24 @@ class SocratesActor:
         # Governance: no silent model calls (AGENTS.md §1.7)
         model_provider = getattr(container, "model_provider", None)
         if model_provider is None:
-            return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+            return ActorResult(
+                ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
+            )
 
         # Pull the concept from the textbook corpus (if ingested)
         concept = await self._fetch_concept(ctx, concept_id)
         if concept is None:
-            return ActorResult(ok=False, error=f"concept {concept_id!r} not found in aristotle_concept")
+            return ActorResult(
+                ok=False, error=f"concept {concept_id!r} not found in aristotle_concept"
+            )
 
         # Build the teaching prompt
         primary_lang = getattr(config, "primary_language", "en") if config else "en"
         alt_lang = getattr(config, "alt_language", "ur") if config else "ur"
 
-        system_prompt = self._build_system_prompt(retry=retry, mastery_level=mastery_level)
+        system_prompt = self._build_system_prompt(
+            retry=retry, mastery_level=mastery_level
+        )
         user_prompt = self._build_teach_prompt(
             concept=concept,
             retry=retry,
@@ -157,7 +169,11 @@ class SocratesActor:
             fading_mode = self._fading_mode_for_level(mastery_level)
             logger.info(
                 "socrates_teach_ok concept=%s retry=%s mastery_level=%d fading=%s explanation_len=%d",
-                concept_id, retry, mastery_level, fading_mode, len(explanation),
+                concept_id,
+                retry,
+                mastery_level,
+                fading_mode,
+                len(explanation),
             )
             # Phase B.5: use the data field, not error-as-payload.
             return ActorResult(
@@ -167,7 +183,9 @@ class SocratesActor:
         except Exception as exc:
             logger.warning(
                 "socrates_teach_failed concept=%s error=%s:%s",
-                concept_id, type(exc).__name__, exc,
+                concept_id,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
 
@@ -220,13 +238,14 @@ class SocratesActor:
         # so the prompt is specific, not generic.
         topic = concept.get("topic", concept_id)
         prompt = (
-            f"Before I explain this, what do you think \"{topic}\" means? "
+            f'Before I explain this, what do you think "{topic}" means? '
             f"A wrong guess is fine — just say what comes to mind."
         )
 
         logger.info(
             "socrates_predict_ok concept=%s prompt_len=%d",
-            concept_id, len(prompt),
+            concept_id,
+            len(prompt),
         )
         # Phase B.5: use the new `data` field, not error-as-payload.
         return ActorResult(ok=True, data={"prompt": prompt})
@@ -283,7 +302,9 @@ class SocratesActor:
         else:
             return "conceptual_only"
 
-    def _build_system_prompt(self, *, retry: bool = False, mastery_level: int = 0) -> str:
+    def _build_system_prompt(
+        self, *, retry: bool = False, mastery_level: int = 0
+    ) -> str:
         """Build the system prompt for the teaching model.
 
         ADR-001 §1: single-voice principle. The system prompt establishes
@@ -370,7 +391,9 @@ class SocratesActor:
         if concept.get("content_primary"):
             parts.append(f"\nTextbook passage:\n{concept['content_primary']}")
         if concept.get("content_alt"):
-            parts.append(f"\nAlt-language passage ({concept.get('content_alt_lang', alt_lang)}):\n{concept['content_alt']}")
+            parts.append(
+                f"\nAlt-language passage ({concept.get('content_alt_lang', alt_lang)}):\n{concept['content_alt']}"
+            )
 
         if retry and struggle_pattern:
             parts.append(f"\nThe learner's struggle pattern: {struggle_pattern}")
@@ -379,7 +402,9 @@ class SocratesActor:
         # Phase B.5: echo the fading mode in the user prompt.
         fading_mode = self._fading_mode_for_level(mastery_level)
         parts.append(f"\nMastery level: {mastery_level} (fading mode: {fading_mode}).")
-        parts.append("Follow the FADING MODE instruction from the system prompt exactly.")
+        parts.append(
+            "Follow the FADING MODE instruction from the system prompt exactly."
+        )
 
         parts.append(f"\nProvide the explanation in {primary_lang} (primary).")
         parts.append(f"If possible, also provide a {alt_lang} translation.")

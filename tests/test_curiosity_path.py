@@ -2,15 +2,16 @@
 
 Run: pytest tests/test_curiosity_path.py -v
 """
+
 from __future__ import annotations
 
 import asyncio
 import warnings
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
-from aip.foundation.protocols.actors import ActorContext, ActorResult
+from aip.foundation.protocols.actors import ActorContext
 from aristotle.session import (
     SessionContext,
     SessionState,
@@ -89,12 +90,17 @@ class _FakeRegistry:
 
 
 def _make_ctx(model_provider=None, stores=None):
-    container = type("C", (), {
-        "model_provider": model_provider,
-        "corpus_registry": _FakeRegistry(stores) if stores else None,
-    })()
+    container = type(
+        "C",
+        (),
+        {
+            "model_provider": model_provider,
+            "corpus_registry": _FakeRegistry(stores) if stores else None,
+        },
+    )()
     return ActorContext(
-        container=container, config=None,
+        container=container,
+        config=None,
         logger=__import__("logging").getLogger("test"),
         cancel_event=asyncio.Event(),
     )
@@ -105,7 +111,11 @@ async def test_session_step_curiosity_response_includes_intent_class():
     """Call _step_curiosity with QUESTION intent.
     Assert result has intent_class == 'QUESTION' and weave-back offer.
     """
-    fake = _FakeModelProvider(responses={"beast": "Gravity is the force that attracts objects toward each other."})
+    fake = _FakeModelProvider(
+        responses={
+            "beast": "Gravity is the force that attracts objects toward each other."
+        }
+    )
     conn = _FakeConn()
     ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
     session = SessionContext(concept_id="newton_first_law", state=SessionState.TEACH)

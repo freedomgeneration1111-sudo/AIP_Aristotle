@@ -14,6 +14,7 @@ All are manual-only (cadence=0.0) — the tutoring state machine is driven
 by user turns, not by a timer (ADR-ARISTOTLE §3: "the learner only feels
 rhythm"). The host runs one cycle on start, then waits for cancellation.
 """
+
 from __future__ import annotations
 
 from aristotle.actors.examiner import ExaminerActor

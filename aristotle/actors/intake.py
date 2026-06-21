@@ -19,6 +19,7 @@ Layer: imports from aip.foundation.protocols.actors only (ActorResult,
 ActorContext). The container is accessed via ctx.container (duck-typed).
 SQL is executed via the corpus's write connection.
 """
+
 from __future__ import annotations
 
 import json
@@ -38,6 +39,7 @@ from aip.foundation.protocols.actors import ActorContext, ActorResult
 
 class IntakeState(str, Enum):
     """The intake conversation states (ADR-002 §9, simplified for Phase D)."""
+
     GREETING = "GREETING"
     SUBJECT = "SUBJECT"
     PRIOR_KNOWLEDGE = "PRIOR_KNOWLEDGE"
@@ -59,6 +61,7 @@ class IntakeTrigger:
     prompt: pre-built prompt for checkin level (e.g. "Welcome back! ...").
             None for full and partial — IntakeActor generates the prompt.
     """
+
     level: str
     entry_state: IntakeState
     prompt: str | None = None
@@ -71,6 +74,7 @@ class IntakeSession:
     The caller persists this between run_intake_step() calls (via the API
     serialization in api.py).
     """
+
     state: IntakeState = IntakeState.GREETING
     entry_state: IntakeState = IntakeState.GREETING
     plan_id: str = ""
@@ -109,7 +113,9 @@ class IntakeActor:
         try:
             stores = await registry.get_stores("aristotle:textbook")
             if stores is None:
-                return ActorResult(ok=False, error="corpus aristotle:textbook not found")
+                return ActorResult(
+                    ok=False, error="corpus aristotle:textbook not found"
+                )
         except Exception as exc:
             return ActorResult(ok=False, error=f"corpus access failed: {exc}")
         return ActorResult(ok=True)
@@ -127,9 +133,7 @@ class IntakeActor:
         )
         return ActorResult(ok=True, data={"prompt": prompt})
 
-    async def ask_prior_knowledge(
-        self, ctx: ActorContext, subject: str
-    ) -> ActorResult:
+    async def ask_prior_knowledge(self, ctx: ActorContext, subject: str) -> ActorResult:
         """Asks what the learner already knows about the subject.
 
         Low-pressure framing — "none at all is a perfectly fine answer."
@@ -141,9 +145,7 @@ class IntakeActor:
         )
         return ActorResult(ok=True, data={"prompt": prompt})
 
-    async def ask_goals(
-        self, ctx: ActorContext, subject: str
-    ) -> ActorResult:
+    async def ask_goals(self, ctx: ActorContext, subject: str) -> ActorResult:
         """Asks what the learner wants to achieve.
 
         Exam? Job? Personal interest? For partial re-INTAKE at GOALS, the
@@ -207,9 +209,7 @@ class IntakeActor:
                 concept_ids = [row[0] for row in rows]
             else:
                 # No match — use all concepts ordered by insertion order.
-                cur = await conn.execute(
-                    "SELECT id FROM aristotle_concept ORDER BY id"
-                )
+                cur = await conn.execute("SELECT id FROM aristotle_concept ORDER BY id")
                 rows = await cur.fetchall()
                 await cur.close()
                 concept_ids = [row[0] for row in rows] if rows else []
@@ -261,7 +261,9 @@ class IntakeActor:
             await conn.commit()
             logger.info(
                 "intake_plan_generated plan_id=%s subject=%s concept_count=%d",
-                plan_id, session.subject, len(concept_ids),
+                plan_id,
+                session.subject,
+                len(concept_ids),
             )
             return ActorResult(
                 ok=True,
@@ -270,7 +272,8 @@ class IntakeActor:
         except Exception as exc:
             logger.warning(
                 "intake_plan_generation_failed error=%s:%s",
-                type(exc).__name__, exc,
+                type(exc).__name__,
+                exc,
             )
             return ActorResult(ok=False, error=f"plan generation failed: {exc}")
 
@@ -296,19 +299,34 @@ class IntakeActor:
 # learner's input and classifies the intent). For pre-alpha, keyword
 # matching is sufficient and deterministic.
 _FULL_KEYWORDS = [
-    "new topic", "start over", "different subject",
-    "learn something else", "reset", "something new",
+    "new topic",
+    "start over",
+    "different subject",
+    "learn something else",
+    "reset",
+    "something new",
 ]
 _GOALS_KEYWORDS = [
-    "exam", "deadline", "goal changed", "target",
-    "need to pass", "interview",
+    "exam",
+    "deadline",
+    "goal changed",
+    "target",
+    "need to pass",
+    "interview",
 ]
 _SCHEDULE_KEYWORDS = [
-    "busier", "less time", "only have", "minutes a day",
-    "schedule", "not enough time",
+    "busier",
+    "less time",
+    "only have",
+    "minutes a day",
+    "schedule",
+    "not enough time",
 ]
 _PLAN_KEYWORDS = [
-    "add more topics", "go deeper", "extend my plan", "more advanced",
+    "add more topics",
+    "go deeper",
+    "extend my plan",
+    "more advanced",
 ]
 
 
@@ -423,9 +441,7 @@ async def check_intake_triggers(
             return IntakeTrigger(
                 level="full",
                 entry_state=IntakeState.GREETING,
-                prompt=(
-                    "You've completed your plan. Want to start something new?"
-                ),
+                prompt=("You've completed your plan. Want to start something new?"),
             )
 
         # (c) Long absence (> 14 days) → checkin at GREETING.
@@ -437,7 +453,11 @@ async def check_intake_triggers(
                 now = datetime.now(timezone.utc)
                 days_since = (now - last).days
                 if days_since > 14:
-                    subject_phrase = f"still working on {subject}" if subject else "ready for something new"
+                    subject_phrase = (
+                        f"still working on {subject}"
+                        if subject
+                        else "ready for something new"
+                    )
                     return IntakeTrigger(
                         level="checkin",
                         entry_state=IntakeState.GREETING,
@@ -664,6 +684,7 @@ class PlacerSession:
     (learning_plan.current_concept_idx). Reuses ExaminerActor — no new
     model slots needed.
     """
+
     plan_id: str = ""
     concepts_to_assess: list = field(default_factory=list)
     current_idx: int = 0
@@ -674,9 +695,7 @@ class PlacerSession:
     state: str = "PROBING"  # or "COMPLETE"
 
 
-def _sample_concepts_for_placement(
-    concept_ids: list, n: int = 7
-) -> list:
+def _sample_concepts_for_placement(concept_ids: list, n: int = 7) -> list:
     """Select n concepts distributed evenly across the list.
 
     Distributes the sample across beginning, middle, and end — not just
@@ -734,7 +753,9 @@ async def run_placer_step(
         return {
             "state": "COMPLETE",
             "concepts_placed": len(session.results),
-            "concepts_known": sum(1 for r in session.results if r.get("mastery_achieved")),
+            "concepts_known": sum(
+                1 for r in session.results if r.get("mastery_achieved")
+            ),
         }
 
     if session.current_idx >= len(session.concepts_to_assess):
@@ -744,7 +765,9 @@ async def run_placer_step(
         return {
             "state": "COMPLETE",
             "concepts_placed": len(session.results),
-            "concepts_known": sum(1 for r in session.results if r.get("mastery_achieved")),
+            "concepts_known": sum(
+                1 for r in session.results if r.get("mastery_achieved")
+            ),
         }
 
     concept_id = session.concepts_to_assess[session.current_idx]
@@ -757,7 +780,8 @@ async def run_placer_step(
             session.question_generated = True
             logger.info(
                 "placer_probe_generated concept=%s idx=%d",
-                concept_id, session.current_idx,
+                concept_id,
+                session.current_idx,
             )
             return {
                 "state": "PROBING",
@@ -773,7 +797,8 @@ async def run_placer_step(
     else:
         # Phase 2: evaluate the learner's answer.
         eval_result = await examiner.evaluate(
-            ctx, concept_id,
+            ctx,
+            concept_id,
             student_answer=student_input,
             quiz_question=session.current_question,
         )
@@ -791,11 +816,13 @@ async def run_placer_step(
         mastery_achieved = bool(eval_data.get("mastery_achieved", False))
 
         # Record the result.
-        session.results.append({
-            "concept_id": concept_id,
-            "score": score,
-            "mastery_achieved": mastery_achieved,
-        })
+        session.results.append(
+            {
+                "concept_id": concept_id,
+                "score": score,
+                "mastery_achieved": mastery_achieved,
+            }
+        )
 
         # Write placement_event row (best-effort).
         container: Any = ctx.container
@@ -821,7 +848,9 @@ async def run_placer_step(
             except Exception as exc:
                 logger.warning(
                     "placer_placement_event_write_failed concept=%s error=%s:%s",
-                    concept_id, type(exc).__name__, exc,
+                    concept_id,
+                    type(exc).__name__,
+                    exc,
                 )
 
             # If mastered, upsert aristotle_mastery (repetitions=3 so SM-2
@@ -847,12 +876,15 @@ async def run_placer_step(
                     await conn.commit()
                     logger.info(
                         "placer_mastery_upserted concept=%s score=%.2f",
-                        concept_id, score,
+                        concept_id,
+                        score,
                     )
                 except Exception as exc:
                     logger.warning(
                         "placer_mastery_upsert_failed concept=%s error=%s:%s",
-                        concept_id, type(exc).__name__, exc,
+                        concept_id,
+                        type(exc).__name__,
+                        exc,
                     )
 
         # Advance to the next concept.
@@ -867,7 +899,9 @@ async def run_placer_step(
             return {
                 "state": "COMPLETE",
                 "concepts_placed": len(session.results),
-                "concepts_known": sum(1 for r in session.results if r.get("mastery_achieved")),
+                "concepts_known": sum(
+                    1 for r in session.results if r.get("mastery_achieved")
+                ),
             }
 
         # More concepts to assess — generate the next question immediately
@@ -940,7 +974,8 @@ async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None
             )
             logger.info(
                 "placer_finalized plan=%s — all %d concepts mastered, plan complete",
-                session.plan_id, len(concept_ids),
+                session.plan_id,
+                len(concept_ids),
             )
         else:
             await conn.execute(
@@ -949,7 +984,8 @@ async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None
             )
             logger.info(
                 "placer_finalized plan=%s — starting at idx=%d (concept=%s)",
-                session.plan_id, starting_idx,
+                session.plan_id,
+                starting_idx,
                 concept_ids[starting_idx] if starting_idx < len(concept_ids) else "?",
             )
 
@@ -957,7 +993,9 @@ async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None
     except Exception as exc:
         logger.warning(
             "placer_finalize_failed plan=%s error=%s:%s",
-            session.plan_id, type(exc).__name__, exc,
+            session.plan_id,
+            type(exc).__name__,
+            exc,
         )
 
 

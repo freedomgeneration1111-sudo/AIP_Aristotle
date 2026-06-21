@@ -2,6 +2,7 @@
 
 Run: pytest tests/test_teacher_dashboard.py -v
 """
+
 from __future__ import annotations
 
 import warnings
@@ -80,10 +81,12 @@ async def test_session_history_route_returns_sessions_list():
     """Mock DB to return 2 grouped rows. GET /aristotle/session-history."""
     from aristotle.api import session_history_route
 
-    conn = _FakeConn(rows=[
-        ("sess-1", "c1", 5, "2026-01-01T10:00:00", "2026-01-01T10:30:00", 3, 1, 1),
-        ("sess-2", "c2", 3, "2026-01-02T14:00:00", "2026-01-02T14:15:00", 2, 1, 0),
-    ])
+    conn = _FakeConn(
+        rows=[
+            ("sess-1", "c1", 5, "2026-01-01T10:00:00", "2026-01-01T10:30:00", 3, 1, 1),
+            ("sess-2", "c2", 3, "2026-01-02T14:00:00", "2026-01-02T14:15:00", 2, 1, 0),
+        ]
+    )
     container = _make_container(conn)
     request = _make_request(container)
 

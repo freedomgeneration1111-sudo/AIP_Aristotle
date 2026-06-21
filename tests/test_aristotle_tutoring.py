@@ -11,6 +11,7 @@ Also tests:
 
 Run:  pytest tests/test_aristotle_tutoring.py -v
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from aip.foundation.protocols.actors import ActorContext, ActorResult
+from aip.foundation.protocols.actors import ActorContext
 from aristotle.actors import ExaminerActor, MentorActor, SocratesActor
 from aristotle.sm2 import SM2State, is_due, score_to_quality, update_sm2
 
@@ -95,10 +96,14 @@ def _make_ctx(
     stores: Any | None = None,
 ) -> ActorContext:
     """Build a minimal ActorContext for testing."""
-    container = type("C", (), {
-        "model_provider": model_provider,
-        "corpus_registry": _FakeRegistry(stores) if stores else None,
-    })()
+    container = type(
+        "C",
+        (),
+        {
+            "model_provider": model_provider,
+            "corpus_registry": _FakeRegistry(stores) if stores else None,
+        },
+    )()
     return ActorContext(
         container=container,
         config=config,
@@ -184,8 +189,10 @@ class TestSM2Algorithm:
         for independent recall).
         """
         from aristotle.sm2 import mastery_probability
-        p = mastery_probability(repetitions=3, hint_assisted_correct=0,
-                                transfer_correct=0, slip_count=0)
+
+        p = mastery_probability(
+            repetitions=3, hint_assisted_correct=0, transfer_correct=0, slip_count=0
+        )
         assert p == 1.0
 
     def test_mastery_probability_penalizes_slips(self):
@@ -195,6 +202,7 @@ class TestSM2Algorithm:
         mastery. The slip_rate penalty reduces the probability.
         """
         from aristotle.sm2 import mastery_probability
+
         p_no_slip = mastery_probability(repetitions=4, slip_count=0)
         p_with_slip = mastery_probability(repetitions=4, slip_count=2)
         assert p_with_slip < p_no_slip
@@ -212,6 +220,7 @@ class TestSM2Algorithm:
         but not to 1.0.
         """
         from aristotle.sm2 import mastery_probability
+
         # With 2 reps + 0 transfer: (2 + 0) / 2 = 1.0
         # With 2 reps + 1 transfer: (2 + 1.5) / 2 = 1.75 → clamped to 1.0
         # Both clamp to 1.0, so test with a scenario where the boost is
@@ -220,8 +229,12 @@ class TestSM2Algorithm:
         # 3 reps + 0 transfer + 2 slips = (3/3) - 0.15*(2/3) = 1.0 - 0.1 = 0.9
         # 3 reps + 1 transfer + 2 slips = (3 + 1.5)/3 - 0.1 = 1.5 - 0.1 = 1.4 → 1.0
         # The transfer bonus offsets the slip penalty:
-        p_no_transfer = mastery_probability(repetitions=3, transfer_correct=0, slip_count=2)
-        p_with_transfer = mastery_probability(repetitions=3, transfer_correct=1, slip_count=2)
+        p_no_transfer = mastery_probability(
+            repetitions=3, transfer_correct=0, slip_count=2
+        )
+        p_with_transfer = mastery_probability(
+            repetitions=3, transfer_correct=1, slip_count=2
+        )
         assert p_with_transfer > p_no_transfer, (
             f"transfer bonus should boost probability: "
             f"no_transfer={p_no_transfer}, with_transfer={p_with_transfer}"
@@ -277,7 +290,9 @@ class TestSocratesTeach:
         We verify the system prompt sent to the model includes the
         'full worked example' fading instruction.
         """
-        fake = _FakeModelProvider(responses={"beast": "Here is a full worked example..."})
+        fake = _FakeModelProvider(
+            responses={"beast": "Here is a full worked example..."}
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         socrates = SocratesActor()
@@ -312,7 +327,9 @@ class TestSocratesTeach:
         Phase B.5 (ADR-002 §4): level 3+ (near-mastered) → no worked
         example, focus on depth and nuance.
         """
-        fake = _FakeModelProvider(responses={"beast": "Here is a conceptual deep-dive..."})
+        fake = _FakeModelProvider(
+            responses={"beast": "Here is a conceptual deep-dive..."}
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         socrates = SocratesActor()
@@ -321,7 +338,9 @@ class TestSocratesTeach:
         assert result.data["fading_mode"] == "conceptual_only"
         system_msg = fake.calls[0][1][0]["content"]
         assert "conceptual explanation only" in system_msg.lower()
-        assert "worked example" not in system_msg.lower().replace("do not include a worked example", "")
+        assert "worked example" not in system_msg.lower().replace(
+            "do not include a worked example", ""
+        )
 
     @pytest.mark.asyncio
     async def test_teach_defaults_to_level_0_for_new_concept(self):
@@ -368,7 +387,9 @@ class TestSocratesPredict:
         # predict() does NOT need a model provider (unlike teach()) — it's a
         # fixed template. Provide one anyway to confirm it's not called.
         fake = _FakeModelProvider()
-        conn = _FakeConn(rows=[("c1", "Newton's First Law", None, "content", None, None, None, 3)])
+        conn = _FakeConn(
+            rows=[("c1", "Newton's First Law", None, "content", None, None, None, 3)]
+        )
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         socrates = SocratesActor()
         result = await socrates.predict(ctx, "c1")
@@ -413,11 +434,14 @@ class TestSocratesPredict:
         assert result.ok
         prompt = result.data["prompt"].lower()
         # Warm framing — at least one of these phrases should appear
-        assert any(phrase in prompt for phrase in [
-            "wrong guess is fine",
-            "just say what comes to mind",
-            "what do you think",
-        ]), f"prompt should use warm framing, got: {result.data['prompt']}"
+        assert any(
+            phrase in prompt
+            for phrase in [
+                "wrong guess is fine",
+                "just say what comes to mind",
+                "what do you think",
+            ]
+        ), f"prompt should use warm framing, got: {result.data['prompt']}"
 
 
 # --------------------------------------------------------------------------
@@ -436,7 +460,9 @@ class TestExaminerMethods:
 
     @pytest.mark.asyncio
     async def test_probe_calls_evaluation_slot(self):
-        fake = _FakeModelProvider(responses={"evaluation": "Explain inertia in your own words."})
+        fake = _FakeModelProvider(
+            responses={"evaluation": "Explain inertia in your own words."}
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
@@ -450,7 +476,9 @@ class TestExaminerMethods:
 
     @pytest.mark.asyncio
     async def test_quiz_calls_evaluation_slot(self):
-        fake = _FakeModelProvider(responses={"evaluation": "What is the SI unit of force?"})
+        fake = _FakeModelProvider(
+            responses={"evaluation": "What is the SI unit of force?"}
+        )
         conn = _FakeConn(rows=[("c1", "Force", None, "content", None, None, None, 4)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
@@ -463,12 +491,16 @@ class TestExaminerMethods:
     @pytest.mark.asyncio
     async def test_evaluate_returns_json(self):
         """evaluate() returns ok=True with data dict (Phase B.5: data, not error-as-payload)."""
-        eval_json = json.dumps({"score": 0.8, "mastery_achieved": True, "feedback": "Good"})
+        eval_json = json.dumps(
+            {"score": 0.8, "mastery_achieved": True, "feedback": "Good"}
+        )
         fake = _FakeModelProvider(responses={"evaluation": eval_json})
         conn = _FakeConn(rows=[("c1", "Force", None, "content", None, None, None, 4)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
-        result = await examiner.evaluate(ctx, "c1", "1 Newton", "What is the SI unit of force?")
+        result = await examiner.evaluate(
+            ctx, "c1", "1 Newton", "What is the SI unit of force?"
+        )
         assert result.ok
         # Phase B.5: read from result.data (not result.error)
         assert result.data is not None
@@ -487,21 +519,25 @@ class TestExaminerMethods:
         The fake model returns the full schema; we verify the data field
         carries it through + all three keys are present.
         """
-        eval_json = json.dumps({
-            "score": 0.3,
-            "mastery_achieved": False,
-            "feedback": "Not quite — see diagnosis.",
-            "diagnosis": {
-                "misconception": "You seem to think a force is needed to sustain motion",
-                "why_wrong": "Objects keep moving on their own — force changes motion, not sustains it",
-                "corrective": "No force is needed to keep something moving; force changes motion",
-            },
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.3,
+                "mastery_achieved": False,
+                "feedback": "Not quite — see diagnosis.",
+                "diagnosis": {
+                    "misconception": "You seem to think a force is needed to sustain motion",
+                    "why_wrong": "Objects keep moving on their own — force changes motion, not sustains it",
+                    "corrective": "No force is needed to keep something moving; force changes motion",
+                },
+            }
+        )
         fake = _FakeModelProvider(responses={"evaluation": eval_json})
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
-        result = await examiner.evaluate(ctx, "c1", "a force keeps it going", "What is inertia?")
+        result = await examiner.evaluate(
+            ctx, "c1", "a force keeps it going", "What is inertia?"
+        )
         assert result.ok
         assert result.data is not None
         assert result.data["score"] == 0.3
@@ -524,17 +560,21 @@ class TestExaminerMethods:
         learner masters the concept, diagnosis is None + feedback names
         why the answer was right.
         """
-        eval_json = json.dumps({
-            "score": 0.9,
-            "mastery_achieved": True,
-            "feedback": "Exactly — you identified that inertia resists change in motion.",
-            "diagnosis": None,
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Exactly — you identified that inertia resists change in motion.",
+                "diagnosis": None,
+            }
+        )
         fake = _FakeModelProvider(responses={"evaluation": eval_json})
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
-        result = await examiner.evaluate(ctx, "c1", "objects resist changes in motion", "What is inertia?")
+        result = await examiner.evaluate(
+            ctx, "c1", "objects resist changes in motion", "What is inertia?"
+        )
         assert result.ok
         assert result.data is not None
         assert result.data["mastery_achieved"] is True
@@ -565,9 +605,11 @@ class TestExaminerHints:
         returns a canned hint; we verify the data field is used + the hint
         is non-empty.
         """
-        fake = _FakeModelProvider(responses={
-            "evaluation": "Think about what happens to a passenger when a bus brakes suddenly.",
-        })
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": "Think about what happens to a passenger when a bus brakes suddenly.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
@@ -591,9 +633,11 @@ class TestExaminerHints:
         still preserves some effort. We verify the data field is used +
         the system prompt sent to the model mentions 'STRONGER HINT'.
         """
-        fake = _FakeModelProvider(responses={
-            "evaluation": "The answer relates to inertia — objects tend to keep doing what they're doing unless a force acts on them. What's the specific term?",
-        })
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": "The answer relates to inertia — objects tend to keep doing what they're doing unless a force acts on them. What's the specific term?",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
@@ -647,7 +691,9 @@ class TestMentorUpdate:
 
     @pytest.mark.asyncio
     async def test_update_calls_sexton_slot(self):
-        fake = _FakeModelProvider(responses={"sexton": "Learner struggles with vector decomposition."})
+        fake = _FakeModelProvider(
+            responses={"sexton": "Learner struggles with vector decomposition."}
+        )
         conn = _FakeConn(rows=[("old pattern",)])  # existing pattern
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         mentor = MentorActor()
@@ -694,7 +740,9 @@ class TestExaminerQuizTransfer:
         The system prompt should mention 'RECOGNITION' — a definition/
         identification check, not an application scenario.
         """
-        fake = _FakeModelProvider(responses={"evaluation": "What is Newton's First Law?"})
+        fake = _FakeModelProvider(
+            responses={"evaluation": "What is Newton's First Law?"}
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
@@ -711,7 +759,9 @@ class TestExaminerQuizTransfer:
         The system prompt should mention 'TRANSFER' + 'NEW situation' —
         an application scenario, not a definition check.
         """
-        fake = _FakeModelProvider(responses={"evaluation": "A spacecraft is coasting..."})
+        fake = _FakeModelProvider(
+            responses={"evaluation": "A spacecraft is coasting..."}
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         examiner = ExaminerActor()
@@ -735,6 +785,7 @@ class TestExaminerQuizTransfer:
 
         class _RoutingConn:
             """Fake conn that returns different rows based on the SQL query."""
+
             def __init__(self):
                 self._executed = []
 
@@ -745,22 +796,31 @@ class TestExaminerQuizTransfer:
                     return _FakeCursor([(3,)])
                 else:
                     # concept query → return 8-column concept row
-                    return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+                    return _FakeCursor(
+                        [("c1", "Inertia", None, "content", None, None, None, 3)]
+                    )
 
             async def commit(self):
                 pass
 
         conn = _RoutingConn()
-        fake = _FakeModelProvider(responses={
-            "evaluation": "A spacecraft is coasting through space...",
-        })
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": "A spacecraft is coasting through space...",
+            }
+        )
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -771,7 +831,8 @@ class TestExaminerQuizTransfer:
         assert session.last_question_type == "transfer"
         # And issued an UPDATE on transfer_attempted
         update_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "transfer_attempted" in sql and "UPDATE" in sql.upper()
         ]
         assert len(update_calls) == 1, "expected one UPDATE on transfer_attempted"
@@ -795,24 +856,40 @@ class TestExaminerQuizTransfer:
                 if "repetitions" in sql.lower():
                     return _FakeCursor([(3,)])
                 else:
-                    return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+                    return _FakeCursor(
+                        [("c1", "Inertia", None, "content", None, None, None, 3)]
+                    )
 
             async def commit(self):
                 pass
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
         conn = _RoutingConn()
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-            "sexton": "Learner does well.",
-        })
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+                "sexton": "Learner does well.",
+            }
+        )
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -828,7 +905,8 @@ class TestExaminerQuizTransfer:
         assert session.state == SessionState.NEXT_CONCEPT  # correct → next concept
         # The coordinator should have issued an UPDATE on transfer_correct
         update_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "transfer_correct" in sql and "UPDATE" in sql.upper()
         ]
         assert len(update_calls) == 1, "expected one UPDATE on transfer_correct"
@@ -864,7 +942,10 @@ class TestMentorLogMisconception:
             "corrective": "Force changes motion, not sustains it",
         }
         result = await mentor.log_misconception(
-            ctx, concept_id="c1", session_id="sess-1", diagnosis=diagnosis,
+            ctx,
+            concept_id="c1",
+            session_id="sess-1",
+            diagnosis=diagnosis,
         )
         assert result.ok
         # data confirms the write
@@ -873,10 +954,13 @@ class TestMentorLogMisconception:
         assert result.data["concept_id"] == "c1"
         # The INSERT was executed on the fake conn
         insert_calls = [
-            (sql, params) for sql, params in conn._executed
+            (sql, params)
+            for sql, params in conn._executed
             if "INSERT INTO aristotle_misconception_log" in sql
         ]
-        assert len(insert_calls) == 1, "expected one INSERT into aristotle_misconception_log"
+        assert len(insert_calls) == 1, (
+            "expected one INSERT into aristotle_misconception_log"
+        )
         sql, params = insert_calls[0]
         # params: (session_id, concept_id, misconception_text, corrective_text)
         assert params[0] == "sess-1"
@@ -893,9 +977,11 @@ class TestMentorLogMisconception:
         than the analytics row. The error is logged at WARNING for
         observability + ok=True is returned with data.logged=False.
         """
+
         class _ExplodingConn:
             async def execute(self, sql, params=()):
                 raise RuntimeError("simulated DB failure")
+
             async def commit(self):
                 pass
 
@@ -906,11 +992,16 @@ class TestMentorLogMisconception:
             async def get_stores(self, corpus_id, **kwargs):
                 return _ExplodingStores()
 
-        container = type("C", (), {
-            "corpus_registry": _ExplodingRegistry(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "corpus_registry": _ExplodingRegistry(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -921,7 +1012,10 @@ class TestMentorLogMisconception:
             "corrective": "some corrective",
         }
         result = await mentor.log_misconception(
-            ctx, concept_id="c1", session_id="sess-1", diagnosis=diagnosis,
+            ctx,
+            concept_id="c1",
+            session_id="sess-1",
+            diagnosis=diagnosis,
         )
         # ok MUST be True — best-effort never breaks the session
         assert result.ok
@@ -945,13 +1039,17 @@ class TestMentorLogMisconception:
         # Partial diagnosis — only 'misconception' present
         diagnosis = {"misconception": "partial thought", "why_wrong": "partial why"}
         result = await mentor.log_misconception(
-            ctx, concept_id="c1", session_id="sess-1", diagnosis=diagnosis,
+            ctx,
+            concept_id="c1",
+            session_id="sess-1",
+            diagnosis=diagnosis,
         )
         assert result.ok
         assert result.data["logged"] is True
         # The INSERT should have empty string for the missing corrective
         insert_calls = [
-            (sql, params) for sql, params in conn._executed
+            (sql, params)
+            for sql, params in conn._executed
             if "INSERT INTO aristotle_misconception_log" in sql
         ]
         assert len(insert_calls) == 1
@@ -976,14 +1074,17 @@ class TestMentorPatternRecognition:
     @pytest.mark.asyncio
     async def test_mentor_synthesize_pattern_returns_pattern_string(self):
         """synthesize_struggle_pattern() returns ok=True with data.pattern as a string."""
-        fake = _FakeModelProvider(responses={
-            "mentor": "The learner consistently confuses force as a cause of motion rather than a change in motion.",
-        })
+        fake = _FakeModelProvider(
+            responses={
+                "mentor": "The learner consistently confuses force as a cause of motion rather than a change in motion.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         mentor = MentorActor()
         result = await mentor.synthesize_struggle_pattern(
-            ctx, "c1",
+            ctx,
+            "c1",
             ["thinks force sustains motion", "confuses inertia with friction"],
         )
         assert result.ok
@@ -1003,14 +1104,17 @@ class TestMentorPatternRecognition:
         generates a pattern — it just uses the concept_id as the name
         instead of the topic).
         """
-        fake = _FakeModelProvider(responses={
-            "mentor": "Some pattern sentence.",
-        })
+        fake = _FakeModelProvider(
+            responses={
+                "mentor": "Some pattern sentence.",
+            }
+        )
         conn = _FakeConn(rows=None)  # no concept row → concept_id used as name
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         mentor = MentorActor()
         result = await mentor.synthesize_struggle_pattern(
-            ctx, "nonexistent",
+            ctx,
+            "nonexistent",
             ["some misconception"],
         )
         assert result.ok
@@ -1024,6 +1128,7 @@ class TestMentorPatternRecognition:
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "COUNT(*)" in sql:
@@ -1033,6 +1138,7 @@ class TestMentorPatternRecognition:
                 if "topic" in sql.lower():
                     return _FakeCursor([("Inertia",)])
                 return _FakeCursor(None)
+
             async def commit(self):
                 pass
 
@@ -1042,7 +1148,8 @@ class TestMentorPatternRecognition:
         await _check_and_synthesize_pattern(ctx, "c1")
         # Should have issued an INSERT OR REPLACE into struggle_pattern
         insert_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
         ]
         assert len(insert_calls) == 1
@@ -1055,6 +1162,7 @@ class TestMentorPatternRecognition:
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "COUNT(*)" in sql:
@@ -1064,6 +1172,7 @@ class TestMentorPatternRecognition:
                 if "topic" in sql.lower():
                     return _FakeCursor([("Inertia",)])
                 return _FakeCursor(None)
+
             async def commit(self):
                 pass
 
@@ -1072,7 +1181,8 @@ class TestMentorPatternRecognition:
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         await _check_and_synthesize_pattern(ctx, "c1")
         insert_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
         ]
         assert len(insert_calls) == 1
@@ -1085,11 +1195,13 @@ class TestMentorPatternRecognition:
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "COUNT(*)" in sql:
                     return _FakeCursor([(4,)])  # count = 4 — NOT a multiple of 3
                 return _FakeCursor(None)
+
             async def commit(self):
                 pass
 
@@ -1099,7 +1211,8 @@ class TestMentorPatternRecognition:
         await _check_and_synthesize_pattern(ctx, "c1")
         # Should NOT have issued any INSERT OR REPLACE — count=4 is not a multiple of 3
         insert_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
         ]
         assert len(insert_calls) == 0
@@ -1112,11 +1225,13 @@ class TestMentorPatternRecognition:
         class _RoutingConn:
             def __init__(self):
                 self._executed = []
+
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
                 if "COUNT(*)" in sql:
                     return _FakeCursor([(2,)])  # count = 2 — below threshold
                 return _FakeCursor(None)
+
             async def commit(self):
                 pass
 
@@ -1125,7 +1240,8 @@ class TestMentorPatternRecognition:
         ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
         await _check_and_synthesize_pattern(ctx, "c1")
         insert_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "INSERT OR REPLACE INTO aristotle_struggle_pattern" in sql
         ]
         assert len(insert_calls) == 0
@@ -1158,22 +1274,29 @@ class TestSessionCoordinator:
         """run_session_step with state=TEACH advances to PROBE."""
         from aristotle.session import SessionContext, SessionState, run_session_step
 
-        fake = _FakeModelProvider(responses={
-            "beast": "Newton's First Law states...",
-            "evaluation": "Explain in your own words.",
-        })
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Newton's First Law states...",
+                "evaluation": "Explain in your own words.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         # The coordinator checks `container.extensions.registry` — provide a
         # non-None registry so it passes the availability check. The
         # coordinator then imports aristotle.actors directly (the actors are
         # stateless for Phase A), so the registry doesn't need real actors.
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1193,28 +1316,37 @@ class TestSessionCoordinator:
         """
         from aristotle.session import SessionContext, SessionState, run_session_step
 
-        eval_json = json.dumps({
-            "score": 0.3,
-            "mastery_achieved": False,
-            "feedback": "Not quite.",
-            "diagnosis": {
-                "misconception": "You seem to think a force is needed to sustain motion",
-                "why_wrong": "Objects keep moving on their own",
-                "corrective": "Force changes motion, not sustains it",
-            },
-        })
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-            "sexton": "Learner struggles with inertia.",
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.3,
+                "mastery_achieved": False,
+                "feedback": "Not quite.",
+                "diagnosis": {
+                    "misconception": "You seem to think a force is needed to sustain motion",
+                    "why_wrong": "Objects keep moving on their own",
+                    "corrective": "Force changes motion, not sustains it",
+                },
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+                "sexton": "Learner struggles with inertia.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1233,7 +1365,10 @@ class TestSessionCoordinator:
         assert "misconception" in session.last_diagnosis
         assert "why_wrong" in session.last_diagnosis
         assert "corrective" in session.last_diagnosis
-        assert session.last_diagnosis["misconception"] == "You seem to think a force is needed to sustain motion"
+        assert (
+            session.last_diagnosis["misconception"]
+            == "You seem to think a force is needed to sustain motion"
+        )
 
     @pytest.mark.asyncio
     async def test_session_logs_misconception_on_wrong_evaluate(self):
@@ -1248,28 +1383,37 @@ class TestSessionCoordinator:
         """
         from aristotle.session import SessionContext, SessionState, run_session_step
 
-        eval_json = json.dumps({
-            "score": 0.3,
-            "mastery_achieved": False,
-            "feedback": "Not quite.",
-            "diagnosis": {
-                "misconception": "You seem to think a force is needed to sustain motion",
-                "why_wrong": "Objects keep moving on their own",
-                "corrective": "Force changes motion, not sustains it",
-            },
-        })
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-            "sexton": "Learner struggles with inertia.",
-        })
+        eval_json = json.dumps(
+            {
+                "score": 0.3,
+                "mastery_achieved": False,
+                "feedback": "Not quite.",
+                "diagnosis": {
+                    "misconception": "You seem to think a force is needed to sustain motion",
+                    "why_wrong": "Objects keep moving on their own",
+                    "corrective": "Force changes motion, not sustains it",
+                },
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+                "sexton": "Learner struggles with inertia.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1284,7 +1428,8 @@ class TestSessionCoordinator:
         assert result.ok
         # The misconception-log INSERT should have been issued on the fake conn
         insert_calls = [
-            sql for sql, _params in conn._executed
+            sql
+            for sql, _params in conn._executed
             if "INSERT INTO aristotle_misconception_log" in sql
         ]
         assert len(insert_calls) == 1, (
@@ -1303,19 +1448,28 @@ class TestSessionCoordinator:
         from aristotle.session import SessionContext, SessionState, run_session_step
 
         # Failing evaluation JSON (score 0.3 < 0.7 mastery_threshold)
-        eval_json = json.dumps({"score": 0.3, "mastery_achieved": False, "feedback": "Try again"})
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-            "sexton": "Learner struggles with inertia.",
-        })
+        eval_json = json.dumps(
+            {"score": 0.3, "mastery_achieved": False, "feedback": "Try again"}
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+                "sexton": "Learner struggles with inertia.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1348,19 +1502,28 @@ class TestSessionCoordinator:
         from aristotle.session import SessionContext, SessionState, run_session_step
 
         # Failing evaluation JSON for every re-evaluation
-        eval_json = json.dumps({"score": 0.3, "mastery_achieved": False, "feedback": "Try again"})
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-            "sexton": "Learner struggles with inertia.",
-        })
+        eval_json = json.dumps(
+            {"score": 0.3, "mastery_achieved": False, "feedback": "Try again"}
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+                "sexton": "Learner struggles with inertia.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake-registry-non-none"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1415,12 +1578,17 @@ class TestSessionCoordinator:
 
         class _RoutingConn:
             async def execute(self, sql, params=()):
-                if "aristotle_mastery" in sql.lower() and "next_review_at" in sql.lower():
+                if (
+                    "aristotle_mastery" in sql.lower()
+                    and "next_review_at" in sql.lower()
+                ):
                     # Due review concepts query → return 2 rows
-                    return _FakeCursor([
-                        ("review_1", 6, 0),
-                        ("review_2", 14, 0),
-                    ])
+                    return _FakeCursor(
+                        [
+                            ("review_1", 6, 0),
+                            ("review_2", 14, 0),
+                        ]
+                    )
                 return _FakeCursor(None)
 
             async def commit(self):
@@ -1459,13 +1627,18 @@ class TestSessionCoordinator:
 
         fake = _FakeModelProvider()
         conn = _FakeConn(rows=None)
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1495,20 +1668,27 @@ class TestSessionCoordinator:
 
         fake = _FakeModelProvider()
         conn = _FakeConn(rows=None)
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
         session = SessionContext(
             concept_id="last_concept",
             state=SessionState.NEXT_CONCEPT,
-            concept_queue=["last_concept"],  # only one concept — will be empty after pop
+            concept_queue=[
+                "last_concept"
+            ],  # only one concept — will be empty after pop
         )
         result = await run_session_step(ctx, session)
         assert result.ok
@@ -1532,13 +1712,18 @@ class TestSessionCoordinator:
 
         fake = _FakeModelProvider()
         conn = _FakeConn(rows=None)
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1567,7 +1752,14 @@ class TestSessionCoordinator:
         """
         from aristotle.session import SessionContext, SessionState, run_session_step
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Good", "diagnosis": None})
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
 
         class _RoutingConn:
             def __init__(self):
@@ -1577,23 +1769,32 @@ class TestSessionCoordinator:
                 self._executed.append((sql, params))
                 if "repetitions" in sql.lower():
                     return _FakeCursor([(3,)])
-                return _FakeCursor([("c1", "Inertia", None, "content", None, None, None, 3)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
 
             async def commit(self):
                 pass
 
         conn = _RoutingConn()
-        fake = _FakeModelProvider(responses={
-            "evaluation": eval_json,
-            "sexton": "Learner does well.",
-        })
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+                "sexton": "Learner does well.",
+            }
+        )
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1611,10 +1812,13 @@ class TestSessionCoordinator:
         assert "c1" not in session.cold_start_pending
         # An UPDATE setting cold_start_passed = 1 should have been issued
         update_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "cold_start_passed = 1" in sql and "UPDATE" in sql.upper()
         ]
-        assert len(update_calls) == 1, "expected one UPDATE setting cold_start_passed = 1"
+        assert len(update_calls) == 1, (
+            "expected one UPDATE setting cold_start_passed = 1"
+        )
 
     # ------------------------------------------------------------------
     # Phase D: plan executor bridge (plan_id on SessionContext)
@@ -1635,8 +1839,12 @@ class TestSessionCoordinator:
                 if "aristotle_learning_plan" in sql.lower():
                     # Plan: 3 concepts, current_idx=1 → primary = "c2"
                     import json as _json
+
                     return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 1, "active")])
-                if "aristotle_mastery" in sql.lower() and "next_review_at" in sql.lower():
+                if (
+                    "aristotle_mastery" in sql.lower()
+                    and "next_review_at" in sql.lower()
+                ):
                     return _FakeCursor(None)  # no due reviews
                 return _FakeCursor(None)
 
@@ -1646,7 +1854,9 @@ class TestSessionCoordinator:
         conn = _RoutingConn()
         ctx = _make_ctx(stores=_FakeStores(conn))
         # Caller passes "ignored_concept" but plan says primary is "c2"
-        queue, cold_start = await _build_concept_queue(ctx, "ignored_concept", plan_id="plan-1")
+        queue, cold_start = await _build_concept_queue(
+            ctx, "ignored_concept", plan_id="plan-1"
+        )
         assert queue[0] == "c2", f"primary should be c2 (from plan), got {queue[0]}"
         assert "ignored_concept" not in queue
 
@@ -1665,8 +1875,12 @@ class TestSessionCoordinator:
 
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
-                if "aristotle_learning_plan" in sql.lower() and "concept_ids_json" in sql.lower():
+                if (
+                    "aristotle_learning_plan" in sql.lower()
+                    and "concept_ids_json" in sql.lower()
+                ):
                     import json as _json
+
                     return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 0, "active")])
                 return _FakeCursor(None)
 
@@ -1675,13 +1889,18 @@ class TestSessionCoordinator:
 
         conn = _RoutingConn()
         fake = _FakeModelProvider()
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1695,7 +1914,8 @@ class TestSessionCoordinator:
         assert result.ok
         # The cursor should have been advanced — look for the UPDATE.
         update_calls = [
-            sql for sql, _ in conn._executed
+            sql
+            for sql, _ in conn._executed
             if "UPDATE aristotle_learning_plan SET current_concept_idx" in sql
         ]
         assert len(update_calls) == 1, "expected one UPDATE on current_concept_idx"
@@ -1716,10 +1936,17 @@ class TestSessionCoordinator:
 
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
-                if "aristotle_learning_plan" in sql.lower() and "concept_ids_json" in sql.lower():
+                if (
+                    "aristotle_learning_plan" in sql.lower()
+                    and "concept_ids_json" in sql.lower()
+                ):
                     import json as _json
+
                     return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 1, "active")])
-                if "aristotle_mastery" in sql.lower() and "next_review_at" in sql.lower():
+                if (
+                    "aristotle_mastery" in sql.lower()
+                    and "next_review_at" in sql.lower()
+                ):
                     return _FakeCursor(None)  # no due reviews
                 return _FakeCursor(None)
 
@@ -1728,13 +1955,18 @@ class TestSessionCoordinator:
 
         conn = _RoutingConn()
         fake = _FakeModelProvider()
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )
@@ -1770,9 +2002,15 @@ class TestSessionCoordinator:
 
             async def execute(self, sql, params=()):
                 self._executed.append((sql, params))
-                if "aristotle_learning_plan" in sql.lower() and "concept_ids_json" in sql.lower():
+                if (
+                    "aristotle_learning_plan" in sql.lower()
+                    and "concept_ids_json" in sql.lower()
+                ):
                     import json as _json
-                    return _FakeCursor([(_json.dumps(["c1", "c2", "c3"]), 3, "complete")])
+
+                    return _FakeCursor(
+                        [(_json.dumps(["c1", "c2", "c3"]), 3, "complete")]
+                    )
                 return _FakeCursor(None)
 
             async def commit(self):
@@ -1780,13 +2018,18 @@ class TestSessionCoordinator:
 
         conn = _RoutingConn()
         fake = _FakeModelProvider()
-        container = type("C", (), {
-            "model_provider": fake,
-            "corpus_registry": _FakeRegistry(_FakeStores(conn)),
-            "extensions": type("H", (), {"registry": "fake"})(),
-        })()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+                "extensions": type("H", (), {"registry": "fake"})(),
+            },
+        )()
         ctx = ActorContext(
-            container=container, config=None,
+            container=container,
+            config=None,
             logger=__import__("logging").getLogger("test"),
             cancel_event=asyncio.Event(),
         )

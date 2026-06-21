@@ -6,6 +6,7 @@ endpoint that runs the complete loop in one call).
 
 Run:  pytest tests/test_aristotle_cli_api.py -v
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aip.foundation.protocols.actors import ActorContext, ActorResult
+from aip.foundation.protocols.actors import ActorContext
 
 
 # --------------------------------------------------------------------------
@@ -45,7 +46,11 @@ class _FakeConn:
     consumes the next row-set from the list.
     """
 
-    def __init__(self, rows: list[tuple] | None = None, multi_rows: list[list[tuple]] | None = None):
+    def __init__(
+        self,
+        rows: list[tuple] | None = None,
+        multi_rows: list[list[tuple]] | None = None,
+    ):
         self._rows = rows or []
         self._multi_rows = multi_rows
         self._multi_idx = 0
@@ -99,11 +104,15 @@ def _make_container(
     stores: Any | None = None,
 ) -> Any:
     """Build a minimal container for testing."""
-    return type("C", (), {
-        "model_provider": model_provider,
-        "corpus_registry": _FakeRegistry(stores) if stores else None,
-        "extensions": type("H", (), {"registry": "fake"})(),
-    })()
+    return type(
+        "C",
+        (),
+        {
+            "model_provider": model_provider,
+            "corpus_registry": _FakeRegistry(stores) if stores else None,
+            "extensions": type("H", (), {"registry": "fake"})(),
+        },
+    )()
 
 
 def _make_ctx(container: Any) -> ActorContext:
@@ -127,21 +136,30 @@ class TestAPIRoutes:
     async def test_list_concepts_route(self):
         """GET /aristotle/concepts returns concepts from the corpus."""
         from aristotle.api import list_concepts_route
-        from aristotle.ingestor import list_concepts
 
         # Mock list_concepts to return canned data
-        conn = _FakeConn(rows=[
-            ("c1", "Inertia", None, 3, None),
-            ("c2", "Force", "c1", 4, None),
-        ])
+        conn = _FakeConn(
+            rows=[
+                ("c1", "Inertia", None, 3, None),
+                ("c2", "Force", "c1", 4, None),
+            ]
+        )
         container = _make_container(stores=_FakeStores(conn))
 
         # Build a fake Request
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-        })()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
 
         result = await list_concepts_route(request)
         assert isinstance(result, list)
@@ -166,16 +184,25 @@ class TestAPIRoutes:
         container = _make_container()
         body = {"concept_id": "newton_first_law"}
 
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-            "_json": body,
-        })()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+                "_json": body,
+            },
+        )()
 
         # Mock the json() method
         async def _json():
             return body
+
         request.json = _json
 
         result = await session_start_route(request)
@@ -187,10 +214,14 @@ class TestAPIRoutes:
         """POST /aristotle/session/run runs a full session with answers."""
         from aristotle.api import session_run_route
 
-        fake = _FakeModelProvider(responses={
-            "beast": "Newton's First Law states that an object at rest stays at rest...",
-            "evaluation": json.dumps({"score": 0.8, "mastery_achieved": True, "feedback": "Good"}),
-        })
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Newton's First Law states that an object at rest stays at rest...",
+                "evaluation": json.dumps(
+                    {"score": 0.8, "mastery_achieved": True, "feedback": "Good"}
+                ),
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         container = _make_container(
             model_provider=fake,
@@ -198,14 +229,23 @@ class TestAPIRoutes:
         )
         body = {"concept_id": "c1", "answers": ["objects resist changes in motion"]}
 
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-        })()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
 
         async def _json():
             return body
+
         request.json = _json
 
         result = await session_run_route(request)
@@ -229,12 +269,16 @@ class TestFullSession:
         """A session where the learner answers correctly ends with mastered=True."""
         from aristotle.session import SessionContext, SessionState, run_session_step
 
-        eval_json = json.dumps({"score": 0.9, "mastery_achieved": True, "feedback": "Excellent"})
-        fake = _FakeModelProvider(responses={
-            "beast": "Newton's First Law: an object at rest stays at rest unless acted on by a force.",
-            "evaluation": eval_json,
-            "sexton": "No struggles — learner grasps inertia well.",
-        })
+        eval_json = json.dumps(
+            {"score": 0.9, "mastery_achieved": True, "feedback": "Excellent"}
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Newton's First Law: an object at rest stays at rest unless acted on by a force.",
+                "evaluation": eval_json,
+                "sexton": "No struggles — learner grasps inertia well.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         container = _make_container(
             model_provider=fake,
@@ -252,7 +296,11 @@ class TestFullSession:
             # Provide student_input when the quiz question has been generated
             # (waiting for answer) and we have answers left
             student_input = ""
-            if session.state == SessionState.QUIZ and session.quiz_generated and answer_idx < len(answers):
+            if (
+                session.state == SessionState.QUIZ
+                and session.quiz_generated
+                and answer_idx < len(answers)
+            ):
                 student_input = answers[answer_idx]
                 answer_idx += 1
             result = await run_session_step(ctx, session, student_input)
@@ -267,12 +315,16 @@ class TestFullSession:
         """A session where the learner answers poorly triggers REMEDIATE."""
         from aristotle.session import SessionContext, SessionState, run_session_step
 
-        eval_json = json.dumps({"score": 0.3, "mastery_achieved": False, "feedback": "Try again"})
-        fake = _FakeModelProvider(responses={
-            "beast": "Let me explain differently...",
-            "evaluation": eval_json,
-            "sexton": "Learner struggles with the concept of inertia.",
-        })
+        eval_json = json.dumps(
+            {"score": 0.3, "mastery_achieved": False, "feedback": "Try again"}
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Let me explain differently...",
+                "evaluation": eval_json,
+                "sexton": "Learner struggles with the concept of inertia.",
+            }
+        )
         conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
         container = _make_container(
             model_provider=fake,
@@ -288,7 +340,11 @@ class TestFullSession:
             if session.state.value == "SESSION_COMPLETE":
                 break
             student_input = ""
-            if session.state == SessionState.QUIZ and session.quiz_generated and answer_idx < len(answers):
+            if (
+                session.state == SessionState.QUIZ
+                and session.quiz_generated
+                and answer_idx < len(answers)
+            ):
                 student_input = answers[answer_idx]
                 answer_idx += 1
             result = await run_session_step(ctx, session, student_input)
@@ -318,7 +374,14 @@ class TestCLI:
             mock_resp.raise_for_status = MagicMock()
             mock_resp.json.return_value = {
                 "host_running": True,
-                "extensions": [{"id": "aristotle", "version": "0.1.0", "state": "REGISTERED", "failures": []}],
+                "extensions": [
+                    {
+                        "id": "aristotle",
+                        "version": "0.1.0",
+                        "state": "REGISTERED",
+                        "failures": [],
+                    }
+                ],
             }
             mock_ctx = MagicMock()
             mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
@@ -341,7 +404,12 @@ class TestCLI:
             mock_resp = MagicMock()
             mock_resp.raise_for_status = MagicMock()
             mock_resp.json.return_value = [
-                {"id": "c1", "topic": "Inertia", "bloom_target": 3, "prerequisite_concept_id": None},
+                {
+                    "id": "c1",
+                    "topic": "Inertia",
+                    "bloom_target": 3,
+                    "prerequisite_concept_id": None,
+                },
             ]
             mock_ctx = MagicMock()
             mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
@@ -376,22 +444,40 @@ class TestDashboardRoute:
         #             query 2 = LEFT JOIN (fetchall, 2 rows)
         # Row format from LEFT JOIN:
         #   (concept_id, topic, mastered, last_score, repetitions, next_review_at, updated_at)
-        conn = _FakeConn(multi_rows=[
-            [],  # query 1: struggle_pattern (no row → None)
-            [
-                # concept 1: has mastery record (started, not mastered, due)
-                ("c1", "Inertia", 0, 0.4, 1, "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00"),
-                # concept 2: no mastery record (unstarted — all NULLs from LEFT JOIN)
-                ("c2", "Force", 0, None, 0, None, None),
-            ],
-        ])
+        conn = _FakeConn(
+            multi_rows=[
+                [],  # query 1: struggle_pattern (no row → None)
+                [
+                    # concept 1: has mastery record (started, not mastered, due)
+                    (
+                        "c1",
+                        "Inertia",
+                        0,
+                        0.4,
+                        1,
+                        "2020-01-01T00:00:00+00:00",
+                        "2020-01-01T00:00:00",
+                    ),
+                    # concept 2: no mastery record (unstarted — all NULLs from LEFT JOIN)
+                    ("c2", "Force", 0, None, 0, None, None),
+                ],
+            ]
+        )
         container = _make_container(stores=_FakeStores(conn))
 
-        request = type("R", (), {
-            "app": type("A", (), {
-                "state": type("S", (), {"container": container})(),
-            })(),
-        })()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
 
         result = await dashboard_route(request)
 

@@ -21,6 +21,7 @@ ARISTOTLE maps EXAMINER's score (0.0-1.0) to SM-2 quality (0-5) via:
 
 Layer: pure Python, no aip imports. Tested in isolation.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class SM2State:
 
     Persisted in the aristotle_mastery table.
     """
+
     easiness_factor: float = 2.5
     interval_days: int = 0
     repetitions: int = 0
@@ -178,9 +180,7 @@ def mastery_probability(
     unassisted_correct = max(0, repetitions - hint_assisted_correct)
 
     numerator = (
-        unassisted_correct
-        + 0.5 * hint_assisted_correct
-        + 1.5 * transfer_correct
+        unassisted_correct + 0.5 * hint_assisted_correct + 1.5 * transfer_correct
     )
     p = numerator / total_attempts
 

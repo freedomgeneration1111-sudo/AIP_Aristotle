@@ -12,6 +12,7 @@ actors themselves in isolation.
 
 Run:  CI=true uv run pytest tests/test_aristotle_actors.py -v
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from aip.foundation.protocols.actors import Actor, ActorContext, ActorResult
+from aip.foundation.protocols.actors import Actor, ActorContext
 
 
 # --------------------------------------------------------------------------
@@ -81,7 +82,9 @@ def test_all_three_actors_have_health():
 
     for actor_cls in [SocratesActor, ExaminerActor, MentorActor]:
         health = actor_cls().health()
-        assert isinstance(health, dict), f"{actor_cls.__name__}.health() must return dict"
+        assert isinstance(health, dict), (
+            f"{actor_cls.__name__}.health() must return dict"
+        )
         assert "state" in health, f"{actor_cls.__name__}.health() must include 'state'"
         assert "name" in health, f"{actor_cls.__name__}.health() must include 'name'"
 
@@ -117,6 +120,7 @@ class _FakeStores:
     def __init__(self, write_conn):
         class _CM:
             pass
+
         self.connection_manager = _CM()
         self.connection_manager.write_conn = write_conn
 
@@ -156,10 +160,16 @@ async def test_examiner_degrades_gracefully_without_model():
     from aristotle.actors import ExaminerActor
 
     # Container with corpus_registry but NO model_provider
-    container = type("C", (), {
-        "corpus_registry": _FakeRegistry(stores=_FakeStores(write_conn=_FakeConn())),
-        "model_provider": None,
-    })()
+    container = type(
+        "C",
+        (),
+        {
+            "corpus_registry": _FakeRegistry(
+                stores=_FakeStores(write_conn=_FakeConn())
+            ),
+            "model_provider": None,
+        },
+    )()
 
     actor = ExaminerActor()
     ctx = _make_ctx(container=container)
@@ -192,9 +202,13 @@ async def test_mentor_initializes_struggle_pattern_when_absent():
 
     # Empty table — fetchone returns None
     conn = _FakeConn(rows=None)
-    container = type("C", (), {
-        "corpus_registry": _FakeRegistry(stores=_FakeStores(write_conn=conn)),
-    })()
+    container = type(
+        "C",
+        (),
+        {
+            "corpus_registry": _FakeRegistry(stores=_FakeStores(write_conn=conn)),
+        },
+    )()
 
     actor = MentorActor()
     ctx = _make_ctx(container=container)
@@ -218,11 +232,17 @@ async def test_mentor_reads_existing_struggle_pattern():
     from aristotle.actors import MentorActor
 
     # Pre-seeded row — fetchone returns it
-    existing_pattern = "Learner struggles with abstraction — needs concrete examples first."
+    existing_pattern = (
+        "Learner struggles with abstraction — needs concrete examples first."
+    )
     conn = _FakeConn(rows=[(existing_pattern,)])
-    container = type("C", (), {
-        "corpus_registry": _FakeRegistry(stores=_FakeStores(write_conn=conn)),
-    })()
+    container = type(
+        "C",
+        (),
+        {
+            "corpus_registry": _FakeRegistry(stores=_FakeStores(write_conn=conn)),
+        },
+    )()
 
     actor = MentorActor()
     ctx = _make_ctx(container=container)
@@ -231,9 +251,7 @@ async def test_mentor_reads_existing_struggle_pattern():
     assert result.ok is True, f"MENTOR should succeed; error={result.error}"
 
     # Verify NO INSERT was executed (the row already exists)
-    insert_executed = any(
-        "INSERT" in sql.upper() for sql, _ in conn._executed
-    )
+    insert_executed = any("INSERT" in sql.upper() for sql, _ in conn._executed)
     assert not insert_executed, (
         f"MENTOR should NOT INSERT when a row exists; executed={conn._executed}"
     )
@@ -263,7 +281,13 @@ def test_aristotle_workflow_yaml_parses():
     """The tutoring_session_v1.yaml parses as valid YAML with the right structure."""
     import yaml
     from pathlib import Path
-    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+
+    workflow_path = (
+        Path(__file__).parent.parent
+        / "aristotle"
+        / "workflows"
+        / "tutoring_session_v1.yaml"
+    )
     with open(workflow_path) as f:
         wf = yaml.safe_load(f)
     assert wf["template_id"] == "tutoring_session_v1"
@@ -271,26 +295,56 @@ def test_aristotle_workflow_yaml_parses():
     assert "nodes" in wf
     assert len(wf["nodes"]) == 7, f"expected 7 nodes, got {len(wf['nodes'])}"
     node_ids = [n["id"] for n in wf["nodes"]]
-    assert node_ids == ["teach", "probe", "quiz", "evaluate", "check_mastery", "remediate", "next_concept"]
+    assert node_ids == [
+        "teach",
+        "probe",
+        "quiz",
+        "evaluate",
+        "check_mastery",
+        "remediate",
+        "next_concept",
+    ]
 
 
 def test_aristotle_workflow_uses_engine_compatible_node_types():
     """Every node type is one the L5 engine's loader accepts."""
     import yaml
     from pathlib import Path
-    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+
+    workflow_path = (
+        Path(__file__).parent.parent
+        / "aristotle"
+        / "workflows"
+        / "tutoring_session_v1.yaml"
+    )
     with open(workflow_path) as f:
         wf = yaml.safe_load(f)
-    allowed_types = {"script", "agent", "condition", "dialog", "parallel", "review", "re_synthesize"}
+    allowed_types = {
+        "script",
+        "agent",
+        "condition",
+        "dialog",
+        "parallel",
+        "review",
+        "re_synthesize",
+    }
     for node in wf["nodes"]:
-        assert node["type"] in allowed_types, f"Node {node['id']!r} has type {node['type']!r} not in {sorted(allowed_types)}"
+        assert node["type"] in allowed_types, (
+            f"Node {node['id']!r} has type {node['type']!r} not in {sorted(allowed_types)}"
+        )
 
 
 def test_aristotle_workflow_agent_nodes_have_model_slot():
     """Every agent node has a model_slot (required by the loader's AgentNode)."""
     import yaml
     from pathlib import Path
-    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+
+    workflow_path = (
+        Path(__file__).parent.parent
+        / "aristotle"
+        / "workflows"
+        / "tutoring_session_v1.yaml"
+    )
     with open(workflow_path) as f:
         wf = yaml.safe_load(f)
     agent_nodes = [n for n in wf["nodes"] if n["type"] == "agent"]
@@ -303,7 +357,13 @@ def test_aristotle_workflow_condition_node_has_branches():
     """The check_mastery condition node has next_on_true + next_on_false."""
     import yaml
     from pathlib import Path
-    workflow_path = Path(__file__).parent.parent / "aristotle" / "workflows" / "tutoring_session_v1.yaml"
+
+    workflow_path = (
+        Path(__file__).parent.parent
+        / "aristotle"
+        / "workflows"
+        / "tutoring_session_v1.yaml"
+    )
     with open(workflow_path) as f:
         wf = yaml.safe_load(f)
     condition_nodes = [n for n in wf["nodes"] if n["type"] == "condition"]

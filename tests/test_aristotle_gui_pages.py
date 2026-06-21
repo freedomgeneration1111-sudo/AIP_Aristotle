@@ -2,6 +2,7 @@
 
 Run: pytest tests/test_aristotle_gui_pages.py -v
 """
+
 from __future__ import annotations
 
 import warnings
@@ -22,6 +23,7 @@ def test_pages_module_importable():
     # The module uses try/except for Brain GUI imports — it should
     # import cleanly even without Brain's gui package present.
     import aristotle.gui.pages
+
     assert hasattr(aristotle.gui.pages, "aristotle_stats_page")
     assert hasattr(aristotle.gui.pages, "aristotle_map_page")
     assert hasattr(aristotle.gui.pages, "aristotle_settings_page")

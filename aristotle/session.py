@@ -21,6 +21,7 @@ Layer: imports from aip.foundation.protocols.actors only (ActorContext).
 Accesses the actors via the container (ctx.container.extensions.registry).
 No aip.adapter or aip.orchestration imports.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -47,6 +48,7 @@ class SessionState(str, Enum):
       hint_assisted_correct++ on aristotle_mastery, then NEXT_CONCEPT.
       Still wrong after HINT_2 → REMEDIATE.
     """
+
     PREDICT = "PREDICT"
     TEACH = "TEACH"
     PROBE = "PROBE"
@@ -75,6 +77,7 @@ class SessionContext:
     current HINT_1/HINT_2 step has generated its hint (phase 1 done,
     waiting for learner's re-answer in phase 2).
     """
+
     student_id: str = "definer"
     concept_id: str = ""
     # Phase B.5: default initial state is PREDICT (was TEACH).
@@ -85,7 +88,9 @@ class SessionContext:
     last_probe_question: str = ""
     last_quiz_question: str = ""
     last_student_answer: str = ""
-    last_evaluation: str = ""  # JSON from EXAMINER.evaluate() (legacy — kept for backward compat)
+    last_evaluation: str = (
+        ""  # JSON from EXAMINER.evaluate() (legacy — kept for backward compat)
+    )
     last_score: float = 0.0
     mastered: bool = False
     # Phase B.5 (transfer questions): the type of the last quiz question.
@@ -226,9 +231,13 @@ async def run_session_step(
     elif session.state == SessionState.EVALUATE:
         return await _step_evaluate(ctx, session, examiner, mentor)
     elif session.state == SessionState.HINT_1:
-        return await _step_hint(ctx, session, examiner, mentor, student_input, hint_rung=1)
+        return await _step_hint(
+            ctx, session, examiner, mentor, student_input, hint_rung=1
+        )
     elif session.state == SessionState.HINT_2:
-        return await _step_hint(ctx, session, examiner, mentor, student_input, hint_rung=2)
+        return await _step_hint(
+            ctx, session, examiner, mentor, student_input, hint_rung=2
+        )
     elif session.state == SessionState.REMEDIATE:
         return await _step_remediate(ctx, session, socrates, mentor)
     elif session.state == SessionState.NEXT_CONCEPT:
@@ -257,18 +266,38 @@ def _classify_student_input(text: str) -> str:
     if stripped.endswith("?"):
         return "QUESTION"
     question_starters = (
-        "what ", "why ", "how ", "when ", "where ", "who ",
-        "could you", "can you", "would you", "explain ",
-        "tell me", "describe ", "define ", "what's", "how's",
+        "what ",
+        "why ",
+        "how ",
+        "when ",
+        "where ",
+        "who ",
+        "could you",
+        "can you",
+        "would you",
+        "explain ",
+        "tell me",
+        "describe ",
+        "define ",
+        "what's",
+        "how's",
     )
     if any(lower.startswith(s) for s in question_starters):
         return "QUESTION"
 
     # TANGENT signals
     tangent_markers = (
-        "what about", "but what", "wait,", "wait —", "actually,",
-        "actually —", "but ", "hold on", "i was thinking",
-        "speaking of", "that reminds me",
+        "what about",
+        "but what",
+        "wait,",
+        "wait —",
+        "actually,",
+        "actually —",
+        "but ",
+        "hold on",
+        "i was thinking",
+        "speaking of",
+        "that reminds me",
     )
     if any(lower.startswith(m) for m in tangent_markers):
         return "TANGENT"
@@ -277,13 +306,25 @@ def _classify_student_input(text: str) -> str:
     word_count = len(stripped.split())
     if word_count <= 4:
         social_words = (
-            "ok", "okay", "cool", "thanks", "got it", "yes",
-            "no", "sure", "right", "hmm", "interesting",
-            "i see", "makes sense", "understood",
+            "ok",
+            "okay",
+            "cool",
+            "thanks",
+            "got it",
+            "yes",
+            "no",
+            "sure",
+            "right",
+            "hmm",
+            "interesting",
+            "i see",
+            "makes sense",
+            "understood",
         )
-        if any(lower == s or lower.startswith(s + " ") or
-               lower.startswith(s + ",")
-               for s in social_words):
+        if any(
+            lower == s or lower.startswith(s + " ") or lower.startswith(s + ",")
+            for s in social_words
+        ):
             return "CHAT"
 
     return "ANSWER"
@@ -306,7 +347,9 @@ async def _step_curiosity(
 
     model_provider = getattr(container, "model_provider", None)
     if model_provider is None:
-        return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+        return ActorResult(
+            ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
+        )
 
     concept_context = ""
     if session.concept_id:
@@ -319,10 +362,7 @@ async def _step_curiosity(
         "you're studying, make that connection. Keep the response "
         "conversational and under 150 words."
     )
-    user_prompt = (
-        f"{concept_context}"
-        f"The student asked: {student_input}"
-    )
+    user_prompt = f"{concept_context}The student asked: {student_input}"
 
     try:
         result = await model_provider.call(
@@ -339,8 +379,7 @@ async def _step_curiosity(
 
     # Soft weave-back offer — never forces return.
     weave_back = (
-        "\n\nWant to keep exploring this, or shall we continue "
-        "where we left off?"
+        "\n\nWant to keep exploring this, or shall we continue where we left off?"
     )
     full_response = response_text + weave_back
 
@@ -349,7 +388,9 @@ async def _step_curiosity(
 
     logger.info(
         "curiosity_path concept=%s intent=%s response_len=%d",
-        session.concept_id, intent_class, len(full_response),
+        session.concept_id,
+        intent_class,
+        len(full_response),
     )
 
     # Session state is NOT advanced — the student stays at the same phase.
@@ -374,7 +415,9 @@ async def _step_chat(
 
     model_provider = getattr(container, "model_provider", None)
     if model_provider is None:
-        return ActorResult(ok=False, error="NEEDS_CONFIGURATION: model_provider not available")
+        return ActorResult(
+            ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
+        )
 
     system_prompt = (
         "You are Aristotle — a warm, patient tutor. The student sent a "
@@ -396,7 +439,9 @@ async def _step_chat(
         logger.warning("chat_model_failed error=%s:%s", type(exc).__name__, exc)
         return ActorResult(ok=False, error=f"model call failed: {exc}")
 
-    logger.info("chat_path concept=%s response_len=%d", session.concept_id, len(response_text))
+    logger.info(
+        "chat_path concept=%s response_len=%d", session.concept_id, len(response_text)
+    )
 
     return ActorResult(
         ok=True,
@@ -442,7 +487,9 @@ async def _log_curiosity_event(
     except Exception as exc:
         logger.warning(
             "curiosity_log_failed concept=%s error=%s:%s",
-            session.concept_id, type(exc).__name__, exc,
+            session.concept_id,
+            type(exc).__name__,
+            exc,
         )
 
 
@@ -508,7 +555,8 @@ async def _step_predict(
         session.state = SessionState.TEACH
         logger.info(
             "session_step_predict_record concept=%s prediction_len=%d",
-            session.concept_id, len(session.last_prediction),
+            session.concept_id,
+            len(session.last_prediction),
         )
         return ActorResult(
             ok=True,
@@ -543,7 +591,9 @@ async def _log_predict_event(ctx: ActorContext, session: SessionContext) -> None
         # for the tutoring loop's control flow.
         ctx.logger.warning(
             "session_predict_log_failed concept=%s error=%s:%s",
-            session.concept_id, type(exc).__name__, exc,
+            session.concept_id,
+            type(exc).__name__,
+            exc,
         )
 
 
@@ -556,6 +606,7 @@ def _derive_session_id(session: SessionContext) -> str:
     aristotle_intake_session table.
     """
     from datetime import datetime, timezone
+
     return f"{session.student_id}:{session.concept_id}:{datetime.now(timezone.utc).isoformat()}"
 
 
@@ -633,7 +684,9 @@ async def _build_concept_queue(
 
     # Phase D: if plan_id is set, read the plan to determine the primary concept.
     actual_primary = primary_concept_id
-    plan_concept_set = None  # None = no plan filtering (all concepts eligible for review)
+    plan_concept_set = (
+        None  # None = no plan filtering (all concepts eligible for review)
+    )
     if plan_id:
         try:
             stores = await registry.get_stores("aristotle:textbook")
@@ -647,6 +700,7 @@ async def _build_concept_queue(
             await cur.close()
             if row is not None:
                 import json as _json
+
                 concept_ids = _json.loads(row[0]) if row[0] else []
                 current_idx = row[1] if row[1] is not None else 0
                 plan_status = row[2] if row[2] is not None else "active"
@@ -686,7 +740,10 @@ async def _build_concept_queue(
         for row in rows:
             review_concept_id = row[0]
             # Phase D: if a plan is attached, filter reviews to plan concepts only.
-            if plan_concept_set is not None and review_concept_id not in plan_concept_set:
+            if (
+                plan_concept_set is not None
+                and review_concept_id not in plan_concept_set
+            ):
                 continue
             interval_days = row[1] if row[1] is not None else 0
             cold_start_passed = row[2] if row[2] is not None else 0
@@ -727,6 +784,7 @@ async def _advance_plan_cursor(ctx: ActorContext, plan_id: str) -> None:
             return
 
         import json as _json
+
         concept_ids = _json.loads(row[0]) if row[0] else []
         current_idx = row[1] if row[1] is not None else 0
         new_idx = current_idx + 1
@@ -769,8 +827,13 @@ async def _increment_mastery_column(
         conn = stores.connection_manager.write_conn
         # parameterized column name isn't supported in SQL — validate
         # against a whitelist to prevent injection.
-        allowed = {"transfer_attempted", "transfer_correct", "hint_assisted_correct",
-                   "slip_count", "cold_start_passed"}
+        allowed = {
+            "transfer_attempted",
+            "transfer_correct",
+            "hint_assisted_correct",
+            "slip_count",
+            "cold_start_passed",
+        }
         if column_name not in allowed:
             return
         await conn.execute(
@@ -783,9 +846,7 @@ async def _increment_mastery_column(
         pass  # best-effort — analytics counter, never block the session
 
 
-async def _check_and_synthesize_pattern(
-    ctx: ActorContext, concept_id: str
-) -> None:
+async def _check_and_synthesize_pattern(ctx: ActorContext, concept_id: str) -> None:
     """Check if pattern synthesis should fire + synthesize if so (ADR-002 §7).
 
     Fires when the misconception count for a concept is a multiple of 3
@@ -838,9 +899,12 @@ async def _check_and_synthesize_pattern(
 
         # Call MENTOR to synthesize the pattern.
         from aristotle.actors.mentor import MentorActor
+
         mentor = MentorActor()
         result = await mentor.synthesize_struggle_pattern(
-            ctx, concept_id, misconceptions,
+            ctx,
+            concept_id,
+            misconceptions,
         )
 
         pattern = ""
@@ -850,7 +914,8 @@ async def _check_and_synthesize_pattern(
         if not pattern:
             logger.info(
                 "session_pattern_synthesize_empty concept=%s count=%d",
-                concept_id, count,
+                concept_id,
+                count,
             )
             return
 
@@ -868,12 +933,16 @@ async def _check_and_synthesize_pattern(
         await conn.commit()
         logger.info(
             "session_pattern_synthesized concept=%s count=%d pattern_len=%d",
-            concept_id, count, len(pattern),
+            concept_id,
+            count,
+            len(pattern),
         )
     except Exception as exc:
         logger.warning(
             "session_pattern_synthesize_failed concept=%s error=%s:%s",
-            concept_id, type(exc).__name__, exc,
+            concept_id,
+            type(exc).__name__,
+            exc,
         )
 
 
@@ -905,7 +974,8 @@ async def _step_teach(
         session.state = SessionState.PROBE
         logger.info(
             "session_step_teach concept=%s mastery_level=%d",
-            session.concept_id, mastery_level,
+            session.concept_id,
+            mastery_level,
         )
     return result
 
@@ -923,7 +993,11 @@ async def _step_probe(
     logger = ctx.logger
 
     # If the probe question was already generated, record the student's answer
-    if session.probe_generated and session.student_input if hasattr(session, 'student_input') else False:
+    if (
+        session.probe_generated and session.student_input
+        if hasattr(session, "student_input")
+        else False
+    ):
         pass  # This path is handled by the caller passing student_input to the next step
 
     result = await examiner.probe(ctx, session.concept_id)
@@ -973,12 +1047,16 @@ async def _step_quiz(
             question_type = "recognition"
 
         # Phase 1: generate the quiz question
-        result = await examiner.quiz(ctx, session.concept_id, question_type=question_type)
+        result = await examiner.quiz(
+            ctx, session.concept_id, question_type=question_type
+        )
         if result.ok:
             # Phase B.5: read from result.data (not error-as-payload).
             if result.data is not None and isinstance(result.data, dict):
                 session.last_quiz_question = result.data.get("question", "")
-                session.last_question_type = result.data.get("question_type", question_type)
+                session.last_question_type = result.data.get(
+                    "question_type", question_type
+                )
             else:
                 session.last_quiz_question = result.error or ""
                 session.last_question_type = question_type
@@ -990,7 +1068,9 @@ async def _step_quiz(
                 session.state = SessionState.EVALUATE
             logger.info(
                 "session_step_quiz_generate concept=%s question_type=%s mastery_level=%d",
-                session.concept_id, session.last_question_type, mastery_level,
+                session.concept_id,
+                session.last_question_type,
+                mastery_level,
             )
         return result
     else:
@@ -1021,7 +1101,8 @@ async def _step_evaluate(
 
     # EXAMINER scores the quiz answer
     eval_result = await examiner.evaluate(
-        ctx, session.concept_id,
+        ctx,
+        session.concept_id,
         student_answer=session.last_student_answer,
         quiz_question=session.last_quiz_question,
     )
@@ -1038,11 +1119,13 @@ async def _step_evaluate(
         # (MENTOR.update_struggle_pattern still reads it, + the API
         # serialization includes it for old clients).
         import json
+
         session.last_evaluation = json.dumps(eval_data)
     else:
         # Legacy path: actor returned error-as-payload (a JSON string).
         session.last_evaluation = eval_result.error or ""
         import json
+
         try:
             eval_data = json.loads(session.last_evaluation)
         except (json.JSONDecodeError, ValueError, TypeError):
@@ -1052,7 +1135,8 @@ async def _step_evaluate(
             session.last_diagnosis = None
             logger.warning(
                 "session_evaluate_parse_failed concept=%s raw=%s",
-                session.concept_id, session.last_evaluation[:200],
+                session.concept_id,
+                session.last_evaluation[:200],
             )
             eval_data = None
 
@@ -1064,13 +1148,16 @@ async def _step_evaluate(
 
     # MENTOR updates the struggle_pattern
     mentor_result = await mentor.update_struggle_pattern(
-        ctx, session.concept_id, session.last_evaluation,
+        ctx,
+        session.concept_id,
+        session.last_evaluation,
     )
     # MENTOR failure is non-fatal — the evaluation still counts
     if not mentor_result.ok:
         logger.warning(
             "session_mentor_update_failed concept=%s error=%s",
-            session.concept_id, mentor_result.error,
+            session.concept_id,
+            mentor_result.error,
         )
 
     # Update SM-2 + mastery state
@@ -1170,7 +1257,9 @@ async def _step_evaluate(
             # over an analytics row.
             logger.warning(
                 "session_misconception_log_failed concept=%s error=%s:%s",
-                session.concept_id, type(exc).__name__, exc,
+                session.concept_id,
+                type(exc).__name__,
+                exc,
             )
 
         # Phase D (MENTOR pattern recognition, ADR-002 §7): after logging
@@ -1183,12 +1272,17 @@ async def _step_evaluate(
         except Exception as exc:
             logger.warning(
                 "session_pattern_check_failed concept=%s error=%s:%s",
-                session.concept_id, type(exc).__name__, exc,
+                session.concept_id,
+                type(exc).__name__,
+                exc,
             )
 
     logger.info(
         "session_step_evaluate concept=%s score=%.2f mastered=%s state=%s has_diagnosis=%s",
-        session.concept_id, session.last_score, session.mastered, session.state.value,
+        session.concept_id,
+        session.last_score,
+        session.mastered,
+        session.state.value,
         session.last_diagnosis is not None,
     )
     return ActorResult(ok=True, error=session.last_evaluation)
@@ -1226,21 +1320,28 @@ async def _step_hint(
 
     if not session.hint_generated:
         # Phase 1: generate the hint.
-        result = await examiner.generate_hint(ctx, session.concept_id, session.hint_count)
+        result = await examiner.generate_hint(
+            ctx, session.concept_id, session.hint_count
+        )
         if result.ok:
             session.hint_generated = True
             # If student_input was provided (non-interactive mode), proceed
             # to phase 2 immediately in the same call.
             if student_input:
-                return await _hint_phase2(ctx, session, examiner, mentor, student_input, hint_rung)
+                return await _hint_phase2(
+                    ctx, session, examiner, mentor, student_input, hint_rung
+                )
             logger.info(
                 "session_step_hint_generate concept=%s rung=%d",
-                session.concept_id, hint_rung,
+                session.concept_id,
+                hint_rung,
             )
         return result
     else:
         # Phase 2: learner's re-answer arrived.
-        return await _hint_phase2(ctx, session, examiner, mentor, student_input, hint_rung)
+        return await _hint_phase2(
+            ctx, session, examiner, mentor, student_input, hint_rung
+        )
 
 
 async def _hint_phase2(
@@ -1264,7 +1365,8 @@ async def _hint_phase2(
 
     # Re-evaluate with the new answer (same quiz question, new answer).
     eval_result = await examiner.evaluate(
-        ctx, session.concept_id,
+        ctx,
+        session.concept_id,
         student_answer=session.last_student_answer,
         quiz_question=session.last_quiz_question,
     )
@@ -1276,10 +1378,12 @@ async def _hint_phase2(
     if eval_result.data is not None and isinstance(eval_result.data, dict):
         eval_data = eval_result.data
         import json
+
         session.last_evaluation = json.dumps(eval_data)
     else:
         session.last_evaluation = eval_result.error or ""
         import json
+
         try:
             eval_data = json.loads(session.last_evaluation)
         except (json.JSONDecodeError, ValueError, TypeError):
@@ -1288,7 +1392,8 @@ async def _hint_phase2(
             session.last_diagnosis = None
             logger.warning(
                 "session_hint_eval_parse_failed concept=%s raw=%s",
-                session.concept_id, session.last_evaluation[:200],
+                session.concept_id,
+                session.last_evaluation[:200],
             )
             eval_data = None
 
@@ -1299,12 +1404,15 @@ async def _hint_phase2(
 
     # MENTOR updates the struggle_pattern (non-fatal on failure).
     mentor_result = await mentor.update_struggle_pattern(
-        ctx, session.concept_id, session.last_evaluation,
+        ctx,
+        session.concept_id,
+        session.last_evaluation,
     )
     if not mentor_result.ok:
         logger.warning(
             "session_hint_mentor_update_failed concept=%s error=%s",
-            session.concept_id, mentor_result.error,
+            session.concept_id,
+            mentor_result.error,
         )
 
     # Update SM-2 + mastery state (same as _step_evaluate).
@@ -1323,11 +1431,15 @@ async def _hint_phase2(
         session.state = SessionState.NEXT_CONCEPT
         logger.info(
             "session_hint_correct_after_hint concept=%s rung=%d score=%.2f",
-            session.concept_id, hint_rung, session.last_score,
+            session.concept_id,
+            hint_rung,
+            session.last_score,
         )
     else:
         # Still wrong after this hint. Increment hint_count + route.
-        session.hint_count = hint_rung  # hint_rung is 1 or 2; this sets hint_count to match
+        session.hint_count = (
+            hint_rung  # hint_rung is 1 or 2; this sets hint_count to match
+        )
         if hint_rung == 1:
             # Was HINT_1, still wrong → HINT_2.
             session.state = SessionState.HINT_2
@@ -1346,7 +1458,8 @@ async def _hint_phase2(
                 session.hint_generated = False  # reset for any future HINT
                 logger.info(
                     "session_hint_still_wrong concept=%s rung=2 → REMEDIATE retry=%d",
-                    session.concept_id, session.retry_count,
+                    session.concept_id,
+                    session.retry_count,
                 )
             else:
                 session.state = SessionState.NEXT_CONCEPT
@@ -1385,7 +1498,9 @@ async def _increment_hint_assisted_correct(
     except Exception as exc:
         ctx.logger.warning(
             "session_hint_assisted_correct_increment_failed concept=%s error=%s:%s",
-            session.concept_id, type(exc).__name__, exc,
+            session.concept_id,
+            type(exc).__name__,
+            exc,
         )
 
 
@@ -1406,7 +1521,8 @@ async def _step_remediate(
     # should get a conceptual re-frame, not a full worked example).
     mastery_level = await _get_mastery_level(ctx, session)
     result = await socrates.teach(
-        ctx, session.concept_id,
+        ctx,
+        session.concept_id,
         retry=True,
         struggle_pattern=struggle_pattern,
         mastery_level=mastery_level,
@@ -1422,7 +1538,8 @@ async def _step_remediate(
         session.state = SessionState.PROBE
         logger.info(
             "session_step_remediate concept=%s retry=%d",
-            session.concept_id, session.retry_count,
+            session.concept_id,
+            session.retry_count,
         )
     return result
 
@@ -1495,7 +1612,8 @@ async def _step_next_concept(
             session.state = SessionState.PREDICT
             logger.info(
                 "session_step_next_concept advance concept=%s queue_len=%d",
-                next_concept, len(session.concept_queue),
+                next_concept,
+                len(session.concept_queue),
             )
         return ActorResult(
             ok=True,
@@ -1506,7 +1624,9 @@ async def _step_next_concept(
         # has more concepts. If so, rebuild the queue (long-arc executor).
         if session.plan_id:
             new_queue, new_cold_start = await _build_concept_queue(
-                ctx, "", plan_id=session.plan_id,
+                ctx,
+                "",
+                plan_id=session.plan_id,
             )
             if new_queue:
                 # Plan has more concepts — continue the session.
@@ -1548,7 +1668,8 @@ async def _step_next_concept(
         session.state = SessionState.SESSION_COMPLETE
         logger.info(
             "session_step_next_concept concept=%s mastered=%s — session complete (queue empty)",
-            session.concept_id, session.mastered,
+            session.concept_id,
+            session.mastered,
         )
         return ActorResult(
             ok=True,
@@ -1615,10 +1736,15 @@ async def _update_mastery(ctx: ActorContext, session: SessionContext) -> None:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                session.student_id, session.concept_id,
-                new_state.easiness_factor, new_state.interval_days,
-                new_state.repetitions, new_state.next_review_at,
-                session.last_score, mastered, now,
+                session.student_id,
+                session.concept_id,
+                new_state.easiness_factor,
+                new_state.interval_days,
+                new_state.repetitions,
+                new_state.next_review_at,
+                session.last_score,
+                mastered,
+                now,
             ),
         )
         await conn.commit()
