@@ -367,5 +367,5 @@ async def test_health_route_returns_ok():
     # health_route takes no request arg — it's a pure liveness probe.
     result = await health_route()
     assert isinstance(result, dict)
-    assert result.get("status") == "ok"
+    assert result.get("ok") is True
     assert result.get("extension") == "aristotle"

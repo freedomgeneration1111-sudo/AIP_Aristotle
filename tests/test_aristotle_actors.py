@@ -293,9 +293,10 @@ def test_aristotle_workflow_yaml_parses():
     assert wf["template_id"] == "tutoring_session_v1"
     assert wf["name"] == "Tutoring Session v1"
     assert "nodes" in wf
-    assert len(wf["nodes"]) == 7, f"expected 7 nodes, got {len(wf['nodes'])}"
+    assert len(wf["nodes"]) == 8, f"expected 8 nodes, got {len(wf['nodes'])}"
     node_ids = [n["id"] for n in wf["nodes"]]
     assert node_ids == [
+        "predict",
         "teach",
         "probe",
         "quiz",
