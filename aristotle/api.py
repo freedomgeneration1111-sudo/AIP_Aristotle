@@ -141,7 +141,7 @@ async def session_start_route(request: Request):
     """Start a new tutoring session.
 
     Request body: {"concept_id": "newton_first_law"}
-    Returns: the initial SessionContext (state=TEACH).
+    Returns: the initial SessionContext (state=PREDICT).
     """
     container = _get_container(request)
     body = await request.json()
@@ -149,7 +149,7 @@ async def session_start_route(request: Request):
     if not concept_id:
         raise HTTPException(status_code=400, detail="concept_id required")
 
-    session = SessionContext(concept_id=concept_id, state=SessionState.TEACH)
+    session = SessionContext(concept_id=concept_id, state=SessionState.PREDICT)
     return _session_to_dict(session)
 
 
@@ -196,7 +196,7 @@ async def session_run_route(request: Request):
     if not concept_id:
         raise HTTPException(status_code=400, detail="concept_id required")
 
-    session = SessionContext(concept_id=concept_id, state=SessionState.TEACH)
+    session = SessionContext(concept_id=concept_id, state=SessionState.PREDICT)
     ctx = _make_ctx(container)
     answer_idx = 0
     steps: list[dict] = []
@@ -437,7 +437,7 @@ def _session_from_dict(d: dict) -> SessionContext:
     return SessionContext(
         student_id=d.get("student_id", "definer"),
         concept_id=d.get("concept_id", ""),
-        state=SessionState(d.get("state", "TEACH")),
+        state=SessionState(d.get("state", "PREDICT")),
         last_explanation=d.get("last_explanation", ""),
         last_probe_question=d.get("last_probe_question", ""),
         last_quiz_question=d.get("last_quiz_question", ""),

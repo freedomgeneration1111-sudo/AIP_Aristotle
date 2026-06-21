@@ -6,10 +6,11 @@
 #
 # Internally this is the state machine; the learner only feels rhythm:
 #
-#   TEACH ──► PROBE ──► QUIZ ──► EVALUATE ──┬─► (mastered) ─► next concept
-#     ▲                                      │
-#     └──────────── REMEDIATE ◄──────────────┘ (struggling → different framing)
+#   PREDICT ──► TEACH ──► PROBE ──► QUIZ ──► EVALUATE ──┬─► (mastered) ─► next concept
+#     ▲                                               │
+#     └──────────── REMEDIATE ◄────────────────────────┘ (struggling → different framing)
 #
+# - PREDICT (SOCRATES): ask the learner to guess before teaching (generation effect).
 # - TEACH (SOCRATES): explain, with an alternate framing on retry.
 # - PROBE (EXAMINER): low-stakes "tell me in your own words."
 # - QUIZ (EXAMINER): a real question.
@@ -32,7 +33,7 @@
 template_id: tutoring_session_v1
 name: "Tutoring Session v1"
 description: >
-  ARISTOTLE TEACH→PROBE→QUIZ→EVALUATE→REMEDIATE state machine.
+  ARISTOTLE PREDICT→TEACH→PROBE→QUIZ→EVALUATE→REMEDIATE state machine.
   Single-voice: the learner meets Aristotle, not the modes (ADR-ARISTOTLE §1).
   Bilingual: content_primary + content_alt (ADR-ARISTOTLE §7).
 trigger: manual
@@ -48,6 +49,18 @@ inputs:
   - mastery_threshold: float  # default 0.7
 
 nodes:
+  - id: predict
+    type: agent
+    model_slot: beast
+    description: >
+      SOCRATES: ask the learner to predict what the concept means before
+      teaching it (ADR-002 Rev 2 §3 — generation effect). The prediction is
+      always accepted, never scored. Display the prompt, wait for prediction.
+    prompt: >
+      Before I explain concept {{ inputs.concept_id }}, what do you think
+      it means? Take a guess — right or wrong doesn't matter.
+    output: predict_result
+
   - id: teach
     type: agent
     model_slot: beast
