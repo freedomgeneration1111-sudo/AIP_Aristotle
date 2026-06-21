@@ -487,3 +487,48 @@ platform-wide soft-deprecation (Brain DEBT-015) is on track.
 - `aristotle/session.py:_step_probe()` (reads result.data with backward-compat fallback)
 - `tests/test_aristotle_tutoring.py::test_probe_calls_evaluation_slot` (updated to read result.data)
 - Brain DEBT-015 (platform-wide ActorResult.data field — the root enabler)
+
+## ARISTOTLE-DEBT-009 — Unbuilt API Routes (Tests Written Ahead of Implementation)
+
+**Status:** Active — Phase B deferred
+**Phase:** Phase B / Phase D
+**Filed:** 2026-06-18
+
+**What was deferred:**
+9 API routes have tests written but no implementation in `aristotle/api.py`.
+The function definitions do not exist anywhere in the codebase. Tests from
+another session were written ahead of the implementation.
+
+Missing routes (by function name):
+1. `intake_start_route` — Phase D onboarding intake (test_aristotle_intake.py)
+2. `intake_step_route` — Phase D onboarding intake step (test_aristotle_intake.py)
+3. `placer_start_route` — Phase D placement assessment (test_aristotle_intake.py)
+4. `placer_step_route` — Phase D placement step (test_aristotle_intake.py)
+5. `session_history_route` — teacher dashboard session history (test_teacher_dashboard.py)
+6. `misconceptions_route` — misconceptions list for dashboard (test_aristotle_routes.py)
+7. `get_settings_route` — extension settings read (test_aristotle_routes.py)
+8. `update_settings_route` — extension settings write (test_aristotle_routes.py)
+9. `upload_route` — file upload (PDF, image, txt, html, json) (test_aristotle_routes.py, 6 tests)
+
+**Why deferred:**
+These routes were planned by another session (Phase B.5 / Phase D) but the
+implementations were never committed. The tests are correct specifications
+for the intended behavior — they just can't import the function.
+
+**Resolution:**
+Tests marked `@pytest.mark.xfail(reason="Phase B/D — route not yet implemented")`
+so the suite reads clean (0 unexpected failures) without hiding the gap.
+When each route is implemented, remove the xfail marker — the test will
+either pass (implementation correct) or fail (implementation needs work).
+
+**Remediation trigger:**
+When implementing each Phase B/D route, remove the xfail marker and verify
+the test passes.
+
+**Related work:**
+- `tests/test_aristotle_intake.py` (4 tests — intake + placer routes)
+- `tests/test_aristotle_routes.py` (9 tests — misconceptions, settings, upload)
+- `tests/test_teacher_dashboard.py` (2 tests — session history)
+- `aristotle/api.py` (where the routes need to be added)
+
+---

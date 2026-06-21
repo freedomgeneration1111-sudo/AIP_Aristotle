@@ -77,6 +77,7 @@ def _make_container(conn):
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_session_history_route_returns_sessions_list():
     """Mock DB to return 2 grouped rows. GET /aristotle/session-history."""
     from aristotle.api import session_history_route
@@ -107,6 +108,7 @@ async def test_session_history_route_returns_sessions_list():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_session_history_empty_when_no_log_entries():
     """Mock DB to return no rows. GET /aristotle/session-history."""
     from aristotle.api import session_history_route

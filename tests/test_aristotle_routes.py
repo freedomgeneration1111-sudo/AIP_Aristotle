@@ -106,6 +106,7 @@ def _make_container(conn):
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_misconceptions_route_returns_list():
     """Mock DB to return 2 rows. GET /aristotle/misconceptions."""
     from aristotle.api import misconceptions_route
@@ -148,6 +149,7 @@ async def test_misconceptions_route_returns_list():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_get_settings_returns_defaults_when_no_row():
     """Mock DB to return no row. GET /aristotle/settings."""
     from aristotle.api import get_settings_route
@@ -169,6 +171,7 @@ async def test_get_settings_returns_defaults_when_no_row():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_post_settings_upserts_and_returns():
     """POST /aristotle/settings with Urdu settings."""
     from aristotle.api import update_settings_route
@@ -205,6 +208,7 @@ async def test_post_settings_upserts_and_returns():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_upload_pdf_returns_extracted_text():
     """POST /aristotle/upload with a minimal PDF."""
     from aristotle.api import upload_route
@@ -235,6 +239,7 @@ async def test_upload_pdf_returns_extracted_text():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_upload_image_returns_extracted_text():
     """POST /aristotle/upload with a minimal image."""
     from aristotle.api import upload_route
@@ -264,6 +269,7 @@ async def test_upload_image_returns_extracted_text():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_upload_txt_returns_text():
     """POST /upload with body b'Hello world' + Content-Type text/plain."""
     from aristotle.api import upload_route
@@ -286,6 +292,7 @@ async def test_upload_txt_returns_text():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_upload_html_strips_tags():
     """POST /upload with b'<h1>Title</h1><p>Body text</p>' Content-Type text/html."""
     from aristotle.api import upload_route
@@ -309,6 +316,7 @@ async def test_upload_html_strips_tags():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_upload_json_returns_text():
     """POST /upload with b'{"key": "value"}' Content-Type application/json."""
     from aristotle.api import upload_route
@@ -331,6 +339,7 @@ async def test_upload_json_returns_text():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
 async def test_upload_unsupported_returns_415():
     """POST /upload with Content-Type application/octet-stream + no magic bytes."""
     from aristotle.api import upload_route
