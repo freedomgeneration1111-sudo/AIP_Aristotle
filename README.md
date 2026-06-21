@@ -226,7 +226,7 @@ AIP_Aristotle/
 │   │   └── M002_aristotle_mastery.sql  # aristotle_mastery (SM-2 state per concept)
 │   └── workflows/
 │       └── tutoring_session_v1.yaml  # 7-node state machine (declared, actor-driven execution)
-├── tests/                           # 140 tests collected (boundary + conformance + behavior + integration)
+├── tests/                           # 150 tests collected, 0 errors (boundary + conformance + behavior + integration)
 ├── docs/decisions/
 │   ├── ADR-000-template.md
 │   └── ADR-001-aristotle-architecture.md
