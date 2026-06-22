@@ -35,25 +35,24 @@ def on_load(host) -> None:
     host.register_actor("examiner", ExaminerActor, cadence=0.0)
     host.register_actor("mentor", MentorActor, cadence=0.0)
 
-    # Register GUI page (ADR-014 v1.1 — the learning view)
-    # The builder_fn is a no-op here — the actual NiceGUI route is registered
-    # by aristotle/gui.py (imported by gui/app.py in AIP_Brain). The
-    # host.register_page call records the NavItem so the host knows the
-    # extension has a GUI surface and transitions to MOUNTED.
+    # Register GUI nav items (ADR-014 v1.1).
+    # Routes point at pages that exist in the platform GUI or in
+    # aristotle/gui/pages.py (discovered via aip.extension_gui entry point).
+    # /ask is the Brain's Ask page — ARISTOTLE mode activates there (FIX 2).
+    # /aristotle/teacher is the teacher dashboard in aristotle/gui/pages.py.
     host.register_page(
-        route="/learn",
-        title="Learn",
+        route="/ask",
+        title="Tutor",
         icon="school",
-        builder_fn=lambda: None,  # NiceGUI route registered by aristotle/gui.py
+        builder_fn=lambda: None,
         order=30,
     )
 
-    # Register teacher dashboard page (Phase B — ADR-001 §8)
     host.register_page(
-        route="/dashboard",
+        route="/aristotle/teacher",
         title="Teach",
         icon="school_outlined",
-        builder_fn=lambda: None,  # NiceGUI route registered by aristotle/gui.py
+        builder_fn=lambda: None,
         order=35,
     )
 
