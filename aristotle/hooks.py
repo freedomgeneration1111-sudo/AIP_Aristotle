@@ -41,7 +41,7 @@ def on_load(host) -> None:
     # /ask is the Brain's Ask page — ARISTOTLE mode activates there (FIX 2).
     # /aristotle/teacher is the teacher dashboard in aristotle/gui/pages.py.
     host.register_page(
-        route="/ask",
+        route="/ask?extension=aristotle",
         title="Tutor",
         icon="school",
         builder_fn=lambda: None,
