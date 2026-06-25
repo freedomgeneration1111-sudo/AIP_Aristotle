@@ -200,13 +200,27 @@ class IntakeActor:
     async def generate_plan(
         self, ctx: ActorContext, session: IntakeSession
     ) -> ActorResult:
-        """Generate a learning plan from the intake responses.
+        """Generate a learning plan from the intake responses + draft_plan.
 
-        Queries aristotle_concept for concepts matching the subject (or all
-        concepts if the subject is broad / no match), orders by prerequisite
-        depth or insertion order, writes one row to aristotle_learning_plan,
-        writes one row to aristotle_intake_session (status='complete',
-        completed_at=now). Returns ActorResult(ok=True, data={"plan_id": ...}).
+        If session.draft_plan is non-empty (the LLM-driven path), ingests
+        each proposed concept as a new aristotle_concept row and uses
+        those concept_ids in the plan. This is the conversational plan
+        generation path — concepts come from the model's understanding
+        of the conversation + uploaded materials, NOT from a LIKE query
+        against sample data.
+
+        If session.draft_plan is empty (the deterministic fallback path
+        or a legacy session), falls back to the old behavior: LIKE query
+        against aristotle_concept matching the subject, or all concepts
+        if no match.
+
+        Either way, writes one row to aristotle_learning_plan + one row
+        to aristotle_intake_session (status='complete'). Also updates
+        aristotle_uploaded_material.concept_ids_json for any materials
+        in session.material_ids so the materials are linked to the
+        concepts they informed.
+
+        Returns ActorResult(ok=True, data={"plan_id": ..., "concept_count": N}).
         """
         logger = ctx.logger
         container: Any = ctx.container
@@ -218,26 +232,80 @@ class IntakeActor:
             stores = await registry.get_stores("aristotle:textbook")
             conn = stores.connection_manager.write_conn
 
-            # Query concepts matching the subject. If the subject is broad
-            # or no exact match, fall back to all concepts ordered by
-            # insertion order (id ASC).
-            cur = await conn.execute(
-                "SELECT id FROM aristotle_concept "
-                "WHERE topic LIKE ? OR subtopic LIKE ? "
-                "ORDER BY id",
-                (f"%{session.subject}%", f"%{session.subject}%"),
-            )
-            rows = await cur.fetchall()
-            await cur.close()
+            concept_ids: list[str] = []
 
-            if rows:
-                concept_ids = [row[0] for row in rows]
+            if session.draft_plan:
+                # LLM-driven path: ingest each proposed concept as a new
+                # aristotle_concept row. The draft_plan is a list of dicts
+                # with keys: topic, subtopic, bloom_target, content_primary,
+                # prerequisite_concept_id (index into the list or None).
+                # We generate stable-ish ids from the subject + index so
+                # re-ingestion is idempotent-ish (same subject + same
+                # draft_plan produces the same ids).
+                subject_slug = "".join(
+                    c.lower() if c.isalnum() else "_" for c in session.subject
+                )[:40] or "concept"
+                for idx, concept in enumerate(session.draft_plan):
+                    cid = f"{subject_slug}_{idx:03d}"
+                    topic = concept.get("topic", f"Concept {idx+1}")
+                    subtopic = concept.get("subtopic", "")
+                    bloom = int(concept.get("bloom_target", 3))
+                    content_primary = concept.get("content_primary", "")
+                    prereq_idx = concept.get("prerequisite_concept_id")
+                    prereq_id = (
+                        f"{subject_slug}_{prereq_idx:03d}"
+                        if isinstance(prereq_idx, int)
+                        else None
+                    )
+
+                    # INSERT OR REPLACE so re-ingestion (learner amends +
+                    # reconfirms) updates the concept rather than failing
+                    # on the PRIMARY KEY collision.
+                    await conn.execute(
+                        "INSERT OR REPLACE INTO aristotle_concept "
+                        "(id, textbook_chapter, topic, subtopic, bloom_target, "
+                        "content_primary, content_alt, content_alt_lang, "
+                        "prerequisite_concept_id, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, datetime('now'))",
+                        (
+                            cid,
+                            subject_slug,
+                            topic,
+                            subtopic,
+                            bloom,
+                            content_primary,
+                            prereq_id,
+                        ),
+                    )
+                    concept_ids.append(cid)
+
+                logger.info(
+                    "intake_draft_plan_ingested concept_count=%d subject=%s",
+                    len(concept_ids),
+                    session.subject,
+                )
             else:
-                # No match — use all concepts ordered by insertion order.
-                cur = await conn.execute("SELECT id FROM aristotle_concept ORDER BY id")
+                # Deterministic fallback path: LIKE query against
+                # aristotle_concept matching the subject, or all concepts
+                # if no match. This is the old behavior — kept for the
+                # no-model fallback path and legacy sessions.
+                cur = await conn.execute(
+                    "SELECT id FROM aristotle_concept "
+                    "WHERE topic LIKE ? OR subtopic LIKE ? "
+                    "ORDER BY id",
+                    (f"%{session.subject}%", f"%{session.subject}%"),
+                )
                 rows = await cur.fetchall()
                 await cur.close()
-                concept_ids = [row[0] for row in rows] if rows else []
+
+                if rows:
+                    concept_ids = [row[0] for row in rows]
+                else:
+                    # No match — use all concepts ordered by insertion order.
+                    cur = await conn.execute("SELECT id FROM aristotle_concept ORDER BY id")
+                    rows = await cur.fetchall()
+                    await cur.close()
+                    concept_ids = [row[0] for row in rows] if rows else []
 
             # Generate a UUID for the plan.
             plan_id = str(uuid.uuid4())
@@ -282,6 +350,17 @@ class IntakeActor:
                     now,
                 ),
             )
+
+            # Link uploaded materials to the ingested concepts so the
+            # teacher dashboard can show "this material informed these
+            # concepts" (Piece 4 will surface this in the GUI).
+            if session.material_ids and concept_ids:
+                for mid in session.material_ids:
+                    await conn.execute(
+                        "UPDATE aristotle_uploaded_material "
+                        "SET concept_ids_json = ? WHERE id = ?",
+                        (concept_ids_json, mid),
+                    )
 
             await conn.commit()
             logger.info(

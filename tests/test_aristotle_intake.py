@@ -638,6 +638,155 @@ class TestIntakeLLMDriven:
 
 
 # ---------------------------------------------------------------------------
+# Plan ingestion tests (Phase D brain transplant — Piece 3)
+# ---------------------------------------------------------------------------
+# These tests verify that when the LLM-driven intake returns a draft_plan,
+# generate_plan() ingests each proposed concept as a new aristotle_concept
+# row (instead of falling back to a LIKE query against sample data) and
+# the plan's concept_ids_json references those new concept ids.
+# ---------------------------------------------------------------------------
+
+
+class TestIntakePlanIngestion:
+    """Tests for draft_plan → aristotle_concept ingestion (Piece 3)."""
+
+    @pytest.mark.asyncio
+    async def test_draft_plan_concepts_are_ingested_as_aristotle_concept_rows(self):
+        """generate_plan() with a draft_plan INSERTs each concept into aristotle_concept."""
+        from aristotle.actors.intake import IntakeActor
+
+        draft_plan = [
+            {"topic": "Inertia", "subtopic": "Newton's First Law",
+             "bloom_target": 2, "content_primary": "objects resist changes in motion",
+             "prerequisite_concept_id": None},
+            {"topic": "F=ma", "subtopic": "Newton's Second Law",
+             "bloom_target": 3, "content_primary": "force equals mass times acceleration",
+             "prerequisite_concept_id": 0},
+        ]
+        # Fake conn that captures all executed SQL so we can assert on the INSERTs
+        conn = _FakeConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = IntakeSession(
+            subject="physics",
+            goals="personal interest",
+            schedule_minutes=30,
+            draft_plan=draft_plan,
+        )
+
+        actor = IntakeActor()
+        result = await actor.generate_plan(ctx, session)
+
+        assert result.ok
+        assert result.data["concept_count"] == 2
+
+        # At least 2 INSERT OR REPLACE INTO aristotle_concept statements
+        # were executed (one per draft_plan concept).
+        concept_inserts = [
+            (sql, params) for sql, params in conn._executed
+            if "INSERT OR REPLACE INTO aristotle_concept" in sql
+        ]
+        assert len(concept_inserts) == 2
+
+        # The concept ids follow the {subject_slug}_{idx:03d} pattern.
+        # subject="physics" → slug="physics", so ids are "physics_000", "physics_001".
+        inserted_ids = [params[0] for _, params in concept_inserts]
+        assert "physics_000" in inserted_ids
+        assert "physics_001" in inserted_ids
+
+    @pytest.mark.asyncio
+    async def test_draft_plan_concept_ids_appear_in_plan_concept_ids_json(self):
+        """The plan's concept_ids_json contains the ingested concept ids, not sample data."""
+        from aristotle.actors.intake import IntakeActor
+
+        draft_plan = [
+            {"topic": "Concept A", "subtopic": "", "bloom_target": 1,
+             "content_primary": "desc A", "prerequisite_concept_id": None},
+            {"topic": "Concept B", "subtopic": "", "bloom_target": 2,
+             "content_primary": "desc B", "prerequisite_concept_id": 0},
+        ]
+        conn = _FakeConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = IntakeSession(
+            subject="nbcm",
+            goals="SME",
+            schedule_minutes=45,
+            draft_plan=draft_plan,
+        )
+
+        actor = IntakeActor()
+        result = await actor.generate_plan(ctx, session)
+
+        assert result.ok
+        # Find the INSERT INTO aristotle_learning_plan statement
+        plan_inserts = [
+            (sql, params) for sql, params in conn._executed
+            if "INSERT INTO aristotle_learning_plan" in sql
+        ]
+        assert len(plan_inserts) == 1
+        # The concept_ids_json is the 5th param (index 4) in the VALUES
+        concept_ids_json = plan_inserts[0][1][4]
+        assert "nbcm_000" in concept_ids_json
+        assert "nbcm_001" in concept_ids_json
+
+    @pytest.mark.asyncio
+    async def test_no_draft_plan_falls_back_to_like_query(self):
+        """Empty draft_plan uses the old LIKE-query path (deterministic fallback)."""
+        from aristotle.actors.intake import IntakeActor
+
+        # Fake conn returns one concept row for the LIKE query
+        conn = _FakeConn(rows=[("newton_first_law",)])
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = IntakeSession(
+            subject="newton",
+            goals="personal interest",
+            schedule_minutes=30,
+            draft_plan=[],  # empty → fallback path
+        )
+
+        actor = IntakeActor()
+        result = await actor.generate_plan(ctx, session)
+
+        assert result.ok
+        assert result.data["concept_count"] == 1
+        # No INSERT OR REPLACE INTO aristotle_concept (no draft_plan to ingest)
+        concept_inserts = [
+            sql for sql, _ in conn._executed
+            if "INSERT OR REPLACE INTO aristotle_concept" in sql
+        ]
+        assert len(concept_inserts) == 0
+
+    @pytest.mark.asyncio
+    async def test_materials_are_linked_to_ingested_concepts(self):
+        """generate_plan() updates aristotle_uploaded_material.concept_ids_json."""
+        from aristotle.actors.intake import IntakeActor
+
+        draft_plan = [
+            {"topic": "Concept A", "subtopic": "", "bloom_target": 1,
+             "content_primary": "desc A", "prerequisite_concept_id": None},
+        ]
+        conn = _FakeConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = IntakeSession(
+            subject="physics",
+            goals="personal interest",
+            schedule_minutes=30,
+            draft_plan=draft_plan,
+            material_ids=["mat-1", "mat-2"],
+        )
+
+        actor = IntakeActor()
+        result = await actor.generate_plan(ctx, session)
+
+        assert result.ok
+        # Two UPDATE statements — one per material_id
+        material_updates = [
+            sql for sql, _ in conn._executed
+            if "UPDATE aristotle_uploaded_material" in sql
+        ]
+        assert len(material_updates) == 2
+
+
+# ---------------------------------------------------------------------------
 # PLACER tests (Phase D — placement calibration, ADR-002 §9 stage 5)
 # ---------------------------------------------------------------------------
 
