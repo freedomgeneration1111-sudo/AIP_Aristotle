@@ -135,6 +135,20 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   says progress tables go in the definer corpus, but the migration_loader
   applies to the extension's own corpus. Pre-alpha pragmatism; revisit at
   Phase B. The `aristotle_*` naming convention is preserved either way.
+- **Map click must pass concept_id in URL.** The learning map navigates to
+  `/ask?extension=aristotle&concept={cid}`. If the query params are dropped,
+  the ask page cannot determine which concept to tutor — the student gets
+  a generic concept selector instead of the pre-selected flow.
+- **`_session_to_dict` / `_session_from_dict` must stay in sync with
+  `SessionContext` fields.** When a new boolean flag is added to the
+  session dataclass (e.g. `predict_generated`), BOTH serializers must be
+  updated. Missing a field silently defaults to False on round-trip,
+  breaking state transitions that depend on the flag.
+- **Output extraction must check `result.data`, not just `result.error`.**
+  Post-DEBT-011 migration, actors return content via `result.data` (e.g.
+  `data={"prompt": "..."}` for PREDICT). The session/step route must
+  fall back through `result.error` → `result.data.get("prompt")` → empty
+  string. Reading only `result.error` returns empty output for ok results.
 - **All three actors are placeholders.** The dogfood SOCRATES/EXAMINER/MENTOR
   verify platform reachability (corpus, model provider, struggle_pattern
   table) but don't do real teaching/probing/mentoring. The full tutoring
@@ -164,7 +178,21 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   asked to generate a question without a model.
 
 ## Last Cycle
-- **ARISTOTLE Phase A — multi-actor + state machine** (this cycle):
+- **Onboarding gateway + API bug fixes** (this cycle):
+  - Fixed map click handler in `gui/pages.py`: concept cards now navigate to
+    `/ask?extension=aristotle&concept={cid}` instead of bare `/ask`, passing
+    the concept_id through to the ask page.
+  - Added `_ask_page_aristotle()` to Brain's `gui/pages/ask.py`: reads
+    `extension` and `concept` query params, branches into Aristotle tutoring
+    UI with concept name display + START button (pre-selected) or concept
+    selector list (direct URL).
+  - Fixed `_session_to_dict` missing `predict_generated` field — round-trip
+    serialization now preserves the PREDICT generation flag.
+  - Fixed `_session_from_dict` missing `predict_generated` field.
+  - Fixed output extraction in session/step route: now checks
+    `result.data.get("prompt")` (for PREDICT) after `result.error`, instead
+    of only reading `result.error` which is empty post-DEBT-011 migration.
+- **ARISTOTLE Phase A — multi-actor + state machine** (prior cycle):
   - Built EXAMINER actor (`actors/examiner.py`): probe/quiz/evaluate mode.
     Conforms to Actor Protocol. Verifies corpus reachability + checks model
     availability. Returns `ok=True` in both cases (healthy actor; the

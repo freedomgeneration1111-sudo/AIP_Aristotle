@@ -315,7 +315,7 @@ async def aristotle_map_page():
                             f"border-radius:{R_LG}; padding:10px 14px; "
                             f"max-width:640px; transition:background 0.15s;"
                         )
-                        .on("click", lambda c=cid: ui.navigate.to("/ask"))
+                        .on("click", lambda c=cid: ui.navigate.to(f"/ask?extension=aristotle&concept={c}"))
                     ):
                         with ui.column().classes("flex-1").style("gap:2px;"):
                             ui.label(name).style(

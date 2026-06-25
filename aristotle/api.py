@@ -171,7 +171,11 @@ async def session_step_route(request: Request):
     result = await run_session_step(ctx, session, student_input)
     return {
         "session": _session_to_dict(session),
-        "output": result.error if result.ok else "",
+        "output": (
+            result.error
+            or (result.data.get("prompt", "") if isinstance(result.data, dict) else "")
+            or ""
+        ) if result.ok else "",
         "ok": result.ok,
         "error": result.error if not result.ok else None,
     }
@@ -429,6 +433,7 @@ def _session_to_dict(session: SessionContext) -> dict:
         "max_retries": session.max_retries,
         "quiz_generated": session.quiz_generated,
         "probe_generated": session.probe_generated,
+        "predict_generated": session.predict_generated,
     }
 
 
@@ -449,4 +454,5 @@ def _session_from_dict(d: dict) -> SessionContext:
         max_retries=d.get("max_retries", 2),
         quiz_generated=d.get("quiz_generated", False),
         probe_generated=d.get("probe_generated", False),
+        predict_generated=d.get("predict_generated", False),
     )
