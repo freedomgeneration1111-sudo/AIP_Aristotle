@@ -821,11 +821,28 @@ async def run_intake_step(
     # fences or include preamble — extract the first { ... } block.
     parsed = _parse_json_response(raw)
     if parsed is None:
-        logger.warning("intake_model_response_not_json raw=%s", raw[:500])
-        # Fall back to showing the raw response so the learner sees something.
+        # The model returned plain text (not JSON). This happens with
+        # models that don't reliably follow structured output instructions.
+        # Rather than failing, treat the plain text as the conversational
+        # response and keep the current focus/extracted unchanged. The
+        # learner still gets a reply — they just don't get state-machine
+        # advancement on this turn. On the next turn, the model may
+        # produce JSON (the system prompt repeats the instruction).
+        logger.info("intake_model_response_plain_text (non-JSON) len=%d", len(raw))
+        if raw and raw.strip():
+            return {
+                "state": session.state.value,
+                "prompt": raw.strip(),
+            }
+        # Truly empty response — the model call returned nothing.
+        logger.warning("intake_model_response_empty")
         return {
             "state": session.state.value,
-            "prompt": raw or "I had trouble formulating a response. Could you rephrase?",
+            "prompt": (
+                "I'm having trouble connecting to my language model right now. "
+                "Please check that your model provider is configured "
+                "(OpenRouter API key, local model, etc.) and try again."
+            ),
         }
 
     # Update session from the parsed response.

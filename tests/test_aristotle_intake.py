@@ -575,6 +575,19 @@ class TestIntakeLLMDriven:
         assert session.current_focus == "SUBJECT"
 
     @pytest.mark.asyncio
+    async def test_llm_driven_empty_response_shows_model_config_error(self):
+        """If the model returns empty content, a helpful config error is shown."""
+        fake = _FakeModelProvider(responses={"beast": ""})
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(current_focus="SUBJECT")
+
+        result = await run_intake_step(session, "hello", ctx)
+
+        # The error message mentions model provider configuration
+        assert "model" in result["prompt"].lower()
+        assert session.current_focus == "SUBJECT"  # unchanged
+
+    @pytest.mark.asyncio
     async def test_llm_driven_json_in_markdown_fences_is_parsed(self):
         """JSON wrapped in ```json fences is extracted correctly."""
         fake = _FakeModelProvider(
