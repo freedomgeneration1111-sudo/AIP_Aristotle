@@ -402,6 +402,242 @@ class TestIntakeSessionFlow:
 
 
 # ---------------------------------------------------------------------------
+# LLM-driven intake tests (Phase D brain transplant — Piece 2)
+# ---------------------------------------------------------------------------
+# These tests verify the LLM-driven intake loop (run_intake_step when a
+# model_provider is present). They use _FakeModelProvider to return canned
+# JSON responses and assert that:
+#   - The model is called on the "beast" slot
+#   - The JSON response is parsed correctly (response, next_focus, extracted,
+#     draft_plan)
+#   - session fields are updated from the parsed response
+#   - next_focus=COMPLETE with a draft_plan triggers plan generation
+#   - material_ids are fetched and included in the model context
+#   - Invalid JSON responses fall back gracefully
+#
+# The deterministic fallback path (no model_provider) is covered by the
+# existing TestIntakeSessionFlow tests above.
+# ---------------------------------------------------------------------------
+
+
+class TestIntakeLLMDriven:
+    """Tests for the LLM-driven intake loop (run_intake_step with a model)."""
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_first_turn_calls_beast_and_returns_greeting(self):
+        """First turn with empty student_input calls beast + returns the model's response."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Hello! I'm Aristotle. What subject would you like to study?",
+                    "next_focus": "SUBJECT",
+                    "extracted": {},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession()
+
+        result = await run_intake_step(session, "", ctx)
+
+        # Model was called on the beast slot
+        assert len(fake.calls) == 1
+        assert fake.calls[0][0] == "beast"
+        # Response text came from the model
+        assert "Hello! I'm Aristotle" in result["prompt"]
+        # Session updated
+        assert session.current_focus == "SUBJECT"
+        assert session.state == IntakeState.SUBJECT
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_extracts_subject_from_raw_learner_text(self):
+        """The model extracts 'physics' from 'i want to learn physics' — not verbatim."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Great — physics! How much do you already know?",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {
+                        "subject": "physics",
+                        "prior_knowledge": "",
+                        "goals": "",
+                        "schedule_minutes": 0,
+                    },
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(state=IntakeState.SUBJECT, current_focus="SUBJECT")
+
+        result = await run_intake_step(session, "i want to learn physics", ctx)
+
+        # The extracted subject is "physics", not the raw text
+        assert session.subject == "physics"
+        assert session.extracted["subject"] == "physics"
+        # The raw text was recorded in responses (conversation history)
+        assert "i want to learn physics" in session.responses
+        # The model's response is what's shown to the learner
+        assert "Great — physics!" in result["prompt"]
+        assert result["state"] == "PRIOR_KNOWLEDGE"
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_multi_turn_stays_in_same_focus(self):
+        """The model can stay in the same focus for multiple turns (not one-turn-per-state)."""
+        # Turn 2: model asks a follow-up, stays in PRIOR_KNOWLEDGE
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Tell me more — have you ever studied mechanics?",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {"subject": "physics", "prior_knowledge": "basic"},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            state=IntakeState.PRIOR_KNOWLEDGE,
+            current_focus="PRIOR_KNOWLEDGE",
+            subject="physics",
+            extracted={"subject": "physics"},
+        )
+
+        result = await run_intake_step(session, "a little bit", ctx)
+
+        # Still in PRIOR_KNOWLEDGE (model didn't advance)
+        assert session.current_focus == "PRIOR_KNOWLEDGE"
+        assert result["state"] == "PRIOR_KNOWLEDGE"
+        # But the extracted prior_knowledge was updated
+        assert session.extracted["prior_knowledge"] == "basic"
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_complete_with_draft_plan_generates_plan(self):
+        """When the model returns next_focus=COMPLETE with a draft_plan, a plan is generated."""
+        draft_plan = [
+            {"topic": "Newton's First Law", "subtopic": "inertia",
+             "bloom_target": 2, "content_primary": "objects resist changes in motion",
+             "prerequisite_concept_id": None},
+            {"topic": "Newton's Second Law", "subtopic": "F=ma",
+             "bloom_target": 3, "content_primary": "force equals mass times acceleration",
+             "prerequisite_concept_id": 0},
+        ]
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Your plan is confirmed. Let's begin!",
+                    "next_focus": "COMPLETE",
+                    "extracted": {
+                        "subject": "physics",
+                        "prior_knowledge": "basic",
+                        "goals": "personal interest",
+                        "schedule_minutes": 30,
+                    },
+                    "draft_plan": draft_plan,
+                })
+            }
+        )
+        # Need a fake conn so generate_plan can INSERT
+        conn = _FakeConn()
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = IntakeSession(
+            state=IntakeState.GENERATING_PLAN,
+            current_focus="PLAN_DRAFT",
+            subject="physics",
+            goals="personal interest",
+            schedule_minutes=30,
+            draft_plan=draft_plan,
+        )
+
+        result = await run_intake_step(session, "looks good", ctx)
+
+        assert result["state"] == "COMPLETE"
+        assert "plan_id" in result
+        assert result["plan_id"]  # non-empty
+        assert session.plan_id == result["plan_id"]
+        assert session.state == IntakeState.COMPLETE
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_invalid_json_falls_back_gracefully(self):
+        """If the model returns non-JSON, the raw text is shown (not a crash)."""
+        fake = _FakeModelProvider(
+            responses={"beast": "Sorry, I wasn't thinking clearly just now."}
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(current_focus="SUBJECT")
+
+        result = await run_intake_step(session, "physics please", ctx)
+
+        # No crash — the raw text is shown as the prompt
+        assert "Sorry, I wasn't thinking clearly" in result["prompt"]
+        # Session state is unchanged (no extraction happened)
+        assert session.current_focus == "SUBJECT"
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_json_in_markdown_fences_is_parsed(self):
+        """JSON wrapped in ```json fences is extracted correctly."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Here's my response:\n```json\n" + json.dumps({
+                    "response": "Got it — physics it is.",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {"subject": "physics"},
+                    "draft_plan": None,
+                }) + "\n```"
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(current_focus="SUBJECT")
+
+        result = await run_intake_step(session, "i want to learn physics", ctx)
+
+        assert "Got it — physics it is." in result["prompt"]
+        assert session.subject == "physics"
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_includes_uploaded_materials_in_context(self):
+        """material_ids on the session are fetched + included in the model context."""
+        # The fake conn returns a row for the material query
+        conn = _FakeConn(rows=[("paper.pdf", "pdf", "This paper covers NBCM theory.")])
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "I see you've uploaded a paper on NBCM. Let me adjust.",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {"subject": "null boundary constraint manifolds"},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = IntakeSession(
+            current_focus="SUBJECT",
+            material_ids=["mat-1"],
+        )
+
+        await run_intake_step(session, "i uploaded a paper", ctx)
+
+        # The model was called with a user prompt that includes the material text
+        user_prompt = fake.calls[0][1][1]["content"]  # [0]=first call, [1]=messages, [1]=user msg, ["content"]
+        assert "paper.pdf" in user_prompt
+        assert "NBCM" in user_prompt
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_no_model_falls_back_to_deterministic(self):
+        """When no model_provider is available, the deterministic path is used."""
+        # No model_provider → deterministic fallback
+        ctx = _make_ctx(model_provider=None)
+        session = IntakeSession()
+
+        result = await run_intake_step(session, "", ctx)
+
+        # Deterministic greeting
+        assert "subject" in result["prompt"].lower()
+        assert session.state == IntakeState.SUBJECT
+
+
+# ---------------------------------------------------------------------------
 # PLACER tests (Phase D — placement calibration, ADR-002 §9 stage 5)
 # ---------------------------------------------------------------------------
 

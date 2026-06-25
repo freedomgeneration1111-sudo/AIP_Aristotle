@@ -537,25 +537,334 @@ def _state_index(state: IntakeState) -> int:
         return 0
 
 
+async def _fetch_material_texts(ctx: ActorContext, material_ids: list) -> list[dict]:
+    """Fetch extracted text for each material_id from aristotle_uploaded_material.
+
+    Returns a list of {filename, source_type, extracted_text} dicts. Skips
+    ids that don't have a row (best-effort). Used by the LLM-driven intake
+    loop to include uploaded material content in the model context.
+    """
+    if not material_ids:
+        return []
+    container: Any = ctx.container
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return []
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        placeholders = ",".join("?" * len(material_ids))
+        cur = await conn.execute(
+            f"SELECT filename, source_type, extracted_text "
+            f"FROM aristotle_uploaded_material WHERE id IN ({placeholders})",
+            tuple(material_ids),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {"filename": r[0], "source_type": r[1], "extracted_text": r[2] or ""}
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+# System prompt for the LLM-driven intake loop. Describes INTAKE's role,
+# the structured JSON output schema, and the rules for advancing focus.
+_INTAKE_SYSTEM_PROMPT = """You are Aristotle, an adaptive tutor conducting the onboarding intake interview with a new learner. You are the ONLY voice the learner meets — they never see "INTAKE" as a persona.
+
+YOUR JOB: Have a real conversation to understand what the learner wants to study, what they already know, what their goals are, how much time they have, and what materials they've brought. Then propose a learning plan.
+
+This is NOT a rigid questionnaire. Each focus area (subject, prior knowledge, goals, schedule, materials) is a PHASE, not a single turn. You can ask follow-up questions, dig deeper, circle back, or adjust based on what the learner says. You decide when you have enough signal to advance.
+
+YOU MUST RETURN VALID JSON with this exact schema:
+{
+  "response": "what you say to the learner next (conversational, warm, in Aristotle's voice)",
+  "next_focus": "SUBJECT" | "PRIOR_KNOWLEDGE" | "GOALS" | "SCHEDULE" | "MATERIALS" | "PLAN_DRAFT" | "COMPLETE",
+  "extracted": {
+    "subject": "the actual subject extracted from the learner's words (e.g., 'physics', not 'i want to learn physics')",
+    "prior_knowledge": "what they already know, summarized",
+    "goals": "what they want to achieve, summarized",
+    "schedule_minutes": 30
+  },
+  "draft_plan": null
+}
+
+Rules for next_focus:
+- SUBJECT: still figuring out what they want to study
+- PRIOR_KNOWLEDGE: probing what they already know
+- GOALS: understanding their goals (exam? personal interest? SME?)
+- SCHEDULE: figuring out time commitment
+- MATERIALS: discussing uploaded materials, asking them to upload if relevant
+- PLAN_DRAFT: you have enough to propose a concept sequence (set draft_plan to a list of concept objects — see below)
+- COMPLETE: the learner has confirmed the draft plan; intake is done
+
+When next_focus == "PLAN_DRAFT", set draft_plan to a list of concept objects:
+[
+  {
+    "topic": "short topic name",
+    "subtopic": "more specific",
+    "bloom_target": 1-6,
+    "content_primary": "1-2 sentence description of what this concept covers",
+    "prerequisite_concept_id": null or index of prerequisite in this list
+  },
+  ...
+]
+
+The draft_plan should be derived from the conversation + any uploaded materials. If the learner uploaded a paper, the concepts should come from the paper's actual content. Order concepts by prerequisite dependency (foundations first).
+
+When next_focus == "COMPLETE", the learner has confirmed the plan. Keep draft_plan as the confirmed list.
+
+The "extracted" field should be updated each turn with your current understanding. Start with empty strings and fill in as you learn. "subject" must be the extracted subject (e.g., "physics", "null boundary constraint manifolds"), NOT the learner's raw words.
+
+Be conversational. Reflect back what you heard. Ask one question at a time. Don't rush — it's fine to spend 2-3 turns in one focus area if the learner's answer is nuanced. If they upload a material, acknowledge it and adjust your questions based on what's in it."""
+
+
+def _build_intake_user_prompt(
+    session: IntakeSession,
+    student_input: str,
+    materials: list[dict],
+) -> str:
+    """Build the user prompt for the LLM-driven intake turn.
+
+    Includes: current focus, conversation history, extracted so far,
+    uploaded material previews (truncated), and the learner's latest reply.
+    """
+    parts = []
+    parts.append(f"Current focus: {session.current_focus}")
+    parts.append("")
+
+    # Conversation history (last 8 turns to keep context manageable).
+    history = session.responses[-8:] if len(session.responses) > 8 else session.responses
+    if history:
+        parts.append("Conversation so far (learner's replies, most recent last):")
+        for i, r in enumerate(history, 1):
+            parts.append(f"  {i}. {r}")
+        parts.append("")
+
+    # Extracted understanding so far.
+    if session.extracted:
+        parts.append("Your current understanding:")
+        for k, v in session.extracted.items():
+            if v:
+                parts.append(f"  {k}: {v}")
+        parts.append("")
+
+    # Uploaded materials (truncated previews).
+    if materials:
+        parts.append("Uploaded materials:")
+        for m in materials:
+            preview = (m.get("extracted_text") or "")[:2000]
+            parts.append(
+                f"  - {m.get('filename', 'unknown')} ({m.get('source_type', 'unknown')}): "
+                f"{preview}"
+            )
+        parts.append("")
+
+    # Draft plan if one exists (learner is reviewing/amending).
+    if session.draft_plan:
+        parts.append("Current draft plan:")
+        for i, c in enumerate(session.draft_plan):
+            parts.append(f"  {i+1}. {c.get('topic', '?')} — {c.get('content_primary', '')[:100]}")
+        parts.append("")
+
+    # Learner's latest reply.
+    if student_input:
+        parts.append(f"Learner's latest reply: {student_input}")
+    else:
+        parts.append("(This is the first turn — generate your greeting.)")
+
+    parts.append("")
+    parts.append("Respond with the JSON object described in your instructions.")
+    return "\n".join(parts)
+
+
 async def run_intake_step(
     session: IntakeSession,
     student_input: str,
     ctx: ActorContext,
 ) -> dict:
-    """Dispatch one intake step based on session.state.
+    """LLM-driven intake loop (ADR-002 §9 brain transplant).
 
-    Two-phase per state (first call = generate prompt, second call with
-    student_input = record answer + advance). GENERATING_PLAN is
-    single-phase (calls generate_plan + advances to COMPLETE). COMPLETE
-    returns {"state": "COMPLETE", "plan_id": session.plan_id}.
+    Each turn:
+      1. Build context: conversation history, current focus, extracted
+         understanding, uploaded material texts, learner's latest reply.
+      2. Call model_provider.call(slot_name="beast", ...) with the
+         INTAKE system prompt + the context user prompt.
+      3. Parse the JSON response: {response, next_focus, extracted,
+         draft_plan}.
+      4. Update session fields from the parsed response.
+      5. If next_focus == "COMPLETE" and draft_plan is present, ingest
+         the concepts (Piece 3) + generate the plan + advance state.
 
-    Supports mid-flow entry via session.entry_state — skip states before
-    entry_state on first call. For partial re-INTAKE, entry_state is set
-    to the mid-flow state (GOALS, SCHEDULE, etc.) and the dispatcher
-    jumps directly there.
+    Fallback: if no model_provider is available, delegates to the old
+    deterministic dispatcher (_run_intake_step_deterministic) so the
+    system still works in tests / offline mode.
 
     Returns: {"state": ..., "prompt": ...} or {"state": "COMPLETE",
-    "plan_id": ...}.
+    "plan_id": ..., "concept_count": N}.
+    """
+    logger = ctx.logger
+    container: Any = ctx.container
+    model_provider = getattr(container, "model_provider", None)
+
+    # No model → fall back to deterministic path (tests, offline mode).
+    if model_provider is None:
+        return await _run_intake_step_deterministic(session, student_input, ctx)
+
+    # Fetch uploaded material texts for the model context.
+    materials = await _fetch_material_texts(ctx, session.material_ids)
+
+    # Record the learner's reply in the conversation history.
+    if student_input:
+        session.responses.append(student_input)
+
+    # Build the prompts.
+    user_prompt = _build_intake_user_prompt(session, student_input, materials)
+
+    try:
+        result = await model_provider.call(
+            slot_name="beast",
+            messages=[
+                {"role": "system", "content": _INTAKE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        raw = result.get("content", "") if isinstance(result, dict) else ""
+    except Exception as exc:
+        logger.warning("intake_model_call_failed error=%s:%s", type(exc).__name__, exc)
+        return {
+            "state": session.state.value,
+            "prompt": "I had trouble thinking just now. Could you say that again?",
+        }
+
+    # Parse the JSON response. The model may wrap JSON in markdown
+    # fences or include preamble — extract the first { ... } block.
+    parsed = _parse_json_response(raw)
+    if parsed is None:
+        logger.warning("intake_model_response_not_json raw=%s", raw[:500])
+        # Fall back to showing the raw response so the learner sees something.
+        return {
+            "state": session.state.value,
+            "prompt": raw or "I had trouble formulating a response. Could you rephrase?",
+        }
+
+    # Update session from the parsed response.
+    response_text = parsed.get("response", "")
+    next_focus = parsed.get("next_focus", session.current_focus)
+    extracted = parsed.get("extracted") or {}
+    draft_plan = parsed.get("draft_plan")
+
+    session.current_focus = next_focus
+    if extracted:
+        # Merge extracted into session.extracted (don't overwrite with empty).
+        for k, v in extracted.items():
+            if v not in (None, "", 0):
+                session.extracted[k] = v
+        # Sync the legacy fields from extracted for backwards compat.
+        if session.extracted.get("subject"):
+            session.subject = session.extracted["subject"]
+        if session.extracted.get("prior_knowledge"):
+            session.prior_knowledge = session.extracted["prior_knowledge"]
+        if session.extracted.get("goals"):
+            session.goals = session.extracted["goals"]
+        if session.extracted.get("schedule_minutes"):
+            try:
+                session.schedule_minutes = int(session.extracted["schedule_minutes"])
+            except (ValueError, TypeError):
+                pass
+
+    if draft_plan:
+        session.draft_plan = draft_plan
+
+    # Map next_focus to IntakeState for backwards compat.
+    focus_to_state = {
+        "SUBJECT": IntakeState.SUBJECT,
+        "PRIOR_KNOWLEDGE": IntakeState.PRIOR_KNOWLEDGE,
+        "GOALS": IntakeState.GOALS,
+        "SCHEDULE": IntakeState.SCHEDULE,
+        "MATERIALS": IntakeState.SCHEDULE,  # no MATERIALS state in enum; use SCHEDULE
+        "PLAN_DRAFT": IntakeState.GENERATING_PLAN,
+        "COMPLETE": IntakeState.COMPLETE,
+    }
+    session.state = focus_to_state.get(next_focus, session.state)
+
+    # If the model says COMPLETE and we have a draft plan, ingest the
+    # concepts + generate the plan row (Piece 3 refines this).
+    if next_focus == "COMPLETE" and session.draft_plan:
+        actor = IntakeActor()
+        plan_result = await actor.generate_plan(ctx, session)
+        if plan_result.ok and plan_result.data:
+            session.plan_id = plan_result.data.get("plan_id", "")
+            session.state = IntakeState.COMPLETE
+            return {
+                "state": "COMPLETE",
+                "prompt": response_text,
+                "plan_id": session.plan_id,
+                "concept_count": plan_result.data.get("concept_count", len(session.draft_plan)),
+            }
+        else:
+            return {
+                "state": "GENERATING_PLAN",
+                "prompt": response_text or "I had trouble saving the plan. Could you confirm again?",
+                "error": plan_result.error,
+            }
+
+    return {
+        "state": session.state.value,
+        "prompt": response_text,
+    }
+
+
+def _parse_json_response(raw: str) -> dict | None:
+    """Extract the first JSON object from a model response.
+
+    Handles: pure JSON, JSON wrapped in ```json fences, JSON with
+    preamble text before it. Returns None if no valid JSON found.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+
+    # Try direct parse first.
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try extracting from markdown code fences.
+    import re
+
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Try finding the first { ... } block (greedy, handles nested braces).
+    brace_match = re.search(r"\{.*\}", raw, re.S)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(0))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return None
+
+
+async def _run_intake_step_deterministic(
+    session: IntakeSession,
+    student_input: str,
+    ctx: ActorContext,
+) -> dict:
+    """Deterministic intake dispatcher (fallback when no model_provider).
+
+    This is the original Phase D implementation — fixed templates with
+    verbatim subject interpolation, one turn per state. Kept as the
+    fallback path so the system works in tests / offline mode. The
+    LLM-driven path (run_intake_step above) is the primary path when
+    a model is configured.
     """
     actor = IntakeActor()
 
@@ -599,12 +908,14 @@ async def run_intake_step(
             # Phase 1: generate greeting.
             result = await actor.greet(ctx)
             session.state = IntakeState.SUBJECT
+            session.current_focus = "SUBJECT"
             return {"state": "GREETING", "prompt": result.data["prompt"]}
         else:
             # Phase 2: record subject + advance.
             session.subject = student_input
             session.responses.append(student_input)
             session.state = IntakeState.PRIOR_KNOWLEDGE
+            session.current_focus = "PRIOR_KNOWLEDGE"
             result = await actor.ask_prior_knowledge(ctx, session.subject)
             return {"state": "SUBJECT", "prompt": result.data["prompt"]}
 
@@ -616,6 +927,7 @@ async def run_intake_step(
             session.subject = student_input
             session.responses.append(student_input)
             session.state = IntakeState.PRIOR_KNOWLEDGE
+            session.current_focus = "PRIOR_KNOWLEDGE"
             result = await actor.ask_prior_knowledge(ctx, session.subject)
             return {"state": "PRIOR_KNOWLEDGE", "prompt": result.data["prompt"]}
 
@@ -627,6 +939,7 @@ async def run_intake_step(
             session.prior_knowledge = student_input
             session.responses.append(student_input)
             session.state = IntakeState.GOALS
+            session.current_focus = "GOALS"
             result = await actor.ask_goals(ctx, session.subject)
             return {"state": "GOALS", "prompt": result.data["prompt"]}
 
@@ -638,6 +951,7 @@ async def run_intake_step(
             session.goals = student_input
             session.responses.append(student_input)
             session.state = IntakeState.SCHEDULE
+            session.current_focus = "SCHEDULE"
             result = await actor.ask_schedule(ctx)
             return {"state": "SCHEDULE", "prompt": result.data["prompt"]}
 
@@ -655,8 +969,9 @@ async def run_intake_step(
                 session.schedule_minutes = 30
             session.responses.append(student_input)
             session.state = IntakeState.GENERATING_PLAN
+            session.current_focus = "PLAN_DRAFT"
             # Immediately generate the plan (single-phase).
-            return await run_intake_step(session, "", ctx)
+            return await _run_intake_step_deterministic(session, "", ctx)
 
     # Fallback (should not reach here).
     return {"state": str(session.state), "prompt": ""}
