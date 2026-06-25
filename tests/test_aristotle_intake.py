@@ -324,7 +324,6 @@ class TestIntakeSessionFlow:
         assert "prompt" in result
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
     async def test_intake_start_route_returns_greeting(self):
         """POST /intake/start with no plan_id returns a greeting prompt."""
         from aristotle.api import intake_start_route
@@ -361,7 +360,6 @@ class TestIntakeSessionFlow:
         assert "subject" in result["prompt"].lower()
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
     async def test_intake_step_route_advances_state(self):
         """POST /intake/step with a subject input advances to PRIOR_KNOWLEDGE."""
         from aristotle.api import intake_step_route
@@ -634,7 +632,6 @@ class TestPlacerRoutes:
     """Tests for the PLACER API routes."""
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
     async def test_placer_start_route_returns_first_question(self):
         """POST /placer/start reads the plan + returns the first probe question."""
         from aristotle.api import placer_start_route
@@ -702,7 +699,6 @@ class TestPlacerRoutes:
         assert len(result["question"]) > 0
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="Phase B/D — route not yet implemented (ARISTOTLE-DEBT-009)", strict=True)
     async def test_placer_step_route_advances_session(self):
         """POST /placer/step with an answer advances the session."""
         from aristotle.api import placer_step_route

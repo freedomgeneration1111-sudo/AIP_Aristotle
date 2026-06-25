@@ -15,6 +15,10 @@ Routes:
   POST /aristotle/session/start   — start a new tutoring session
   POST /aristotle/session/step    — advance a session one step
   POST /aristotle/session/run     — run a full session (non-interactive)
+  POST /aristotle/intake/start    — start onboarding intake (ADR-002 §9)
+  POST /aristotle/intake/step     — advance intake one turn
+  POST /aristotle/placer/start    — start placement calibration (ADR-002 §9 stage 5)
+  POST /aristotle/placer/step     — advance placement one turn
 
 Layer: imports from aip.adapter.api.dependencies (get_container) — this
 is the composition-root pattern (the API layer is allowed to access the
@@ -46,6 +50,20 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from aip.foundation.protocols.actors import ActorContext
+from aristotle.actors.intake import (
+    IntakeSession,
+    IntakeState,
+    PlacerSession,
+    _detect_intake_intent,
+    _sample_concepts_for_placement,
+    check_intake_triggers,
+    intake_session_from_dict,
+    intake_session_to_dict,
+    placer_session_from_dict,
+    placer_session_to_dict,
+    run_intake_step,
+    run_placer_step,
+)
 from aristotle.ingestor import ingest_concepts_from_yaml, list_concepts
 from aristotle.session import (
     SessionContext,
@@ -409,6 +427,250 @@ async def dashboard_route(request: Request):
         "struggle_pattern": struggle_pattern,
         "mastery_by_concept": mastery_by_concept,
     }
+
+
+# ------------------------------------------------------------------
+# Intake routes (Phase D — ADR-002 §9 onboarding)
+# ------------------------------------------------------------------
+
+
+@router.post("/intake/start")
+async def intake_start_route(request: Request):
+    """Start an onboarding intake conversation (ADR-002 §9).
+
+    Request body: {"plan_id": str | None}
+      - plan_id None or absent → new learner; full intake from GREETING.
+      - plan_id present → check_intake_triggers() decides whether to
+        re-surface (full / checkin / partial) or skip intake entirely
+        (returns trigger=None when the plan is healthy and mid-stream).
+
+    Returns:
+      {
+        "trigger": "full" | "checkin" | "partial" | None,
+        "prompt": str | None,           # first greeting/question
+        "session": IntakeSession_dict | None,
+      }
+
+    When trigger is None the caller should proceed directly to
+    /placer/start or /session/start — no intake needed.
+    """
+    container = _get_container(request)
+    body = await request.json()
+    plan_id = body.get("plan_id") or None
+    ctx = _make_ctx(container)
+
+    trigger = await check_intake_triggers(ctx, plan_id)
+
+    if trigger is None:
+        # No intake needed — plan exists and is healthy.
+        return {"trigger": None, "prompt": None, "session": None}
+
+    # Build a fresh IntakeSession at the trigger's entry_state.
+    session = IntakeSession(
+        state=trigger.entry_state,
+        entry_state=trigger.entry_state,
+        plan_id=plan_id or "",
+    )
+
+    # If the trigger carries a pre-built prompt (checkin / completed-plan
+    # cases), surface it directly without dispatching run_intake_step —
+    # the entry_state is GREETING and the prompt is the re-engagement
+    # message, not the standard "what subject?" greeting.
+    if trigger.prompt:
+        return {
+            "trigger": trigger.level,
+            "prompt": trigger.prompt,
+            "session": intake_session_to_dict(session),
+        }
+
+    # Phase 1 of the entry_state: generate the prompt via run_intake_step
+    # with empty student_input. run_intake_step advances session.state to
+    # the next state and returns the prompt for the current turn.
+    result = await run_intake_step(session, "", ctx)
+    return {
+        "trigger": trigger.level,
+        "prompt": result.get("prompt", ""),
+        "session": intake_session_to_dict(session),
+    }
+
+
+@router.post("/intake/step")
+async def intake_step_route(request: Request):
+    """Advance an intake conversation one turn (ADR-002 §9).
+
+    Request body: {"session": IntakeSession_dict, "student_input": str}
+      - student_input is the learner's free-form reply to the previous
+        prompt. May be empty on the very first turn after intake_start
+        if the caller wants to regenerate the prompt (rare).
+
+    Returns:
+      {
+        "state": str,                   # new IntakeState name
+        "prompt": str | None,           # next prompt, or None at COMPLETE
+        "pivot": IntakeTrigger_dict | None,  # set when intent detected
+        "session": IntakeSession_dict,
+        "plan_id": str | None,          # present when state=COMPLETE
+        "concept_count": int | None,    # present when state=COMPLETE
+      }
+
+    Pivot detection: if the learner's student_input matches an intake
+    intent keyword ("new topic", "exam", "schedule", etc.), the run
+    surfaces the pivot so the caller can decide whether to branch the
+    conversation. Pivots are advisory — the caller may ignore them and
+    continue the normal flow.
+    """
+    container = _get_container(request)
+    body = await request.json()
+    session_dict = body.get("session", {})
+    student_input = body.get("student_input", "")
+
+    session = intake_session_from_dict(session_dict)
+    ctx = _make_ctx(container)
+
+    # Detect mid-conversation intent pivots (advisory).
+    pivot = _detect_intake_intent(student_input)
+
+    result = await run_intake_step(session, student_input, ctx)
+
+    # If the run reached GENERATING_PLAN it has just produced the plan.
+    # run_intake_step returns {"state": "COMPLETE", "plan_id": ...,
+    # "concept_count": N} in that case.
+    response = {
+        "state": result.get("state", session.state.value),
+        "prompt": result.get("prompt"),
+        "pivot": (
+            {"level": pivot.level, "entry_state": pivot.entry_state.value}
+            if pivot
+            else None
+        ),
+        "session": intake_session_to_dict(session),
+    }
+    if result.get("state") == "COMPLETE":
+        response["plan_id"] = result.get("plan_id", session.plan_id)
+        response["concept_count"] = result.get("concept_count")
+    return response
+
+
+# ------------------------------------------------------------------
+# Placer routes (Phase D — ADR-002 §9 stage 5 placement calibration)
+# ------------------------------------------------------------------
+
+
+@router.post("/placer/start")
+async def placer_start_route(request: Request):
+    """Start placement calibration for a learning plan (ADR-002 §9 stage 5).
+
+    Request body: {"plan_id": str}
+      - plan_id is the plan produced by a completed intake. The placer
+        reads concept_ids_json from aristotle_learning_plan, samples a
+        spread of concepts (beginning/middle/end via
+        _sample_concepts_for_placement), and probes the learner on each
+        to calibrate where to start tutoring.
+
+    Returns:
+      {
+        "state": "PROBING",
+        "question": str,                # first probe question
+        "concepts_placed": 0,
+        "session": PlacerSession_dict,
+      }
+
+    The learner never sees the placement labels (CONFIRMED / SHAKY /
+    ABSENT / UNEXPECTED_STRENGTH) — they experience it as Aristotle
+    getting to know them.
+    """
+    container = _get_container(request)
+    body = await request.json()
+    plan_id = body.get("plan_id", "")
+    if not plan_id:
+        raise HTTPException(status_code=400, detail="plan_id required")
+
+    ctx = _make_ctx(container)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    stores = await registry.get_stores("aristotle:textbook")
+    conn = stores.connection_manager.write_conn
+
+    # Read the concept_ids_json from the plan row.
+    cur = await conn.execute(
+        "SELECT concept_ids_json FROM aristotle_learning_plan WHERE id = ?",
+        (plan_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"plan {plan_id!r} not found")
+
+    import json as _json
+
+    try:
+        concept_ids = _json.loads(row[0]) if row[0] else []
+    except (ValueError, TypeError):
+        concept_ids = []
+
+    if not concept_ids:
+        raise HTTPException(
+            status_code=409,
+            detail=f"plan {plan_id!r} has no concepts to place",
+        )
+
+    sampled = _sample_concepts_for_placement(concept_ids)
+    session = PlacerSession(
+        plan_id=plan_id,
+        concepts_to_assess=sampled,
+    )
+
+    # Phase 1: generate the first probe question.
+    result = await run_placer_step(session, "", ctx)
+    return {
+        "state": result.get("state", "PROBING"),
+        "question": result.get("question", ""),
+        "concepts_placed": result.get("concepts_placed", 0),
+        "session": placer_session_to_dict(session),
+    }
+
+
+@router.post("/placer/step")
+async def placer_step_route(request: Request):
+    """Advance a placement calibration one turn (ADR-002 §9 stage 5).
+
+    Request body: {"session": PlacerSession_dict, "student_input": str}
+      - student_input is the learner's answer to the current probe
+        question. Empty string is invalid here — the placer always
+        expects an answer (use /placer/start to get the first question
+        without sending an answer).
+
+    Returns:
+      {
+        "state": "PROBING" | "COMPLETE",
+        "question": str | None,         # next probe question, or None
+        "concepts_placed": int,
+        "concepts_known": int | None,   # only at COMPLETE
+        "session": PlacerSession_dict,
+      }
+    """
+    container = _get_container(request)
+    body = await request.json()
+    session_dict = body.get("session", {})
+    student_input = body.get("student_input", "")
+
+    session = placer_session_from_dict(session_dict)
+    ctx = _make_ctx(container)
+
+    result = await run_placer_step(session, student_input, ctx)
+
+    response = {
+        "state": result.get("state", session.state),
+        "question": result.get("question"),
+        "concepts_placed": result.get("concepts_placed", len(session.results)),
+        "session": placer_session_to_dict(session),
+    }
+    if result.get("state") == "COMPLETE":
+        response["concepts_known"] = result.get("concepts_known")
+    return response
 
 
 # ------------------------------------------------------------------
