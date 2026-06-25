@@ -498,10 +498,20 @@ async def intake_start_route(request: Request):
 async def intake_step_route(request: Request):
     """Advance an intake conversation one turn (ADR-002 §9).
 
-    Request body: {"session": IntakeSession_dict, "student_input": str}
+    Request body: {
+        "session": IntakeSession_dict,
+        "student_input": str,
+        "material_ids": [str, ...]  # optional — ids of newly uploaded
+                                    # materials to attach to this turn
+    }
       - student_input is the learner's free-form reply to the previous
         prompt. May be empty on the very first turn after intake_start
         if the caller wants to regenerate the prompt (rare).
+      - material_ids (optional) — if the learner uploaded a file since
+        the last turn, the GUI sends the material_id(s) here. The route
+        appends them to session.material_ids so the IntakeActor includes
+        their extracted text in its model context for this and future
+        turns. Deduplicates against ids already in the session.
 
     Returns:
       {
@@ -523,9 +533,15 @@ async def intake_step_route(request: Request):
     body = await request.json()
     session_dict = body.get("session", {})
     student_input = body.get("student_input", "")
+    new_material_ids = body.get("material_ids", []) or []
 
     session = intake_session_from_dict(session_dict)
     ctx = _make_ctx(container)
+
+    # Attach any newly uploaded materials to the session (dedup).
+    for mid in new_material_ids:
+        if mid and mid not in session.material_ids:
+            session.material_ids.append(mid)
 
     # Detect mid-conversation intent pivots (advisory).
     pivot = _detect_intake_intent(student_input)
@@ -745,21 +761,29 @@ def _extract_text(content: bytes) -> str:
 
 @router.post("/upload")
 async def upload_route(request: Request):
-    """Upload a file for text extraction (ADR-002 §9 stage 3).
+    """Upload a file for text extraction + persistence (ADR-002 §9 stage 3).
 
-    Receives the raw file body + Content-Type header. Extracts text
-    using:
+    Receives the raw file body + Content-Type header + Content-Disposition
+    header (for filename). Extracts text using:
       - PDF → pypdf (returns page_count)
       - Image → pytesseract OCR
       - HTML → tag stripping
       - txt/md/csv/json/yaml → UTF-8 decode
 
+    Then persists the extracted text to aristotle_uploaded_material
+    (M007 schema) so the INTAKE actor can reference it during the
+    LLM-driven intake conversation and the plan generator can derive
+    concepts from the actual content. Returns the material_id so the
+    GUI can attach it to subsequent /intake/step calls.
+
     Returns:
       {
-        "extracted_text": str,
+        "material_id": str,            # row id in aristotle_uploaded_material
+        "extracted_text": str,         # full extracted text (also stored in DB)
         "source_type": "pdf" | "image" | "text" | "html",
         "char_count": int,
-        "page_count": int | None,  # PDF only
+        "page_count": int | None,      # PDF only
+        "filename": str,
       }
 
     Returns 415 if the Content-Type is unsupported.
@@ -767,6 +791,17 @@ async def upload_route(request: Request):
     container = _get_container(request)
     content = await request.body()
     content_type = (request.headers.get("content-type") or "").lower().split(";")[0].strip()
+
+    # Parse filename from Content-Disposition header (fallback: "upload").
+    disposition = request.headers.get("content-disposition") or ""
+    filename = "upload"
+    if "filename=" in disposition:
+        # Handles both filename="name.pdf" and filename=name.pdf
+        import re as _re
+
+        m = _re.search(r'filename="?([^";]+)"?', disposition)
+        if m:
+            filename = m.group(1)
 
     source_type = _UPLOAD_CT_MAP.get(content_type)
     if source_type is None:
@@ -781,33 +816,58 @@ async def upload_route(request: Request):
     try:
         if source_type == "pdf":
             extracted, page_count = _extract_pdf_text(content)
-            return {
-                "extracted_text": extracted,
-                "source_type": "pdf",
-                "char_count": len(extracted),
-                "page_count": page_count,
-            }
         elif source_type == "image":
             extracted = _extract_image_text(content)
-            return {
-                "extracted_text": extracted,
-                "source_type": "image",
-                "char_count": len(extracted),
-            }
+            page_count = None
         elif source_type == "html":
             extracted = _extract_html_text(content)
-            return {
-                "extracted_text": extracted,
-                "source_type": "html",
-                "char_count": len(extracted),
-            }
+            page_count = None
         else:  # text
             extracted = _extract_text(content)
-            return {
-                "extracted_text": extracted,
-                "source_type": "text",
-                "char_count": len(extracted),
-            }
+            page_count = None
+
+        char_count = len(extracted)
+
+        # Persist to aristotle_uploaded_material so INTAKE + plan generator
+        # can read it back via material_id.
+        material_id = str(__import__("uuid").uuid4())
+        registry = getattr(container, "corpus_registry", None)
+        if registry is not None:
+            try:
+                stores = await registry.get_stores("aristotle:textbook")
+                conn = stores.connection_manager.write_conn
+                await conn.execute(
+                    "INSERT INTO aristotle_uploaded_material "
+                    "(id, student_id, filename, source_type, extracted_text, "
+                    "char_count, page_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("definer", material_id, filename, source_type, extracted,
+                     char_count, page_count),
+                )
+                await conn.commit()
+                logger.info(
+                    "upload_stored material_id=%s filename=%s source=%s chars=%d",
+                    material_id, filename, source_type, char_count,
+                )
+            except Exception as db_exc:
+                # DB persistence is best-effort — don't fail the upload if
+                # the DB is unavailable. The extracted text is still
+                # returned to the caller, just not stored for INTAKE to
+                # reference. Log the failure so it's visible.
+                logger.warning(
+                    "upload_persist_failed material_id=%s error=%s:%s",
+                    material_id, type(db_exc).__name__, db_exc,
+                )
+                material_id = ""
+
+        return {
+            "material_id": material_id,
+            "extracted_text": extracted,
+            "source_type": source_type,
+            "char_count": char_count,
+            "page_count": page_count,
+            "filename": filename,
+        }
     except HTTPException:
         raise
     except Exception as exc:

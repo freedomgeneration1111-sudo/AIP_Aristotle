@@ -73,6 +73,25 @@ class IntakeSession:
 
     The caller persists this between run_intake_step() calls (via the API
     serialization in api.py).
+
+    Phase D brain-transplant fields (added when the IntakeActor became
+    LLM-driven):
+      - material_ids:    ids of uploaded materials (aristotle_uploaded_material
+                         rows) the actor should include in its model context.
+      - extracted:       running structured extraction from the model
+                         (subject, prior_knowledge, goals, schedule_minutes).
+                         Updated each turn; persisted so the conversation
+                         can resume with the model's understanding intact.
+      - draft_plan:      when the model proposes a concept sequence (focus
+                         == PLAN_DRAFT), the proposed concepts land here for
+                         learner review. Empty list until the model drafts.
+      - current_focus:   the model-decided focus for the next turn. Replaces
+                         the deterministic state machine's `state` field as
+                         the source of truth for "what are we talking about
+                         right now." Kept in sync with `state` for backwards
+                         compatibility with code that still reads .state.
+      - plan_confirmed:  True once the learner confirms the draft plan.
+                         Triggers GENERATING_PLAN → COMPLETE transition.
     """
 
     state: IntakeState = IntakeState.GREETING
@@ -83,6 +102,12 @@ class IntakeSession:
     goals: str = ""
     schedule_minutes: int = 30
     responses: list = field(default_factory=list)
+    # Phase D brain-transplant fields
+    material_ids: list = field(default_factory=list)
+    extracted: dict = field(default_factory=dict)
+    draft_plan: list = field(default_factory=list)
+    current_focus: str = "SUBJECT"
+    plan_confirmed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +678,12 @@ def intake_session_to_dict(session: IntakeSession) -> dict:
         "goals": session.goals,
         "schedule_minutes": session.schedule_minutes,
         "responses": list(session.responses),
+        # Phase D brain-transplant fields
+        "material_ids": list(session.material_ids),
+        "extracted": dict(session.extracted),
+        "draft_plan": list(session.draft_plan),
+        "current_focus": session.current_focus,
+        "plan_confirmed": session.plan_confirmed,
     }
 
 
@@ -667,6 +698,12 @@ def intake_session_from_dict(d: dict) -> IntakeSession:
         goals=d.get("goals", ""),
         schedule_minutes=d.get("schedule_minutes", 30),
         responses=d.get("responses", []),
+        # Phase D brain-transplant fields
+        material_ids=d.get("material_ids", []),
+        extracted=d.get("extracted", {}),
+        draft_plan=d.get("draft_plan", []),
+        current_focus=d.get("current_focus", "SUBJECT"),
+        plan_confirmed=d.get("plan_confirmed", False),
     )
 
 
