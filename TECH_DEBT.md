@@ -490,45 +490,50 @@ platform-wide soft-deprecation (Brain DEBT-015) is on track.
 
 ## ARISTOTLE-DEBT-009 — Unbuilt API Routes (Tests Written Ahead of Implementation)
 
-**Status:** Active — Phase B deferred
+**Status:** Partially resolved — 4 of 9 routes wired (commit baf6ef2); 5 still deferred
 **Phase:** Phase B / Phase D
 **Filed:** 2026-06-18
+**Last update:** 2026-06-26 (4 routes wired)
 
-**What was deferred:**
-9 API routes have tests written but no implementation in `aristotle/api.py`.
-The function definitions do not exist anywhere in the codebase. Tests from
-another session were written ahead of the implementation.
+**Resolved (4 routes, xfail markers removed):**
+1. `intake_start_route` — Phase D onboarding intake (commit baf6ef2)
+2. `intake_step_route` — Phase D onboarding intake step (commit baf6ef2)
+3. `placer_start_route` — Phase D placement assessment (commit baf6ef2)
+4. `placer_step_route` — Phase D placement step (commit baf6ef2)
 
-Missing routes (by function name):
-1. `intake_start_route` — Phase D onboarding intake (test_aristotle_intake.py)
-2. `intake_step_route` — Phase D onboarding intake step (test_aristotle_intake.py)
-3. `placer_start_route` — Phase D placement assessment (test_aristotle_intake.py)
-4. `placer_step_route` — Phase D placement step (test_aristotle_intake.py)
+These 4 routes were wired as thin FastAPI wrappers around the existing
+actor logic (IntakeActor, run_intake_step, run_placer_step,
+check_intake_triggers, _detect_intake_intent,
+_sample_concepts_for_placement) + serialization helpers
+(intake_session_to_dict/from_dict, placer_session_to_dict/from_dict).
+Tests in `tests/test_aristotle_intake.py` now pass without xfail.
+
+**Still deferred (5 routes, tests remain xfail):**
 5. `session_history_route` — teacher dashboard session history (test_teacher_dashboard.py)
 6. `misconceptions_route` — misconceptions list for dashboard (test_aristotle_routes.py)
 7. `get_settings_route` — extension settings read (test_aristotle_routes.py)
 8. `update_settings_route` — extension settings write (test_aristotle_routes.py)
 9. `upload_route` — file upload (PDF, image, txt, html, json) (test_aristotle_routes.py, 6 tests)
 
-**Why deferred:**
-These routes were planned by another session (Phase B.5 / Phase D) but the
-implementations were never committed. The tests are correct specifications
-for the intended behavior — they just can't import the function.
+**Why the remaining 5 are deferred:**
+These routes need NEW behavior — not just wrapping existing actors.
+`upload_route` needs OCR pipeline integration (pytesseract + pypdf);
+`session_history_route` + `misconceptions_route` need new read queries;
+`get/update_settings_route` need a settings store. Each is a separate
+piece of work; they will be wired as their consuming GUI surface ships.
 
-**Resolution:**
-Tests marked `@pytest.mark.xfail(reason="Phase B/D — route not yet implemented")`
-so the suite reads clean (0 unexpected failures) without hiding the gap.
-When each route is implemented, remove the xfail marker — the test will
-either pass (implementation correct) or fail (implementation needs work).
-
-**Remediation trigger:**
-When implementing each Phase B/D route, remove the xfail marker and verify
-the test passes.
+**Resolution policy:**
+When each remaining route is implemented, remove the xfail marker and
+verify the test passes. If the test fails, fix the implementation, do
+not silently re-mark as xfail.
 
 **Related work:**
-- `tests/test_aristotle_intake.py` (4 tests — intake + placer routes)
-- `tests/test_aristotle_routes.py` (9 tests — misconceptions, settings, upload)
-- `tests/test_teacher_dashboard.py` (2 tests — session history)
-- `aristotle/api.py` (where the routes need to be added)
+- `tests/test_aristotle_intake.py` (4 tests — wired, passing)
+- `tests/test_aristotle_routes.py` (9 tests — still xfail)
+- `tests/test_teacher_dashboard.py` (2 tests — still xfail)
+- `aristotle/api.py` (where the remaining routes need to be added)
+- Brain GUI: `gui/pages/ask.py` `_ask_page_aristotle()` consumes
+  /intake/* and /placer/* — wired in AIP_Brain commit a6f59bc on
+  feat/multi-corpus.
 
 ---

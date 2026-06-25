@@ -27,6 +27,8 @@ tasks.
 - Content ingestor (YAML → aristotle_concept, bilingual)
 - CLI (HTTP client): health, list-concepts, ingest, session (interactive + non-interactive)
 - API routes: /concepts, /ingest, /session/{start,step,run}, /intake/{start,step}, /placer/{start,step}, /dashboard, /misconceptions, /settings (GET+POST), /upload, /session-history
+  - Wired: /intake/{start,step} + /placer/{start,step} (commit baf6ef2 — ARISTOTLE-DEBT-009 partial)
+  - Still unwired (xfail tests in test_aristotle_routes.py + test_teacher_dashboard.py): /misconceptions, /settings GET+POST, /upload, /session-history
 - Expanded /upload endpoint: PDF (pypdf), images (pytesseract OCR), txt/md/csv/html/json/yaml/docx
 - GUI learning view at /learn (concept selector + tutoring session)
 - GUI teacher dashboard at /dashboard (stats header, struggle pattern, mastery table)

@@ -184,12 +184,21 @@ surface. ARISTOTLE registers three pages only:
 | 5 | **OCR path** via `pytesseract` | Extracts text from uploaded images / scanned PDFs into the ingestor. `pypdf` for native PDFs (fix already committed — DEBT-012 resolved). | None. `pytesseract` + `Pillow` installed. Upload via Brain core + menu. |
 | 7 | **Voice mode toggle** | Browser Web Speech API for STT (zero-dep path). Contributed via Brain core + menu, not a separate ARISTOTLE UI element. | None for browser path. |
 
-**Intake via Brain chat:** The INTAKE actor (already built — commit
-`5128caa`) drives the conversation via the `/intake/start` and
-`/intake/step` API routes. The Brain chat bar IS the intake surface —
-ARISTOTLE does not register a separate /intake page. The chat-primary
-extension pattern (UI_CONVENTIONS.md) means the chat bar stays as the
-main view during intake, with ARISTOTLE's mode label in the header.
+**Intake via Brain chat:** The INTAKE actor (built — commit `5128caa`)
+drives the conversation via the `/intake/start` and `/intake/step` API
+routes (wired — commit `baf6ef2`). The Brain chat bar IS the intake
+surface — ARISTOTLE does not register a separate /intake page. The
+chat-primary extension pattern (UI_CONVENTIONS.md) means the chat bar
+stays as the main view during intake, with ARISTOTLE's mode label in
+the header.
+
+**Status (2026-06-26):** The chat-primary GUI shipped in AIP_Brain
+commit `a6f59bc` (feat/multi-corpus). `_ask_page_aristotle()` in
+`gui/pages/ask.py` now drives the full INTAKE → PLACER → TUTORING
+flow through a single chat surface — no concept cards, no START
+button, no autostart. The chat bar is visible from the first render.
+Phase label in the header (Onboarding / Placement / Tutoring /
+Complete) is operator-only — the learner never sees the phase names.
 
 **+ menu:** ARISTOTLE does not register new + menu items — Upload PDF
 and Voice mode are Brain core features. ARISTOTLE consumes them via
