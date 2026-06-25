@@ -674,6 +674,148 @@ async def placer_step_route(request: Request):
 
 
 # ------------------------------------------------------------------
+# Upload route (Phase D — ADR-002 §9 stage 3 material inventory)
+# ------------------------------------------------------------------
+
+
+# Content-Type → source_type mapping for supported file types.
+# Anything not in this map (or application/octet-stream without magic
+# bytes) returns 415 Unsupported Media Type.
+_UPLOAD_CT_MAP = {
+    "application/pdf": "pdf",
+    "image/png": "image",
+    "image/jpeg": "image",
+    "image/jpg": "image",
+    "image/gif": "image",
+    "image/webp": "image",
+    "image/bmp": "image",
+    "image/tiff": "image",
+    "text/plain": "text",
+    "text/markdown": "text",
+    "text/csv": "text",
+    "text/html": "html",
+    "application/json": "text",
+    "application/x-yaml": "text",
+}
+
+
+def _extract_pdf_text(content: bytes) -> tuple[str, int]:
+    """Extract text from a PDF via pypdf. Returns (text, page_count)."""
+    import io
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(content))
+    pages = []
+    for page in reader.pages:
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception:
+            pages.append("")
+    return "\n\n".join(pages), len(reader.pages)
+
+
+def _extract_image_text(content: bytes) -> str:
+    """Extract text from an image via pytesseract OCR."""
+    import io
+    from PIL import Image
+    import pytesseract
+
+    img = Image.open(io.BytesIO(content))
+    return pytesseract.image_to_string(img)
+
+
+def _extract_html_text(content: bytes) -> str:
+    """Extract text from HTML by stripping tags."""
+    import re
+
+    text = content.decode("utf-8", errors="replace")
+    # Remove script/style blocks first (so their content doesn't leak)
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", text, flags=re.S | re.I)
+    # Remove all remaining tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _extract_text(content: bytes) -> str:
+    """Decode raw text bytes (txt/md/csv/json/yaml)."""
+    return content.decode("utf-8", errors="replace")
+
+
+@router.post("/upload")
+async def upload_route(request: Request):
+    """Upload a file for text extraction (ADR-002 §9 stage 3).
+
+    Receives the raw file body + Content-Type header. Extracts text
+    using:
+      - PDF → pypdf (returns page_count)
+      - Image → pytesseract OCR
+      - HTML → tag stripping
+      - txt/md/csv/json/yaml → UTF-8 decode
+
+    Returns:
+      {
+        "extracted_text": str,
+        "source_type": "pdf" | "image" | "text" | "html",
+        "char_count": int,
+        "page_count": int | None,  # PDF only
+      }
+
+    Returns 415 if the Content-Type is unsupported.
+    """
+    container = _get_container(request)
+    content = await request.body()
+    content_type = (request.headers.get("content-type") or "").lower().split(";")[0].strip()
+
+    source_type = _UPLOAD_CT_MAP.get(content_type)
+    if source_type is None:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported media type: {content_type}",
+        )
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty upload body")
+
+    try:
+        if source_type == "pdf":
+            extracted, page_count = _extract_pdf_text(content)
+            return {
+                "extracted_text": extracted,
+                "source_type": "pdf",
+                "char_count": len(extracted),
+                "page_count": page_count,
+            }
+        elif source_type == "image":
+            extracted = _extract_image_text(content)
+            return {
+                "extracted_text": extracted,
+                "source_type": "image",
+                "char_count": len(extracted),
+            }
+        elif source_type == "html":
+            extracted = _extract_html_text(content)
+            return {
+                "extracted_text": extracted,
+                "source_type": "html",
+                "char_count": len(extracted),
+            }
+        else:  # text
+            extracted = _extract_text(content)
+            return {
+                "extracted_text": extracted,
+                "source_type": "text",
+                "char_count": len(extracted),
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("upload_extraction_failed ct=%s error=%s:%s", content_type, type(exc).__name__, exc)
+        raise HTTPException(status_code=500, detail=f"Text extraction failed: {exc}")
+
+
+# ------------------------------------------------------------------
 # Serialization helpers
 # ------------------------------------------------------------------
 
