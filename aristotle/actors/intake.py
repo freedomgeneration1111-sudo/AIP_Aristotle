@@ -656,6 +656,10 @@ YOUR JOB: Have a real conversation to understand what the learner wants to study
 
 This is NOT a rigid questionnaire. Each focus area (subject, prior knowledge, goals, schedule, materials) is a PHASE, not a single turn. You can ask follow-up questions, dig deeper, circle back, or adjust based on what the learner says. You decide when you have enough signal to advance.
 
+UPLOADED MATERIALS ARE THE CURRICULUM. When the learner uploads a paper, textbook chapter, or notes, that material IS the curriculum — you must read it deeply and derive the learning plan's concepts from its actual content. Do NOT ask the learner to summarize the paper for you; read it yourself from the "Uploaded materials" section of the user prompt. Acknowledge specifically what you read (e.g., "I see this paper covers Newton's three laws and includes worked examples on inclined planes" — not "I see you uploaded a paper"). When you propose a draft_plan, the concepts should come from the paper's actual sections, equations, theorems, or chapters — ordered by prerequisite dependency as the paper presents them.
+
+If the "Uploaded materials" section shows a truncation notice ("... [PAPER TRUNCATED: N more chars]"), acknowledge to the learner that you've read the first portion and ask whether the remaining content follows the same structure or introduces new topics — don't pretend you've read the whole paper.
+
 YOU MUST RETURN VALID JSON with this exact schema:
 {
   "response": "what you say to the learner next (conversational, warm, in Aristotle's voice)",
@@ -690,24 +694,33 @@ When next_focus == "PLAN_DRAFT", set draft_plan to a list of concept objects:
   ...
 ]
 
-The draft_plan should be derived from the conversation + any uploaded materials. If the learner uploaded a paper, the concepts should come from the paper's actual content. Order concepts by prerequisite dependency (foundations first).
+The draft_plan should be derived from the conversation + any uploaded materials. If the learner uploaded a paper, the concepts should come from the paper's actual content — its sections, equations, theorems, or chapter headings. Do NOT invent generic concepts; ground every concept in the paper's actual structure. Order concepts by prerequisite dependency (foundations first, as the paper presents them).
 
 When next_focus == "COMPLETE", the learner has confirmed the plan. Keep draft_plan as the confirmed list.
 
 The "extracted" field should be updated each turn with your current understanding. Start with empty strings and fill in as you learn. "subject" must be the extracted subject (e.g., "physics", "null boundary constraint manifolds"), NOT the learner's raw words.
 
-Be conversational. Reflect back what you heard. Ask one question at a time. Don't rush — it's fine to spend 2-3 turns in one focus area if the learner's answer is nuanced. If they upload a material, acknowledge it and adjust your questions based on what's in it."""
+Be conversational. Reflect back what you heard. Ask one question at a time. Don't rush — it's fine to spend 2-3 turns in one focus area if the learner's answer is nuanced. If they upload a material, acknowledge SPECIFICALLY what you read in it (not just "I see you uploaded a paper") and adjust your questions based on what's in it."""
 
 
 def _build_intake_user_prompt(
     session: IntakeSession,
     student_input: str,
     materials: list[dict],
+    material_preview_chars: int = 20000,
 ) -> str:
     """Build the user prompt for the LLM-driven intake turn.
 
     Includes: current focus, conversation history, extracted so far,
-    uploaded material previews (truncated), and the learner's latest reply.
+    uploaded material texts (truncated to material_preview_chars with a
+    clear truncation notice), and the learner's latest reply.
+
+    Args:
+        material_preview_chars: Max chars of each material to include.
+            Default 20000 (~5000 tokens) — large enough for the LLM to
+            actually read a paper's abstract + intro + methods + first
+            results section. For longer papers, a truncation notice is
+            appended so the LLM knows the paper continues.
     """
     parts = []
     parts.append(f"Current focus: {session.current_focus}")
@@ -729,16 +742,31 @@ def _build_intake_user_prompt(
                 parts.append(f"  {k}: {v}")
         parts.append("")
 
-    # Uploaded materials (truncated previews).
+    # Uploaded materials — the curriculum. Include the full text up to
+    # material_preview_chars per material. For longer materials, append a
+    # clear truncation notice so the LLM knows the paper continues and
+    # can ask the learner about the remaining scope.
     if materials:
-        parts.append("Uploaded materials:")
+        parts.append("Uploaded materials (these ARE the curriculum — read them deeply):")
         for m in materials:
-            preview = (m.get("extracted_text") or "")[:2000]
-            parts.append(
-                f"  - {m.get('filename', 'unknown')} ({m.get('source_type', 'unknown')}): "
-                f"{preview}"
-            )
-        parts.append("")
+            filename = m.get("filename", "unknown")
+            source_type = m.get("source_type", "unknown")
+            full_text = m.get("extracted_text") or ""
+            total_chars = len(full_text)
+            if total_chars <= material_preview_chars:
+                parts.append(f"  --- {filename} ({source_type}, {total_chars} chars) ---")
+                parts.append(full_text)
+            else:
+                preview = full_text[:material_preview_chars]
+                remaining = total_chars - material_preview_chars
+                parts.append(f"  --- {filename} ({source_type}, {total_chars} chars total — showing first {material_preview_chars}) ---")
+                parts.append(preview)
+                parts.append(
+                    f"  ... [PAPER TRUNCATED: {remaining} more chars not shown. "
+                    f"Ask the learner whether the remaining content follows the "
+                    f"same structure or introduces new topics.]"
+                )
+            parts.append("")
 
     # Draft plan if one exists (learner is reviewing/amending).
     if session.draft_plan:
@@ -794,12 +822,46 @@ async def run_intake_step(
     # Fetch uploaded material texts for the model context.
     materials = await _fetch_material_texts(ctx, session.material_ids)
 
+    # Log material fetch results — critical for debugging "the LLM didn't
+    # see my paper" issues. If session.material_ids is non-empty but
+    # materials is empty, the DB lookup returned 0 rows (the material_id
+    # didn't match any row in aristotle_uploaded_material).
+    if session.material_ids:
+        total_chars = sum(len(m.get("extracted_text") or "") for m in materials)
+        logger.info(
+            "intake_materials_fetched requested=%d fetched=%d total_chars=%d",
+            len(session.material_ids),
+            len(materials),
+            total_chars,
+        )
+        if len(materials) < len(session.material_ids):
+            logger.warning(
+                "intake_materials_missing requested_ids=%s fetched_filenames=%s — "
+                "some uploaded materials were not found in the DB. This usually "
+                "means the upload route failed to persist them (check the upload "
+                "route's INSERT column/value order).",
+                session.material_ids,
+                [m.get("filename") for m in materials],
+            )
+    else:
+        logger.debug("intake_no_materials_attached session_id=%s", id(session))
+
     # Record the learner's reply in the conversation history.
     if student_input:
         session.responses.append(student_input)
 
+    # Resolve material_preview_chars from the extension config (if the
+    # container exposes it) — defaults to 20000 if not configured.
+    preview_chars = 20000
+    ext_config = getattr(container, "extension_config", None)
+    if ext_config is not None:
+        ar_settings = ext_config.get("aristotle", {}) if isinstance(ext_config, dict) else {}
+        preview_chars = ar_settings.get("material_preview_chars", 20000)
+
     # Build the prompts.
-    user_prompt = _build_intake_user_prompt(session, student_input, materials)
+    user_prompt = _build_intake_user_prompt(
+        session, student_input, materials, material_preview_chars=preview_chars,
+    )
 
     try:
         result = await model_provider.call(

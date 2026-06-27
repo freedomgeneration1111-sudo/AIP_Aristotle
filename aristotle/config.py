@@ -39,3 +39,13 @@ class AristotleSettings:
     # Mastery threshold (0.0-1.0) — EXAMINER's evaluate() uses this to
     # decide if a concept is mastered. Score >= threshold → mastered.
     mastery_threshold: float = 0.7
+
+    # Maximum chars of each uploaded material to include in the IntakeActor's
+    # model context per turn. Papers are the curriculum — the LLM needs to
+    # actually read them, not just see a 2000-char abstract preview.
+    # 20000 chars ≈ 5000 tokens, which fits comfortably in modern context
+    # windows (gpt-4o: 128k, claude-3.5: 200k, gemini-1.5: 1M, even
+    # openrouter free tiers handle 32k+). For papers longer than this,
+    # the prompt includes a clear truncation notice so the LLM knows the
+    # paper continues and can ask the learner to confirm scope.
+    material_preview_chars: int = 20000

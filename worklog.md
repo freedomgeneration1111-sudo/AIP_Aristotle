@@ -256,3 +256,42 @@ Files changed:
 - aristotle/api.py — fixed upload_route INSERT column/value order (id ↔ student_id swap) + added clarifying comment
 - tests/test_aristotle_routes.py — added test_upload_sql_insert_column_value_order_is_correct regression test
 - tests/test_aristotle_intake_e2e.py — NEW end-to-end smoke test (TestClient + scripted fake model + real SQLite DB)
+
+---
+Task ID: 10
+Agent: Super Z (main)
+Task: Fix "LLM doesn't recognize the uploaded paper" — paper content wasn't reaching the model context
+
+Work Log:
+- User reported: uploaded a paper via the ARISTOTLE chat, Aristotle responded asking for the paper's title/description — proving the model KNEW a paper was attached but didn't have its content.
+- Root cause analysis (3 contributing bugs):
+  1. _build_intake_user_prompt truncated each material to 2000 chars in the model context. A typical academic paper is 30k-80k chars — the LLM only saw the abstract + intro, not enough to derive a curriculum.
+  2. The system prompt told the LLM to "acknowledge" uploaded materials but didn't explicitly instruct it to READ the material content and derive concepts from it. The model defaulted to asking the learner to summarize.
+  3. When the DB lookup returned 0 rows (e.g., the upload route failed to persist the material_id correctly — see Task ID 9), the IntakeActor silently passed an empty materials list to the model with NO warning logged. This made the original upload bug invisible to operators.
+- Fix 1 (config.py): Added material_preview_chars field to AristotleSettings (default 20000 ≈ 5000 tokens). Large enough for the LLM to actually read a paper's abstract + intro + methods + first results section. Fits comfortably in modern context windows.
+- Fix 2 (intake.py::_build_intake_user_prompt): Now takes material_preview_chars parameter (default 20000). For materials longer than the limit, appends a clear truncation notice: "PAPER TRUNCATED: N more chars not shown. Ask the learner whether the remaining content follows the same structure or introduces new topics." The LLM knows the paper continues and can ask about scope instead of pretending it read the whole thing.
+- Fix 3 (intake.py::run_intake_step): Added explicit logging when materials are fetched:
+  - info: intake_materials_fetched requested=N fetched=M total_chars=K
+  - warning: intake_materials_missing — when requested > fetched (the DB lookup returned fewer rows than expected). The warning message explicitly mentions "the upload route failed to persist them" so operators know where to look.
+- Fix 4 (intake.py::_INTAKE_SYSTEM_PROMPT): Strengthened the prompt with a new section "UPLOADED MATERIALS ARE THE CURRICULUM" — explicitly instructs the LLM to:
+  - Read the paper content from the "Uploaded materials" section (not ask the learner to summarize)
+  - Acknowledge SPECIFICALLY what it read (e.g., "I see this paper covers Newton's three laws and includes worked examples on inclined planes" — not "I see you uploaded a paper")
+  - Derive draft_plan concepts from the paper's actual sections/equations/theorems/chapters
+  - Acknowledge truncation when present (don't pretend it read the whole paper)
+- Fix 5 (Brain gui/pages/ask.py::_handle_aristotle_upload): After a successful upload during INTAKE phase, the GUI now auto-triggers _step_intake("") with empty student_input. This forces the LLM to immediately see the paper content and acknowledge it specifically — without requiring the learner to type something first. Also added an explicit error message when material_id is empty (upload route failed to persist) so the learner knows Aristotle won't see the paper.
+- Added 3 regression tests in tests/test_aristotle_intake.py::TestIntakeLLMDriven:
+  - test_llm_driven_long_paper_content_reaches_model_not_truncated_to_2000 — verifies a 15000-char paper's full content reaches the model (would have failed under the old 2000-char limit).
+  - test_llm_driven_very_long_paper_shows_truncation_notice — verifies a 30000-char paper gets a clear truncation notice with the remaining char count.
+  - test_llm_driven_material_fetch_failure_logs_warning — verifies the intake_materials_missing warning fires when session.material_ids is set but the DB returns 0 rows (the silent-failure mode that masked the original upload bug).
+- Verified: 164 pass / 5 xfail / 0 regressions. Standalone smoke test (21 stages) still passes.
+
+Stage Summary:
+- The LLM now actually reads uploaded papers. The combination of (a) larger preview limit, (b) explicit "these ARE the curriculum" system prompt instruction, (c) auto-trigger after upload, and (d) truncation notice for very long papers means the model has both the content and the instruction to derive the curriculum from it.
+- The intake_materials_missing warning is the canary that would have caught the original upload bug immediately — operators will see it in the logs whenever a material_id is sent to /intake/step but the DB lookup returns nothing.
+- The material_preview_chars setting (default 20000) is configurable via the extension config so operators can tune it for their model's context window. Larger models (claude-3.5, gemini-1.5) can handle 100k+ chars; smaller free-tier OpenRouter models may need to keep it at 20000 to avoid context overflow.
+
+Files changed:
+- aristotle/config.py — added material_preview_chars field (default 20000)
+- aristotle/actors/intake.py — strengthened system prompt + improved _build_intake_user_prompt (configurable preview, truncation notice) + added material-fetch logging in run_intake_step
+- tests/test_aristotle_intake.py — 3 new regression tests
+- (Brain) gui/pages/ask.py — auto-trigger _step_intake("") after upload during INTAKE phase + explicit error when material_id is empty

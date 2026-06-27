@@ -649,6 +649,132 @@ class TestIntakeLLMDriven:
         assert "subject" in result["prompt"].lower()
         assert session.state == IntakeState.SUBJECT
 
+    @pytest.mark.asyncio
+    async def test_llm_driven_long_paper_content_reaches_model_not_truncated_to_2000(self):
+        """REGRESSION: a long paper's content must reach the model, not be
+        truncated to 2000 chars.
+
+        The original implementation truncated each material to 2000 chars
+        in _build_intake_user_prompt — way too small for a paper (typical
+        academic paper is 30k-80k chars). The LLM only saw the abstract
+        and asked the learner to "share the title" because it couldn't
+        read the actual content.
+
+        Fix: default material_preview_chars is now 20000 (~5000 tokens).
+        This test verifies that a 15000-char paper's full content reaches
+        the model (it's under the new limit).
+        """
+        # 15000-char paper — would have been truncated under the old 2000
+        # char limit, but fits under the new 20000 char limit.
+        paper_body = "A" * 15000
+        conn = _FakeConn(rows=[("long_paper.pdf", "pdf", paper_body)])
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "I've read your paper.",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {"subject": "physics"},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = IntakeSession(
+            current_focus="SUBJECT",
+            material_ids=["mat-1"],
+        )
+
+        await run_intake_step(session, "i uploaded a paper", ctx)
+
+        user_prompt = fake.calls[0][1][1]["content"]
+        # The full 15000 chars should be in the prompt (not truncated to 2000).
+        assert paper_body in user_prompt, (
+            "Full paper content (15000 chars) should reach the model. "
+            f"Prompt length: {len(user_prompt)}"
+        )
+        # No truncation notice should appear (paper fits in the preview).
+        assert "PAPER TRUNCATED" not in user_prompt
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_very_long_paper_shows_truncation_notice(self):
+        """A paper longer than material_preview_chars gets a clear truncation notice.
+
+        The LLM needs to know the paper continues so it can ask the learner
+        about the remaining scope (instead of pretending it read the whole
+        thing).
+        """
+        # 30000-char paper — exceeds the 20000 default preview limit.
+        paper_body = "B" * 30000
+        conn = _FakeConn(rows=[("very_long_paper.pdf", "pdf", paper_body)])
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "I've read the first portion.",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {"subject": "physics"},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = IntakeSession(
+            current_focus="SUBJECT",
+            material_ids=["mat-1"],
+        )
+
+        await run_intake_step(session, "i uploaded a long paper", ctx)
+
+        user_prompt = fake.calls[0][1][1]["content"]
+        # First 20000 chars should be present.
+        assert paper_body[:20000] in user_prompt
+        # Truncation notice should be present, mentioning the remaining 10000 chars.
+        assert "PAPER TRUNCATED" in user_prompt
+        assert "10000 more chars" in user_prompt
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_material_fetch_failure_logs_warning(self, caplog):
+        """When session.material_ids is set but the DB returns 0 rows, a
+        warning is logged so the operator can diagnose the upload-route bug.
+
+        This is the silent-failure mode that masked the original upload
+        INSERT column/value swap bug — the material_id was stored under
+        the wrong column, so _fetch_material_texts returned 0 rows, and
+        the LLM got an empty materials list with NO warning.
+        """
+        # _FakeConn returns no rows — simulates the DB lookup returning 0
+        # results because the material_id doesn't match any stored row.
+        conn = _FakeConn(rows=[])
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Hello!",
+                    "next_focus": "SUBJECT",
+                    "extracted": {},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = IntakeSession(
+            current_focus="SUBJECT",
+            material_ids=["mat-1", "mat-2"],  # 2 requested, 0 will be found
+        )
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="test"):
+            await run_intake_step(session, "hello", ctx)
+
+        # The warning about missing materials should be in the logs.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "intake_materials_missing" in r.message
+            for r in warnings
+        ), (
+            "Expected intake_materials_missing warning when material_ids are "
+            "set but the DB returns 0 rows. This warning is critical for "
+            "diagnosing upload-route persistence bugs."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Plan ingestion tests (Phase D brain transplant — Piece 3)
