@@ -295,3 +295,54 @@ Files changed:
 - aristotle/actors/intake.py — strengthened system prompt + improved _build_intake_user_prompt (configurable preview, truncation notice) + added material-fetch logging in run_intake_step
 - tests/test_aristotle_intake.py — 3 new regression tests
 - (Brain) gui/pages/ask.py — auto-trigger _step_intake("") after upload during INTAKE phase + explicit error when material_id is empty
+
+---
+Task ID: 11
+Agent: Super Z (main)
+Task: Fix all 4 bugs from Claude's diagnostic (aristotle_diagnostic.md) — "Aristotle is coming across like an idiot"
+
+Work Log:
+- User uploaded aristotle_diagnostic.md (Claude's architectural review of the NBCM onboarding screenshot). The diagnostic identified 4 discrete bugs that stack to produce the "idiot" behavior: 8+ turns of meta-questions, no teaching, hallucinated paper ingestion, swallowed error detail.
+- Verified each bug against the actual code — all 4 are real. Implemented fixes in priority order (BUG-003 → BUG-001 → BUG-002 → BUG-004 per the diagnostic).
+
+BUG-003 (HIGH, trivial): Auto-trigger with empty student_input sent "(This is the first turn — generate your greeting.)" at turn 8 of a conversation.
+- Fix in _build_intake_user_prompt: distinguish 3 cases for student_input:
+  1. Non-empty text → "Learner's latest reply: {text}"
+  2. Empty text + session.responses non-empty → upload auto-trigger instruction: "Acknowledge SPECIFICALLY what you read... Do NOT re-greet. If all four extracted fields are populated, propose a draft_plan now."
+  3. Empty text + empty responses → genuine first turn greeting instruction (unchanged)
+- Regression test: test_llm_driven_auto_trigger_after_upload_does_not_re_greet
+
+BUG-001 (CRITICAL): No forcing function on intake turns — the model could interrogate the learner forever in a single focus area. The screenshot showed 8+ turns of polite sub-questions with no plan.
+- Fix Part A: Added turns_in_focus field to IntakeSession. Incremented in run_intake_step when next_focus == session.current_focus; reset to 0 on focus change. Persisted in intake_session_to_dict/from_dict so it survives the API round-trip.
+- Fix Part B: System prompt now includes "HARD CAP ON INTERROGATION: You must advance next_focus after at most 2 turns in any one focus area." + "AUTO-ADVANCE RULE: If all four extracted fields are populated, you MUST return next_focus=PLAN_DRAFT."
+- Fix Part C: _build_intake_user_prompt now surfaces "Turns spent in current focus: N" + a WARNING when N >= 2 + "AUTO-ADVANCE TRIGGERED" when all 4 fields are filled.
+- Fix Part D: Server-side auto-advance in run_intake_step — if all 4 extracted fields are filled AND turns_in_focus >= 2 AND next_focus is not PLAN_DRAFT/COMPLETE, override next_focus to PLAN_DRAFT. This is the forcing function the diagnostic asked for — eliminates interrogation hell even if the model ignores the prompt instructions.
+- Regression tests: test_llm_driven_turns_in_focus_increments_when_same_focus, test_llm_driven_turns_in_focus_resets_on_focus_change, test_llm_driven_auto_advances_to_plan_draft_when_all_fields_filled, test_llm_driven_does_not_auto_advance_before_turn_cap
+
+BUG-002 (CRITICAL): LLM hallucinated paper ingestion — claimed "I have indeed ingested the NBCM paper and can see the list of citations" then asked "could you tell me a bit more about the paper's structure?" — proving it read nothing.
+- Root cause: pypdf extracted only a few chars from the math-heavy NBCM PDF (LaTeX-rendered glyphs). The thin text was passed to the LLM as "extracted_text", the LLM inferred from conversation context that a paper existed, and hallucinated.
+- Fix Part A (intake.py::_build_intake_user_prompt): When extracted_text < 100 chars, the prompt now says "EXTRACTION FAILED: only N chars extracted. This is likely a math-heavy or scanned PDF that pypdf cannot parse. DO NOT claim to have read this paper. Tell the learner the extraction failed and ask them to paste the abstract + section headings as text." The garbage text is NOT passed to the LLM.
+- Fix Part B (ask.py::_handle_aristotle_upload): When char_count < 200, the GUI now shows a red error bubble: "Uploaded {filename} but extracted only N chars — likely a math-heavy or scanned PDF that pypdf can't parse. Aristotle will NOT be able to read this paper's content. Try pasting the abstract + section headings as text instead." The auto-trigger is skipped (the LLM would just hallucinate).
+- Fix Part C (intake.py::run_intake_step): Added intake_material_text_thin warning log when any material's extracted_text < 200 chars. Message: "PDF likely failed extraction (math-heavy or scanned). LLM context will be effectively empty; the model may hallucinate that it read the paper."
+- Regression test: test_llm_driven_short_extracted_text_shows_extraction_failed
+
+BUG-004 (MEDIUM): "Something went wrong:" error bubble swallowed exception detail.
+- Fix in ask.py::_render_http_error: When the exception has a .response attribute (httpx.HTTPStatusError), append " | HTTP {status}: {body[:200]}" to the error message so the operator can see the actual HTTP status code + response body instead of just str(exc).
+- No new test (the change is in a GUI closure that's hard to unit-test; verified manually by reading the diff).
+
+- Updated the existing test_llm_driven_includes_uploaded_materials_in_context test — the old test used a 30-char material text which now correctly triggers the EXTRACTION FAILED guard. Bumped the test text to ~175 chars so it exercises the normal (non-failed) path.
+- Verified: 171 pass / 5 xfail / 0 regressions (up from 164 — 7 new tests added). Standalone smoke test 21/21 stages pass. Brain side: 26 pass / 1 skip / 0 regressions.
+
+Stage Summary:
+- The "idiot Aristotle" behavior had 4 stacking causes, all now fixed:
+  1. The model could interrogate forever (BUG-001) → hard cap + server-side auto-advance
+  2. The model hallucinated paper ingestion (BUG-002) → EXTRACTION FAILED guard + thin-text warning + user-facing error
+  3. The auto-trigger confused the model into re-greeting (BUG-003) → 3-way branch for student_input
+  4. Errors were swallowed (BUG-004) → exception detail + HTTP status surfaced
+- The expected behavior after these fixes (from the diagnostic): by turn 5 (subject + priors + goals + schedule all collected), Aristotle should auto-advance to PLAN_DRAFT, propose a concept sequence derived from the paper's actual content (or honestly report extraction failure), and the learner can confirm to start tutoring by turn 6.
+- The server-side auto-advance (BUG-001 Part D) is the safety net — even if the model ignores the prompt instructions, the server forces PLAN_DRAFT after 2 turns in any focus area once all 4 fields are filled. This guarantees the interrogation can't continue past ~6-8 turns max.
+
+Files changed:
+- aristotle/actors/intake.py: turns_in_focus field + hard cap in system prompt + turns_in_focus in _build_intake_user_prompt + auto-advance in run_intake_step + EXTRACTION FAILED guard + thin-text warning + serialization
+- tests/test_aristotle_intake.py: 7 new regression tests + 1 existing test updated for the new >100 char threshold
+- (Brain) gui/pages/ask.py: BUG-002 Part B (char_count < 200 warning) + BUG-004 (exception detail)

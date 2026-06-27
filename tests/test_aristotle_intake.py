@@ -611,8 +611,14 @@ class TestIntakeLLMDriven:
     @pytest.mark.asyncio
     async def test_llm_driven_includes_uploaded_materials_in_context(self):
         """material_ids on the session are fetched + included in the model context."""
-        # The fake conn returns a row for the material query
-        conn = _FakeConn(rows=[("paper.pdf", "pdf", "This paper covers NBCM theory.")])
+        # The fake conn returns a row for the material query. Text must be
+        # >= 100 chars to pass the EXTRACTION FAILED guard added in BUG-002.
+        material_text = (
+            "This paper covers NBCM theory — null boundary constraint manifolds. "
+            "It develops the constraint algebra on a Lorentzian manifold with "
+            "2+2 foliation and derives the Hamiltonian structure."
+        )
+        conn = _FakeConn(rows=[("paper.pdf", "pdf", material_text)])
         fake = _FakeModelProvider(
             responses={
                 "beast": json.dumps({
@@ -774,6 +780,257 @@ class TestIntakeLLMDriven:
             "set but the DB returns 0 rows. This warning is critical for "
             "diagnosing upload-route persistence bugs."
         )
+
+    # ------------------------------------------------------------------
+    # BUG-001: turns_in_focus counter + hard cap + auto-advance
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_turns_in_focus_increments_when_same_focus(self):
+        """turns_in_focus increments when the model returns the same next_focus."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Tell me more about your background.",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {"subject": "physics"},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="PRIOR_KNOWLEDGE",
+            turns_in_focus=0,
+        )
+
+        await run_intake_step(session, "a little", ctx)
+
+        # Same focus returned → turns_in_focus should increment to 1
+        assert session.turns_in_focus == 1
+        assert session.current_focus == "PRIOR_KNOWLEDGE"
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_turns_in_focus_resets_on_focus_change(self):
+        """turns_in_focus resets to 0 when the model advances to a new focus."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "What are your goals?",
+                    "next_focus": "GOALS",
+                    "extracted": {"subject": "physics", "prior_knowledge": "basic"},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="PRIOR_KNOWLEDGE",
+            turns_in_focus=2,  # was at cap
+        )
+
+        await run_intake_step(session, "basic", ctx)
+
+        # Focus changed → turns_in_focus should reset to 0
+        assert session.turns_in_focus == 0
+        assert session.current_focus == "GOALS"
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_auto_advances_to_plan_draft_when_all_fields_filled(self):
+        """BUG-001 fix: when all 4 extracted fields are filled + turns_in_focus >= 2,
+        the server forces next_focus to PLAN_DRAFT even if the model returned
+        a different focus. This is the forcing function that eliminates the
+        'interrogation hell' where the model keeps asking polite sub-questions.
+        """
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Let me ask one more question about your schedule.",
+                    "next_focus": "SCHEDULE",  # model wants to linger
+                    "extracted": {
+                        "subject": "physics",
+                        "prior_knowledge": "basic",
+                        "goals": "personal interest",
+                        "schedule_minutes": 30,
+                    },
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="SCHEDULE",
+            turns_in_focus=2,  # at the cap
+            extracted={
+                "subject": "physics",
+                "prior_knowledge": "basic",
+                "goals": "personal interest",
+                "schedule_minutes": 30,
+            },
+        )
+
+        await run_intake_step(session, "30 minutes", ctx)
+
+        # Server should have overridden SCHEDULE → PLAN_DRAFT
+        assert session.current_focus == "PLAN_DRAFT"
+        assert session.state == IntakeState.GENERATING_PLAN
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_does_not_auto_advance_before_turn_cap(self):
+        """BUG-001 fix: don't auto-advance before turns_in_focus >= 2.
+
+        The model gets 2 turns per focus area before the server forces
+        advancement. This preserves the model's ability to ask a
+        legitimate follow-up question.
+        """
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "One more question about your schedule.",
+                    "next_focus": "SCHEDULE",
+                    "extracted": {
+                        "subject": "physics",
+                        "prior_knowledge": "basic",
+                        "goals": "personal interest",
+                        "schedule_minutes": 30,
+                    },
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="SCHEDULE",
+            turns_in_focus=0,  # first turn in this focus
+            extracted={
+                "subject": "physics",
+                "prior_knowledge": "basic",
+                "goals": "personal interest",
+                "schedule_minutes": 30,
+            },
+        )
+
+        await run_intake_step(session, "30 minutes", ctx)
+
+        # Should NOT auto-advance on the first turn in this focus
+        assert session.current_focus == "SCHEDULE"
+        assert session.turns_in_focus == 1
+
+    # ------------------------------------------------------------------
+    # BUG-002: extraction failure guard + thin-text warning
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_short_extracted_text_shows_extraction_failed(self, caplog):
+        """BUG-002 fix: when extracted_text < 100 chars, the prompt tells the
+        LLM 'EXTRACTION FAILED' instead of passing through garbage text.
+
+        This prevents the LLM from hallucinating that it read the paper
+        when pypdf extracted only a few chars (math-heavy PDFs).
+        """
+        # 30 chars — way too short, triggers the guard
+        short_text = "NBCM paper. Section 1."
+        assert len(short_text) < 100
+        conn = _FakeConn(rows=[("math_paper.pdf", "pdf", short_text)])
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "OK",
+                    "next_focus": "SUBJECT",
+                    "extracted": {},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = IntakeSession(
+            current_focus="SUBJECT",
+            material_ids=["mat-1"],
+        )
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="test"):
+            await run_intake_step(session, "hello", ctx)
+
+        user_prompt = fake.calls[0][1][1]["content"]
+        # The prompt should contain EXTRACTION FAILED, not the short text
+        assert "EXTRACTION FAILED" in user_prompt
+        assert short_text not in user_prompt  # the garbage text is NOT passed
+        # The thin-text warning should fire
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("intake_material_text_thin" in r.message for r in warnings)
+
+    # ------------------------------------------------------------------
+    # BUG-003: auto-trigger empty-input no longer sends "first turn greeting"
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_auto_trigger_after_upload_does_not_re_greet(self):
+        """BUG-003 fix: when student_input is empty BUT session.responses is
+        non-empty (upload auto-trigger), the prompt tells the LLM to
+        acknowledge the upload — NOT to 'generate your greeting'.
+
+        The old code sent '(This is the first turn — generate your greeting.)'
+        at turn 8 of a conversation, confusing the LLM into re-greeting.
+        """
+        # Use a material with enough text to pass the EXTRACTION FAILED guard
+        material_text = (
+            "This paper covers NBCM theory in depth. " * 5  # ~175 chars
+        )
+        conn = _FakeConn(rows=[("paper.pdf", "pdf", material_text)])
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "I see this paper covers NBCM theory.",
+                    "next_focus": "PRIOR_KNOWLEDGE",
+                    "extracted": {"subject": "NBCM"},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = IntakeSession(
+            current_focus="SUBJECT",
+            material_ids=["mat-1"],
+            responses=["i want to study this paper", "physics please"],  # non-empty
+        )
+
+        # Empty student_input — simulates the upload auto-trigger
+        await run_intake_step(session, "", ctx)
+
+        user_prompt = fake.calls[0][1][1]["content"]
+        # Should NOT contain the first-turn greeting instruction
+        assert "This is the first turn" not in user_prompt, (
+            "Auto-trigger after upload should NOT send 'first turn greeting' "
+            "instruction — that confuses the LLM into re-greeting at turn 8."
+        )
+        # SHOULD contain the upload acknowledgment instruction
+        assert "uploaded a file" in user_prompt.lower() or "acknowledge" in user_prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_genuine_first_turn_still_sends_greeting_instruction(self):
+        """The first-turn greeting instruction still fires on the actual first
+        turn (empty student_input + empty session.responses)."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Hello! I'm Aristotle.",
+                    "next_focus": "SUBJECT",
+                    "extracted": {},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="SUBJECT",
+            responses=[],  # empty — genuine first turn
+        )
+
+        await run_intake_step(session, "", ctx)
+
+        user_prompt = fake.calls[0][1][1]["content"]
+        assert "This is the first turn" in user_prompt
 
 
 # ---------------------------------------------------------------------------

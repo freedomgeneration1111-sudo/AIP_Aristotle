@@ -108,6 +108,12 @@ class IntakeSession:
     draft_plan: list = field(default_factory=list)
     current_focus: str = "SUBJECT"
     plan_confirmed: bool = False
+    # BUG-001 fix: turns spent in the current focus area. Incremented each
+    # turn the model returns the same next_focus; reset to 0 on focus change.
+    # Used to enforce a hard cap (default 2) so the model can't interrogate
+    # the learner forever in a single focus area. Passed to the model via
+    # the user prompt so it knows when it's about to hit the cap.
+    turns_in_focus: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -700,7 +706,11 @@ When next_focus == "COMPLETE", the learner has confirmed the plan. Keep draft_pl
 
 The "extracted" field should be updated each turn with your current understanding. Start with empty strings and fill in as you learn. "subject" must be the extracted subject (e.g., "physics", "null boundary constraint manifolds"), NOT the learner's raw words.
 
-Be conversational. Reflect back what you heard. Ask one question at a time. Don't rush — it's fine to spend 2-3 turns in one focus area if the learner's answer is nuanced. If they upload a material, acknowledge SPECIFICALLY what you read in it (not just "I see you uploaded a paper") and adjust your questions based on what's in it."""
+Be conversational. Reflect back what you heard. Ask one question at a time. Don't rush — it's fine to spend 2-3 turns in one focus area if the learner's answer is nuanced. If they upload a material, acknowledge SPECIFICALLY what you read in it (not just "I see you uploaded a paper") and adjust your questions based on what's in it.
+
+HARD CAP ON INTERROGATION: You must advance next_focus after at most 2 turns in any one focus area. The user prompt includes "Turns spent in current focus: N". If N >= 2 and you are not yet at PLAN_DRAFT, advance now even if your understanding feels incomplete — a good-enough plan you can revise beats an interrogation. Once you have all four of (subject, prior_knowledge, goals, schedule_minutes), move immediately to PLAN_DRAFT. Do not linger. Do not ask a third sub-question in the same focus area. The learner wants to start learning, not answer questions forever.
+
+AUTO-ADVANCE RULE: If the user prompt shows that all four extracted fields (subject, prior_knowledge, goals, schedule_minutes) are non-empty, you MUST return next_focus=PLAN_DRAFT with a draft_plan derived from the conversation + uploaded materials. Do not ask another question. Propose the plan now."""
 
 
 def _build_intake_user_prompt(
@@ -724,6 +734,14 @@ def _build_intake_user_prompt(
     """
     parts = []
     parts.append(f"Current focus: {session.current_focus}")
+    # BUG-001 fix: surface the turn count so the model knows when it's
+    # about to hit the hard cap (default 2 turns per focus area).
+    parts.append(f"Turns spent in current focus: {session.turns_in_focus}")
+    if session.turns_in_focus >= 2 and session.current_focus not in ("PLAN_DRAFT", "COMPLETE"):
+        parts.append(
+            "WARNING: You have hit the hard cap for this focus area. "
+            "You MUST advance next_focus now. Do not ask another sub-question."
+        )
     parts.append("")
 
     # Conversation history (last 8 turns to keep context manageable).
@@ -740,6 +758,17 @@ def _build_intake_user_prompt(
         for k, v in session.extracted.items():
             if v:
                 parts.append(f"  {k}: {v}")
+        # BUG-001 fix: explicit auto-advance signal. If all four fields
+        # are populated, tell the model it MUST propose a plan now.
+        all_four = all(session.extracted.get(k) for k in (
+            "subject", "prior_knowledge", "goals", "schedule_minutes",
+        ))
+        if all_four and session.current_focus not in ("PLAN_DRAFT", "COMPLETE"):
+            parts.append("")
+            parts.append(
+                "AUTO-ADVANCE TRIGGERED: All four required fields are populated. "
+                "You MUST return next_focus=PLAN_DRAFT with a draft_plan now."
+            )
         parts.append("")
 
     # Uploaded materials — the curriculum. Include the full text up to
@@ -753,6 +782,22 @@ def _build_intake_user_prompt(
             source_type = m.get("source_type", "unknown")
             full_text = m.get("extracted_text") or ""
             total_chars = len(full_text)
+            # BUG-002 Part A: guard against empty/garbled extracted_text.
+            # If pypdf failed to extract meaningful text (common with
+            # math-heavy PDFs where text is rendered as glyphs/LaTeX),
+            # tell the LLM explicitly so it doesn't hallucinate that it
+            # read the paper.
+            if total_chars < 100:
+                parts.append(
+                    f"  --- {filename} ({source_type}) — EXTRACTION FAILED: "
+                    f"only {total_chars} chars extracted. This is likely a "
+                    f"math-heavy or scanned PDF that pypdf cannot parse. "
+                    f"DO NOT claim to have read this paper. Tell the learner "
+                    f"the extraction failed and ask them to paste the "
+                    f"abstract + section headings as text. ---"
+                )
+                parts.append("")
+                continue
             if total_chars <= material_preview_chars:
                 parts.append(f"  --- {filename} ({source_type}, {total_chars} chars) ---")
                 parts.append(full_text)
@@ -775,9 +820,22 @@ def _build_intake_user_prompt(
             parts.append(f"  {i+1}. {c.get('topic', '?')} — {c.get('content_primary', '')[:100]}")
         parts.append("")
 
-    # Learner's latest reply.
+    # BUG-003 fix: distinguish three cases for student_input:
+    #   1. Non-empty text → learner's latest reply
+    #   2. Empty text + session.responses exists → upload auto-trigger
+    #      (materials just arrived, no new text). Tell the LLM to
+    #      acknowledge the upload specifically — NOT to re-greet.
+    #   3. Empty text + no responses → genuine first turn (greeting)
     if student_input:
         parts.append(f"Learner's latest reply: {student_input}")
+    elif session.responses:
+        parts.append(
+            "(The learner just uploaded a file. No new text from them. "
+            "Acknowledge SPECIFICALLY what you read in the uploaded material — "
+            "sections, equations, topics you can see. Do NOT claim you read it "
+            "if the material shows EXTRACTION FAILED. Do NOT re-greet. "
+            "If all four extracted fields are populated, propose a draft_plan now.)"
+        )
     else:
         parts.append("(This is the first turn — generate your greeting.)")
 
@@ -843,6 +901,22 @@ async def run_intake_step(
                 session.material_ids,
                 [m.get("filename") for m in materials],
             )
+        # BUG-002 Part C: warn when extracted_text is suspiciously short.
+        # This catches math-heavy PDFs where pypdf extracts only a few
+        # chars (LaTeX rendered as glyphs, scanned images without OCR).
+        # The LLM context will be effectively empty — without this warning
+        # the operator can't tell why the LLM claims it "read" the paper
+        # but asks about its structure.
+        for m in materials:
+            text_len = len(m.get("extracted_text") or "")
+            if text_len < 200:
+                logger.warning(
+                    "intake_material_text_thin filename=%s chars=%d — "
+                    "PDF likely failed extraction (math-heavy or scanned). "
+                    "LLM context will be effectively empty; the model may "
+                    "hallucinate that it read the paper.",
+                    m.get("filename"), text_len,
+                )
     else:
         logger.debug("intake_no_materials_attached session_id=%s", id(session))
 
@@ -913,6 +987,13 @@ async def run_intake_step(
     extracted = parsed.get("extracted") or {}
     draft_plan = parsed.get("draft_plan")
 
+    # BUG-001 fix Part A: track turns_in_focus. If the model returned the
+    # same focus as the current one, increment; otherwise reset to 0.
+    if next_focus == session.current_focus:
+        session.turns_in_focus += 1
+    else:
+        session.turns_in_focus = 0
+
     session.current_focus = next_focus
     if extracted:
         # Merge extracted into session.extracted (don't overwrite with empty).
@@ -934,6 +1015,33 @@ async def run_intake_step(
 
     if draft_plan:
         session.draft_plan = draft_plan
+
+    # BUG-001 fix Part B: server-side auto-advance. Even if the model
+    # returns a non-PLAN_DRAFT focus, if all four extracted fields are
+    # populated AND we have materials (or the learner explicitly said no
+    # materials), force next_focus to PLAN_DRAFT. This is the forcing
+    # function the diagnostic (BUG-001) asked for — eliminates the
+    # "interrogation hell" where the model keeps asking polite sub-questions.
+    all_four_filled = all(
+        session.extracted.get(k)
+        for k in ("subject", "prior_knowledge", "goals", "schedule_minutes")
+    )
+    if (
+        all_four_filled
+        and next_focus not in ("PLAN_DRAFT", "COMPLETE")
+        and session.turns_in_focus >= 2  # give the model 2 turns before forcing
+    ):
+        logger.info(
+            "intake_auto_advancing_to_plan_draft focus=%s turns_in_focus=%d — "
+            "all four fields filled, forcing PLAN_DRAFT",
+            next_focus, session.turns_in_focus,
+        )
+        next_focus = "PLAN_DRAFT"
+        session.current_focus = "PLAN_DRAFT"
+        session.turns_in_focus = 0
+        # If the model didn't provide a draft_plan in this turn, we can't
+        # fabricate one — let the next turn generate it. But we force the
+        # focus so the model knows to produce one.
 
     # Map next_focus to IntakeState for backwards compat.
     focus_to_state = {
@@ -1157,6 +1265,9 @@ def intake_session_to_dict(session: IntakeSession) -> dict:
         "draft_plan": list(session.draft_plan),
         "current_focus": session.current_focus,
         "plan_confirmed": session.plan_confirmed,
+        # BUG-001 fix: persist turns_in_focus across API calls so the
+        # counter survives the round-trip through /intake/step.
+        "turns_in_focus": session.turns_in_focus,
     }
 
 
@@ -1177,6 +1288,8 @@ def intake_session_from_dict(d: dict) -> IntakeSession:
         draft_plan=d.get("draft_plan", []),
         current_focus=d.get("current_focus", "SUBJECT"),
         plan_confirmed=d.get("plan_confirmed", False),
+        # BUG-001 fix: restore turns_in_focus (default 0 for legacy sessions).
+        turns_in_focus=d.get("turns_in_focus", 0),
     )
 
 
