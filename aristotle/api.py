@@ -836,12 +836,18 @@ async def upload_route(request: Request):
             try:
                 stores = await registry.get_stores("aristotle:textbook")
                 conn = stores.connection_manager.write_conn
+                # NOTE: column order is (id, student_id, filename, ...).
+                # The id is the per-upload UUID (material_id); student_id
+                # is the constant "definer" (single-tenant pre-alpha).
+                # The values MUST match the column order — a previous
+                # version had them swapped, which caused the second upload
+                # to fail with UNIQUE constraint violation on id="definer".
                 await conn.execute(
                     "INSERT INTO aristotle_uploaded_material "
                     "(id, student_id, filename, source_type, extracted_text, "
                     "char_count, page_count) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    ("definer", material_id, filename, source_type, extracted,
+                    (material_id, "definer", filename, source_type, extracted,
                      char_count, page_count),
                 )
                 await conn.commit()

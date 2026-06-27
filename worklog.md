@@ -224,3 +224,35 @@ Work Log:
 Stage Summary:
 - Docs are current. Phase B is marked done. Phase C (HERALD) is the next major milestone, blocked on platform web/feed layer.
 
+
+---
+Task ID: 9
+Agent: Super Z (main)
+Task: Smoke-test /aristotle/intake/start + /aristotle/upload end-to-end against a real SQLite DB; fix bugs surfaced; ship a regression-tested e2e test.
+
+Work Log:
+- Pulled both repos to latest: AIP_Brain @ feat/multi-corpus (6114ece), AIP_Aristotle @ main (622535b).
+- Installed AIP_Brain + AIP_Aristotle into a venv via `pip install -e .` (editable). Verified aristotle entry point discovered: `entry_points(group='aip.extensions')` returns `aristotle -> aristotle.entrypoint:get_manifest`.
+- Ran baseline test suite: 158 pass / 5 xfail (pre-existing). No regressions before changes.
+- Wrote `/home/z/my-project/scripts/smoke_test_intake_e2e.py` — a standalone smoke test that:
+  - Spawns the real AIP_Brain FastAPI app via TestClient (lifespan runs, ExtensionHost starts, ARISTOTLE router mounts).
+  - Monkey-patches container.model_provider with a _ScriptedIntakeModel that returns valid JSON for each intake turn (greeting → subject → prior_knowledge → goals → schedule → draft_plan → complete).
+  - Walks the full pipeline: /aristotle/intake/start, /aristotle/upload (PDF), 5× /aristotle/intake/step, /aristotle/dashboard, /aristotle/concepts.
+  - 21 stages, all passing.
+- BUG FOUND + FIXED: `aristotle/api.py::upload_route` had a column/value swap in the INSERT into aristotle_uploaded_material. The SQL column order is `(id, student_id, filename, ...)` but the values were `("definer", material_id, ...)` — i.e. `id="definer"` (a constant!) and `student_id=<uuid>`. Because `id` is the PRIMARY KEY, the SECOND upload (and every subsequent upload) would fail with `IntegrityError: UNIQUE constraint failed: aristotle_uploaded_material.id`. The DB exception was caught silently and `material_id=""` was returned to the caller, so the GUI/intake flow couldn't reference any uploaded material past the first one.
+  - Fix: swapped the first two values so `id=material_id` (the per-upload UUID) and `student_id="definer"` (the constant single-tenant id).
+  - Added a regression test in `tests/test_aristotle_routes.py::test_upload_sql_insert_column_value_order_is_correct` that inspects the SQL params to catch this class of bug (the existing _FakeConn doesn't enforce constraints, so the original bug slipped through).
+- Ported the smoke test into the repo as `tests/test_aristotle_intake_e2e.py` (pytest version). Two tests:
+  - `TestIntakeE2E::test_full_intake_loop_with_upload_and_draft_plan` — the full happy path (9 stages).
+  - `TestIntakeNoModelFallback::test_deterministic_intake_completes_without_model` — verifies the no-model fallback path still works.
+- Verified: 160 pass / 5 xfail / 0 regressions after the fix.
+
+Stage Summary:
+- The LLM-driven intake pipeline works end-to-end when the model returns valid JSON. The bug was in the upload route, not the intake loop itself — but it would have silently broken the entire "upload a paper → LLM reads it → derives concepts" flow because the second upload (and every one after) would fail with a UNIQUE constraint violation that was caught and turned into an empty material_id.
+- The e2e test ships in the repo so the user can pull + run `pytest tests/test_aristotle_intake_e2e.py -v` to verify on their side. To run against a REAL LLM, set AIP_OPENAI_API_KEY and walk the same flow via curl/httpie/GUI — the test's _ScriptedIntakeModel documents exactly what JSON schema the LLM needs to return at each turn.
+- The fix is minimal (one line of swapped values + a clarifying comment). The regression test inspects SQL params directly so future refactors can't reintroduce the bug.
+
+Files changed:
+- aristotle/api.py — fixed upload_route INSERT column/value order (id ↔ student_id swap) + added clarifying comment
+- tests/test_aristotle_routes.py — added test_upload_sql_insert_column_value_order_is_correct regression test
+- tests/test_aristotle_intake_e2e.py — NEW end-to-end smoke test (TestClient + scripted fake model + real SQLite DB)

@@ -232,6 +232,55 @@ async def test_upload_pdf_returns_extracted_text():
     assert isinstance(result["char_count"], int)
 
 
+@pytest.mark.asyncio
+async def test_upload_sql_insert_column_value_order_is_correct():
+    """Regression: the INSERT into aristotle_uploaded_material must use
+    (id=material_id, student_id='definer', ...) — NOT swapped.
+
+    A previous version had the values as ("definer", material_id, ...)
+    which silently swapped id and student_id. Because id is the PRIMARY KEY,
+    the second upload would fail with UNIQUE constraint violation.
+    The _FakeConn doesn't enforce constraints, so this test inspects the
+    actual SQL params to catch the regression.
+    """
+    from aristotle.api import upload_route
+
+    conn = _FakeConn()
+    container = _make_container(conn)
+    request = _make_request(
+        container,
+        body=b"some text content",
+        headers={"content-type": "text/plain"},
+    )
+
+    result = await upload_route(request)
+    assert result["material_id"], "material_id should be non-empty"
+
+    # Find the INSERT statement.
+    insert_calls = [
+        (sql, params)
+        for sql, params in conn._executed
+        if "INSERT INTO aristotle_uploaded_material" in sql
+    ]
+    assert len(insert_calls) == 1, "expected exactly one INSERT"
+    sql, params = insert_calls[0]
+
+    # Column order in the SQL is (id, student_id, filename, source_type,
+    # extracted_text, char_count, page_count). Params must match.
+    assert params[0] == result["material_id"], (
+        f"params[0] (id) should be the material_id UUID, got {params[0]!r}"
+    )
+    assert params[1] == "definer", (
+        f"params[1] (student_id) should be 'definer', got {params[1]!r}"
+    )
+    assert params[2] == "upload", (
+        f"params[2] (filename) should be 'upload', got {params[2]!r}"
+    )
+    assert params[3] == "text", (
+        f"params[3] (source_type) should be 'text', got {params[3]!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 5: upload image returns extracted text
 # ---------------------------------------------------------------------------
