@@ -110,9 +110,13 @@ class IntakeSession:
     plan_confirmed: bool = False
     # BUG-001 fix: turns spent in the current focus area. Incremented each
     # turn the model returns the same next_focus; reset to 0 on focus change.
-    # Used to enforce a hard cap (default 2) so the model can't interrogate
-    # the learner forever in a single focus area. Passed to the model via
-    # the user prompt so it knows when it's about to hit the cap.
+    # Passed to the model via the user prompt so it knows how many turns
+    # it has spent in the current focus — the model decides when it has
+    # enough signal to advance. This is VISIBILITY ONLY, not a forcing
+    # function: a custom curriculum (e.g., NBCM) legitimately requires
+    # many questions to gauge the student's state, so the server does NOT
+    # override the model's focus choice. The model is trusted to advance
+    # when it has enough understanding.
     turns_in_focus: int = 0
 
 
@@ -706,11 +710,9 @@ When next_focus == "COMPLETE", the learner has confirmed the plan. Keep draft_pl
 
 The "extracted" field should be updated each turn with your current understanding. Start with empty strings and fill in as you learn. "subject" must be the extracted subject (e.g., "physics", "null boundary constraint manifolds"), NOT the learner's raw words.
 
-Be conversational. Reflect back what you heard. Ask one question at a time. Don't rush — it's fine to spend 2-3 turns in one focus area if the learner's answer is nuanced. If they upload a material, acknowledge SPECIFICALLY what you read in it (not just "I see you uploaded a paper") and adjust your questions based on what's in it.
+Be conversational. Reflect back what you heard. Ask one question at a time. For a custom curriculum built around a complex paper, TAKE YOUR TIME — it's better to ask 8-10 thoughtful questions and build a precise plan than to rush to PLAN_DRAFT with a shallow understanding. Probe the learner's actual knowledge: ask about specific topics (calculus? tensors? quantum mechanics? differential geometry?) and listen to the answers. The turns_in_focus counter is for your awareness — if you've spent many turns in one focus area, consider whether you have enough signal or whether you're asking the same question in different ways. But don't advance just because of a counter — advance when you genuinely understand the learner's state well enough to propose a meaningful plan.
 
-HARD CAP ON INTERROGATION: You must advance next_focus after at most 2 turns in any one focus area. The user prompt includes "Turns spent in current focus: N". If N >= 2 and you are not yet at PLAN_DRAFT, advance now even if your understanding feels incomplete — a good-enough plan you can revise beats an interrogation. Once you have all four of (subject, prior_knowledge, goals, schedule_minutes), move immediately to PLAN_DRAFT. Do not linger. Do not ask a third sub-question in the same focus area. The learner wants to start learning, not answer questions forever.
-
-AUTO-ADVANCE RULE: If the user prompt shows that all four extracted fields (subject, prior_knowledge, goals, schedule_minutes) are non-empty, you MUST return next_focus=PLAN_DRAFT with a draft_plan derived from the conversation + uploaded materials. Do not ask another question. Propose the plan now."""
+When you do propose a draft_plan, ground every concept in the paper's actual content (sections, equations, theorems) AND in what you learned about the learner's gaps. The plan should bridge from the learner's current knowledge to the paper's advanced topics."""
 
 
 def _build_intake_user_prompt(
@@ -734,14 +736,10 @@ def _build_intake_user_prompt(
     """
     parts = []
     parts.append(f"Current focus: {session.current_focus}")
-    # BUG-001 fix: surface the turn count so the model knows when it's
-    # about to hit the hard cap (default 2 turns per focus area).
+    # turns_in_focus is for the model's awareness — it helps the model
+    # notice if it's been asking the same type of question for many turns.
+    # This is NOT a forcing function; the model decides when to advance.
     parts.append(f"Turns spent in current focus: {session.turns_in_focus}")
-    if session.turns_in_focus >= 2 and session.current_focus not in ("PLAN_DRAFT", "COMPLETE"):
-        parts.append(
-            "WARNING: You have hit the hard cap for this focus area. "
-            "You MUST advance next_focus now. Do not ask another sub-question."
-        )
     parts.append("")
 
     # Conversation history (last 8 turns to keep context manageable).
@@ -758,17 +756,6 @@ def _build_intake_user_prompt(
         for k, v in session.extracted.items():
             if v:
                 parts.append(f"  {k}: {v}")
-        # BUG-001 fix: explicit auto-advance signal. If all four fields
-        # are populated, tell the model it MUST propose a plan now.
-        all_four = all(session.extracted.get(k) for k in (
-            "subject", "prior_knowledge", "goals", "schedule_minutes",
-        ))
-        if all_four and session.current_focus not in ("PLAN_DRAFT", "COMPLETE"):
-            parts.append("")
-            parts.append(
-                "AUTO-ADVANCE TRIGGERED: All four required fields are populated. "
-                "You MUST return next_focus=PLAN_DRAFT with a draft_plan now."
-            )
         parts.append("")
 
     # Uploaded materials — the curriculum. Include the full text up to
@@ -938,19 +925,65 @@ async def run_intake_step(
     )
 
     try:
-        result = await model_provider.call(
-            slot_name="beast",
-            messages=[
-                {"role": "system", "content": _INTAKE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        raw = result.get("content", "") if isinstance(result, dict) else ""
+        # Retry on transient network failures (DNS, connection reset, etc.).
+        # OpenRouter free-tier models can have intermittent connectivity
+        # issues — a single retry usually succeeds. Without this, the user
+        # sees "Something went wrong" + has to manually re-type their reply.
+        max_retries = 2
+        last_exc: Exception | None = None
+        raw = ""
+        for attempt in range(max_retries + 1):
+            try:
+                result = await model_provider.call(
+                    slot_name="beast",
+                    messages=[
+                        {"role": "system", "content": _INTAKE_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                raw = result.get("content", "") if isinstance(result, dict) else ""
+                if raw and raw.strip():
+                    break  # got a response, stop retrying
+                # Empty response — treat as failure + retry if attempts remain
+                logger.info("intake_model_empty_response attempt=%d", attempt + 1)
+                last_exc = RuntimeError("empty model response")
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "intake_model_call_attempt_failed attempt=%d error=%s:%s",
+                    attempt + 1, type(exc).__name__, exc,
+                )
+                # Brief delay before retry (1s, then 2s)
+                if attempt < max_retries:
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(1.0 * (attempt + 1))
+
+        if not raw or not raw.strip():
+            # All retries exhausted. Give the user a clear, actionable message
+            # instead of the generic "trouble thinking" — tell them it's a
+            # network issue + to retry their message.
+            logger.warning(
+                "intake_model_all_retries_exhausted last_error=%s:%s",
+                type(last_exc).__name__ if last_exc else "None",
+                last_exc,
+            )
+            return {
+                "state": session.state.value,
+                "prompt": (
+                    "I'm having trouble reaching my language model right now "
+                    "(network error — this is usually temporary). Please wait "
+                    "a moment and send your message again. Your conversation "
+                    "is saved — I won't lose context."
+                ),
+            }
     except Exception as exc:
         logger.warning("intake_model_call_failed error=%s:%s", type(exc).__name__, exc)
         return {
             "state": session.state.value,
-            "prompt": "I had trouble thinking just now. Could you say that again?",
+            "prompt": (
+                "I had trouble thinking just now (network error). "
+                "Please send your message again — I'll pick up where we left off."
+            ),
         }
 
     # Parse the JSON response. The model may wrap JSON in markdown
@@ -989,6 +1022,10 @@ async def run_intake_step(
 
     # BUG-001 fix Part A: track turns_in_focus. If the model returned the
     # same focus as the current one, increment; otherwise reset to 0.
+    # This is VISIBILITY ONLY — passed to the model so it knows how many
+    # turns it's spent in the current focus. The server does NOT override
+    # the model's focus choice (a custom curriculum legitimately needs
+    # many questions to gauge the student's state).
     if next_focus == session.current_focus:
         session.turns_in_focus += 1
     else:
@@ -1016,32 +1053,15 @@ async def run_intake_step(
     if draft_plan:
         session.draft_plan = draft_plan
 
-    # BUG-001 fix Part B: server-side auto-advance. Even if the model
-    # returns a non-PLAN_DRAFT focus, if all four extracted fields are
-    # populated AND we have materials (or the learner explicitly said no
-    # materials), force next_focus to PLAN_DRAFT. This is the forcing
-    # function the diagnostic (BUG-001) asked for — eliminates the
-    # "interrogation hell" where the model keeps asking polite sub-questions.
-    all_four_filled = all(
-        session.extracted.get(k)
-        for k in ("subject", "prior_knowledge", "goals", "schedule_minutes")
-    )
-    if (
-        all_four_filled
-        and next_focus not in ("PLAN_DRAFT", "COMPLETE")
-        and session.turns_in_focus >= 2  # give the model 2 turns before forcing
-    ):
-        logger.info(
-            "intake_auto_advancing_to_plan_draft focus=%s turns_in_focus=%d — "
-            "all four fields filled, forcing PLAN_DRAFT",
-            next_focus, session.turns_in_focus,
-        )
-        next_focus = "PLAN_DRAFT"
-        session.current_focus = "PLAN_DRAFT"
-        session.turns_in_focus = 0
-        # If the model didn't provide a draft_plan in this turn, we can't
-        # fabricate one — let the next turn generate it. But we force the
-        # focus so the model knows to produce one.
+    # NOTE: The server does NOT force-advance to PLAN_DRAFT. A custom
+    # curriculum (e.g., NBCM) legitimately requires many questions to
+    # gauge the student's state — the model decides when it has enough
+    # signal to propose a plan. The turns_in_focus counter is passed to
+    # the model via the user prompt for visibility, but the server trusts
+    # the model's judgment. The original BUG-001 fix had a server-side
+    # override (force PLAN_DRAFT after turns_in_focus >= 2 when all 4
+    # fields were filled) — it was reverted because it cut off legitimate
+    # probing that a complex subject requires.
 
     # Map next_focus to IntakeState for backwards compat.
     focus_to_state = {
@@ -1265,8 +1285,8 @@ def intake_session_to_dict(session: IntakeSession) -> dict:
         "draft_plan": list(session.draft_plan),
         "current_focus": session.current_focus,
         "plan_confirmed": session.plan_confirmed,
-        # BUG-001 fix: persist turns_in_focus across API calls so the
-        # counter survives the round-trip through /intake/step.
+        # turns_in_focus persists across API calls so the counter
+        # survives the round-trip through /intake/step.
         "turns_in_focus": session.turns_in_focus,
     }
 
@@ -1288,7 +1308,7 @@ def intake_session_from_dict(d: dict) -> IntakeSession:
         draft_plan=d.get("draft_plan", []),
         current_focus=d.get("current_focus", "SUBJECT"),
         plan_confirmed=d.get("plan_confirmed", False),
-        # BUG-001 fix: restore turns_in_focus (default 0 for legacy sessions).
+        # Restore turns_in_focus (default 0 for legacy sessions).
         turns_in_focus=d.get("turns_in_focus", 0),
     )
 

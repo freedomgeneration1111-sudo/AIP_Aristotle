@@ -836,17 +836,22 @@ class TestIntakeLLMDriven:
         assert session.current_focus == "GOALS"
 
     @pytest.mark.asyncio
-    async def test_llm_driven_auto_advances_to_plan_draft_when_all_fields_filled(self):
-        """BUG-001 fix: when all 4 extracted fields are filled + turns_in_focus >= 2,
-        the server forces next_focus to PLAN_DRAFT even if the model returned
-        a different focus. This is the forcing function that eliminates the
-        'interrogation hell' where the model keeps asking polite sub-questions.
+    async def test_llm_driven_does_not_force_advance_to_plan_draft(self):
+        """REVERTED: the server does NOT force-advance to PLAN_DRAFT.
+
+        A custom curriculum (e.g., NBCM) legitimately requires many
+        questions to gauge the student's state. The server trusts the
+        model to advance when it has enough signal. The turns_in_focus
+        counter is for the model's awareness (passed via the prompt),
+        NOT a forcing function. This test verifies the server respects
+        the model's focus choice even when all 4 fields are filled +
+        turns_in_focus is high.
         """
         fake = _FakeModelProvider(
             responses={
                 "beast": json.dumps({
                     "response": "Let me ask one more question about your schedule.",
-                    "next_focus": "SCHEDULE",  # model wants to linger
+                    "next_focus": "SCHEDULE",  # model wants to probe further
                     "extracted": {
                         "subject": "physics",
                         "prior_knowledge": "basic",
@@ -860,7 +865,7 @@ class TestIntakeLLMDriven:
         ctx = _make_ctx(model_provider=fake)
         session = IntakeSession(
             current_focus="SCHEDULE",
-            turns_in_focus=2,  # at the cap
+            turns_in_focus=5,  # many turns in this focus — but server doesn't force
             extracted={
                 "subject": "physics",
                 "prior_knowledge": "basic",
@@ -871,17 +876,16 @@ class TestIntakeLLMDriven:
 
         await run_intake_step(session, "30 minutes", ctx)
 
-        # Server should have overridden SCHEDULE → PLAN_DRAFT
-        assert session.current_focus == "PLAN_DRAFT"
-        assert session.state == IntakeState.GENERATING_PLAN
+        # Server should NOT have overridden — model's choice respected
+        assert session.current_focus == "SCHEDULE"
+        assert session.turns_in_focus == 6  # incremented, not reset
 
     @pytest.mark.asyncio
     async def test_llm_driven_does_not_auto_advance_before_turn_cap(self):
-        """BUG-001 fix: don't auto-advance before turns_in_focus >= 2.
+        """The server never force-advances — turns_in_focus is visibility only.
 
-        The model gets 2 turns per focus area before the server forces
-        advancement. This preserves the model's ability to ask a
-        legitimate follow-up question.
+        The model gets to decide when it has enough signal. The server
+        respects the model's focus choice at any turn count.
         """
         fake = _FakeModelProvider(
             responses={

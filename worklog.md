@@ -346,3 +346,33 @@ Files changed:
 - aristotle/actors/intake.py: turns_in_focus field + hard cap in system prompt + turns_in_focus in _build_intake_user_prompt + auto-advance in run_intake_step + EXTRACTION FAILED guard + thin-text warning + serialization
 - tests/test_aristotle_intake.py: 7 new regression tests + 1 existing test updated for the new >100 char threshold
 - (Brain) gui/pages/ask.py: BUG-002 Part B (char_count < 200 warning) + BUG-004 (exception detail)
+
+---
+Task ID: 12
+Agent: Super Z (main)
+Task: REVERT the auto-advance forcing function — user wants thorough intake for custom curricula
+
+Work Log:
+- User feedback: "I don't feel that aristotle is asking too many followup questions. Not at all. This is onboarding for a custom curriculum, there should be as many questions as needed to gauge the state of the student. How can we make a plan draft without asking a lot of questions?"
+- User is right. The BUG-001 fix (server-side auto-advance to PLAN_DRAFT after turns_in_focus >= 2 when all 4 fields filled) was too aggressive. For a custom curriculum based on a complex paper like NBCM, thorough intake IS the point — you can't build a good plan without understanding exactly where the student is.
+- Reverted:
+  1. Removed the server-side auto-advance block in run_intake_step (the "all_four_filled + turns_in_focus >= 2 → force PLAN_DRAFT" logic). The server now respects the model's focus choice at any turn count.
+  2. Removed the total_turns field (never fully implemented, was going to be a hard cap at 6 turns — also wrong for custom curricula).
+  3. Softened the system prompt: removed "HARD CAP ON INTERROGATION" + "AUTO-ADVANCE RULE" language. Replaced with: "For a custom curriculum built around a complex paper, TAKE YOUR TIME — it's better to ask 8-10 thoughtful questions and build a precise plan than to rush to PLAN_DRAFT with a shallow understanding."
+  4. Removed the "WARNING: You have hit the hard cap" + "AUTO-ADVANCE TRIGGERED" text from _build_intake_user_prompt. The turns_in_focus counter is still shown to the model for awareness, but no warning/forcing text.
+- Kept:
+  1. turns_in_focus tracking + visibility in the prompt (the model sees how many turns it's spent in the current focus — helps it notice if it's looping, but the server doesn't override).
+  2. Network-retry logic (up to 2 retries on DNS/connection failures with 1s/2s delays). This is unrelated to the forcing function — it just makes the system resilient to transient network errors.
+  3. Better fallback message when retries exhausted ("network error — this is usually temporary. Please wait a moment and send your message again. Your conversation is saved.").
+- Updated tests:
+  - test_llm_driven_auto_advances_to_plan_draft_when_all_fields_filled → renamed to test_llm_driven_does_not_force_advance_to_plan_draft. Now asserts the server does NOT override (session.current_focus stays "SCHEDULE", turns_in_focus increments to 6).
+  - test_llm_driven_does_not_auto_advance_before_turn_cap → kept, updated docstring ("The server never force-advances — turns_in_focus is visibility only").
+- Verified: 171 pass / 5 xfail / 0 regressions. Standalone smoke test 21/21 stages pass.
+
+Stage Summary:
+- The intake conversation now trusts the model to probe as thoroughly as the subject requires. For NBCM (a complex physics paper), the model can legitimately ask 8-10+ questions about math background, physics background, goals, learning style, etc. before proposing a plan. The turns_in_focus counter is still passed to the model for self-awareness, but the server never overrides the model's focus choice.
+- The network-retry logic is the real win from this cycle — it handles the transient DNS failures that caused "Something went wrong" in the user's session. When OpenRouter has a momentary connectivity blip, the system retries up to 2 times (with 1s/2s delays) before showing a user-friendly "network error, please resend" message.
+
+Files changed:
+- aristotle/actors/intake.py: reverted auto-advance + softened system prompt + kept retry logic
+- tests/test_aristotle_intake.py: updated auto-advance tests to verify the server does NOT force-advance
