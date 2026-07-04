@@ -48,4 +48,25 @@ class AristotleSettings:
     # openrouter free tiers handle 32k+). For papers longer than this,
     # the prompt includes a clear truncation notice so the LLM knows the
     # paper continues and can ask the learner to confirm scope.
+    #
+    # NOTE: This is the LEGACY fallback path. The ADR-003 RAG pipeline
+    # retrieves top-K chunks instead of truncating. This setting is only
+    # used when RAG retrieval returns nothing (e.g., ingestion job still
+    # running, or paper too short to chunk).
     material_preview_chars: int = 20000
+
+    # ADR-003: RAG pipeline settings
+    # Number of chunks to retrieve per intake turn via vector search.
+    # Each chunk is ~1500 chars (~375 tokens), so 5 chunks ≈ 1875 tokens.
+    rag_top_k: int = 5
+
+    # Max chars per chunk during paper ingestion. Smaller chunks = more
+    # precise retrieval but more embedding calls. 1500 chars is a good
+    # balance for academic papers (≈ 1-2 paragraphs).
+    rag_chunk_chars: int = 1500
+
+    # Model slot for structural analysis (TOC, concept index, prereqs).
+    # Uses "beast" by default (same as IntakeActor). A dedicated
+    # "aristotle_analysis" slot could use a stronger model for better
+    # reasoning — not yet wired.
+    ingest_analysis_model_slot: str = "beast"

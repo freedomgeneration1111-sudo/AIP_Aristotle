@@ -831,6 +831,7 @@ async def upload_route(request: Request):
         # Persist to aristotle_uploaded_material so INTAKE + plan generator
         # can read it back via material_id.
         material_id = str(__import__("uuid").uuid4())
+        ingest_job_id = ""
         registry = getattr(container, "corpus_registry", None)
         if registry is not None:
             try:
@@ -855,6 +856,45 @@ async def upload_route(request: Request):
                     "upload_stored material_id=%s filename=%s source=%s chars=%d",
                     material_id, filename, source_type, char_count,
                 )
+
+                # ADR-003: kick off background ingestion job (chunk + embed + analyze)
+                # The job runs as a supervised background task. The GUI polls
+                # GET /aristotle/ingest/{job_id}/status for progress.
+                if char_count >= 100:
+                    try:
+                        from aristotle.ingestion.paper_ingestor import (
+                            create_ingest_job, ingest_paper,
+                        )
+                        from aip.adapter.extensions.supervision import supervised_task
+
+                        ingest_job_id = await create_ingest_job(
+                            container, material_id, filename,
+                        )
+                        # Start the background job — supervised_task handles
+                        # exception logging + cancellation on shutdown.
+                        task = supervised_task(
+                            f"aristotle:ingest:{ingest_job_id}",
+                            ingest_paper(material_id, filename, extracted, container, ingest_job_id),
+                        )
+                        # Store the task on the container so shutdown cancels it.
+                        if not hasattr(container, "_aristotle_ingest_tasks"):
+                            container._aristotle_ingest_tasks = {}
+                        container._aristotle_ingest_tasks[ingest_job_id] = task
+                        logger.info(
+                            "ingest_job_started job_id=%s material_id=%s",
+                            ingest_job_id, material_id,
+                        )
+                    except Exception as ingest_exc:
+                        logger.warning(
+                            "ingest_job_start_failed material_id=%s error=%s:%s — "
+                            "fallback to legacy truncation path",
+                            material_id, type(ingest_exc).__name__, ingest_exc,
+                        )
+                else:
+                    logger.info(
+                        "ingest_job_skipped material_id=%s chars=%d — too short for chunking",
+                        material_id, char_count,
+                    )
             except Exception as db_exc:
                 # DB persistence is best-effort — don't fail the upload if
                 # the DB is unavailable. The extracted text is still
@@ -873,6 +913,8 @@ async def upload_route(request: Request):
             "char_count": char_count,
             "page_count": page_count,
             "filename": filename,
+            "ingest_job_id": ingest_job_id,
+            "ingest_status": "PENDING",
         }
     except HTTPException:
         raise
@@ -900,6 +942,64 @@ async def upload_route(request: Request):
     except Exception as exc:
         logger.warning("upload_extraction_failed ct=%s error=%s:%s", content_type, type(exc).__name__, exc)
         raise HTTPException(status_code=500, detail=f"Text extraction failed: {exc}")
+
+
+# ------------------------------------------------------------------
+# Ingestion job routes (ADR-003 — background pipeline)
+# ------------------------------------------------------------------
+
+
+@router.get("/ingest/{job_id}/status")
+async def ingest_status_route(request: Request, job_id: str):
+    """Get the status of a background paper ingestion job.
+
+    Returns:
+      {
+        "job_id": str,
+        "material_id": str,
+        "filename": str,
+        "phase": "PENDING"|"PARSING"|"CHUNKING"|"EMBEDDING"|"INDEXING"|"ANALYZING"|"COMPLETE"|"FAILED",
+        "status": "PENDING"|"RUNNING"|"COMPLETE"|"FAILED",
+        "chunks_total": int,
+        "chunks_done": int,
+        "analysis_complete": bool,
+        "error": str | None,
+        "started_at": str,
+        "updated_at": str,
+        "completed_at": str | None,
+      }
+
+    The GUI polls this every 2-3 seconds to render a progress indicator.
+    """
+    container = _get_container(request)
+    from aristotle.ingestion.paper_ingestor import get_job_status
+
+    status = await get_job_status(container, job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
+    return status
+
+
+@router.get("/material/{material_id}/structure")
+async def material_structure_route(request: Request, material_id: str):
+    """Get the structural metadata for an ingested paper.
+
+    Returns the TOC, concept tags, prerequisite tags, and citation IDs
+    for each chunk. Used by the GUI to render a "curriculum map" view
+    and by the IntakeActor to build the structural map shown to the LLM.
+    """
+    container = _get_container(request)
+    from aristotle.ingestion.paper_ingestor import get_material_structure, get_structural_map
+
+    structure = await get_material_structure(container, material_id)
+    structural_map = await get_structural_map(container, material_id)
+    return {
+        "material_id": material_id,
+        "chunks": structure,
+        "toc": structural_map.get("toc", []),
+        "concepts": structural_map.get("concepts", []),
+        "citations": structural_map.get("citations", []),
+    }
 
 
 # ------------------------------------------------------------------

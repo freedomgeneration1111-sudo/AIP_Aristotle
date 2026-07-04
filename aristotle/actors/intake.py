@@ -831,6 +831,108 @@ def _build_intake_user_prompt(
     return "\n".join(parts)
 
 
+def _build_rag_intake_prompt(
+    session: IntakeSession,
+    student_input: str,
+    structural_maps: list[dict],
+    rag_chunks: list[dict],
+) -> str:
+    """Build the RAG-driven intake prompt (ADR-003).
+
+    Replaces the legacy truncation path. The LLM sees:
+      1. Current focus + turns_in_focus
+      2. Conversation history (last 8 turns)
+      3. Extracted understanding so far
+      4. Structural map (TOC + concept index) — compact, shown every turn
+      5. Retrieved chunks (top-K relevant to the current context)
+      6. Learner's latest reply
+
+    No truncation. The LLM sees the paper's structure always + the specific
+    chunks relevant to the current question. Over multiple turns, the LLM
+    effectively "reads" the whole paper.
+    """
+    parts = []
+    parts.append(f"Current focus: {session.current_focus}")
+    parts.append(f"Turns spent in current focus: {session.turns_in_focus}")
+    parts.append("")
+
+    # Conversation history (last 8 turns)
+    history = session.responses[-8:] if len(session.responses) > 8 else session.responses
+    if history:
+        parts.append("Conversation so far (learner's replies, most recent last):")
+        for i, r in enumerate(history, 1):
+            parts.append(f"  {i}. {r}")
+        parts.append("")
+
+    # Extracted understanding so far
+    if session.extracted:
+        parts.append("Your current understanding:")
+        for k, v in session.extracted.items():
+            if v:
+                parts.append(f"  {k}: {v}")
+        parts.append("")
+
+    # Structural map (TOC + concept index) — shown every turn so the LLM
+    # always knows the paper's structure. Compact (~2k tokens).
+    if structural_maps:
+        parts.append("Paper structure (table of contents + key concepts):")
+        for smap in structural_maps:
+            toc = smap.get("toc", [])
+            concepts = smap.get("concepts", [])
+            if toc:
+                parts.append("  Table of contents:")
+                for entry in toc[:20]:  # cap at 20 entries to stay compact
+                    parts.append(f"    {entry.get('chunk_index', '?')}. {entry.get('heading', '?')}")
+            if concepts:
+                parts.append(f"  Key concepts: {', '.join(concepts[:30])}")
+        parts.append("")
+
+    # Retrieved chunks — the RAG retrieval results. Each chunk has its
+    # section heading + full text. The LLM sees the specific parts of
+    # the paper relevant to the current question.
+    if rag_chunks:
+        parts.append("Relevant excerpts from the paper (retrieved for this turn):")
+        for i, chunk in enumerate(rag_chunks, 1):
+            content = chunk.get("content", "")
+            metadata = chunk.get("metadata", {})
+            heading = metadata.get("heading", "")
+            section = metadata.get("section_path", "")
+            score = chunk.get("score", 0.0)
+            parts.append(f"  --- Excerpt {i} (relevance: {score:.2f}) ---")
+            if section or heading:
+                parts.append(f"  Section: {section or heading}")
+            parts.append(content)
+            parts.append("")
+    else:
+        parts.append("(No relevant excerpts retrieved — the paper may still be ingesting. Answer based on the structural map above + conversation context.)")
+        parts.append("")
+
+    # Draft plan if one exists
+    if session.draft_plan:
+        parts.append("Current draft plan:")
+        for i, c in enumerate(session.draft_plan):
+            parts.append(f"  {i+1}. {c.get('topic', '?')} — {c.get('content_primary', '')[:100]}")
+        parts.append("")
+
+    # Learner's latest reply (3-way branch: reply / upload auto-trigger / first turn)
+    if student_input:
+        parts.append(f"Learner's latest reply: {student_input}")
+    elif session.responses:
+        parts.append(
+            "(The learner just uploaded a file. No new text from them. "
+            "Acknowledge SPECIFICALLY what you read in the retrieved excerpts — "
+            "sections, equations, topics you can see. Do NOT claim you read it "
+            "if no excerpts were retrieved. Do NOT re-greet. "
+            "If all four extracted fields are populated, propose a draft_plan now.)"
+        )
+    else:
+        parts.append("(This is the first turn — generate your greeting.)")
+
+    parts.append("")
+    parts.append("Respond with the JSON object described in your instructions.")
+    return "\n".join(parts)
+
+
 async def run_intake_step(
     session: IntakeSession,
     student_input: str,
@@ -864,7 +966,11 @@ async def run_intake_step(
     if model_provider is None:
         return await _run_intake_step_deterministic(session, student_input, ctx)
 
-    # Fetch uploaded material texts for the model context.
+    # ADR-003: RAG retrieval. Instead of fetching the full paper text
+    # (truncated to 20k chars), retrieve the top-K chunks relevant to the
+    # current conversation context. This scales to full textbooks + multiple
+    # papers. Falls back to legacy truncation if RAG retrieval returns nothing
+    # (e.g., ingestion job still running, or paper too short to chunk).
     materials = await _fetch_material_texts(ctx, session.material_ids)
 
     # Log material fetch results — critical for debugging "the LLM didn't
@@ -911,18 +1017,67 @@ async def run_intake_step(
     if student_input:
         session.responses.append(student_input)
 
+    # ADR-003: RAG retrieval. Build a retrieval query from the current
+    # conversation context + retrieve top-K chunks from the vector store.
+    # This replaces the legacy truncation path — the LLM sees relevant
+    # chunks instead of the first 20k chars. Falls back to legacy
+    # truncation if RAG returns nothing (ingestion not done yet).
+    rag_chunks: list[dict] = []
+    structural_maps: list[dict] = []
+    if session.material_ids:
+        try:
+            from aristotle.ingestion.paper_ingestor import (
+                retrieve_relevant_chunks, get_structural_map,
+            )
+            # Build retrieval query from conversation context
+            query_parts = [session.current_focus]
+            if student_input:
+                query_parts.append(student_input)
+            if session.extracted.get("subject"):
+                query_parts.append(session.extracted["subject"])
+            retrieval_query = " ".join(query_parts)
+
+            rag_chunks = await retrieve_relevant_chunks(
+                container, retrieval_query, top_k=5,
+            )
+            # Get the structural map (TOC + concepts) for each material —
+            # this is compact (~2k tokens) and shown every turn so the LLM
+            # always knows the paper's structure.
+            for mid in session.material_ids:
+                smap = await get_structural_map(container, mid)
+                if smap.get("toc"):
+                    structural_maps.append(smap)
+
+            logger.info(
+                "rag_retrieved chunks=%d structural_maps=%d query=%r",
+                len(rag_chunks), len(structural_maps), retrieval_query[:80],
+            )
+        except Exception as exc:
+            logger.warning(
+                "rag_retrieval_failed error=%s:%s — falling back to legacy truncation",
+                type(exc).__name__, exc,
+            )
+
     # Resolve material_preview_chars from the extension config (if the
     # container exposes it) — defaults to 20000 if not configured.
+    # Used only for the legacy fallback path.
     preview_chars = 20000
     ext_config = getattr(container, "extension_config", None)
     if ext_config is not None:
         ar_settings = ext_config.get("aristotle", {}) if isinstance(ext_config, dict) else {}
         preview_chars = ar_settings.get("material_preview_chars", 20000)
 
-    # Build the prompts.
-    user_prompt = _build_intake_user_prompt(
-        session, student_input, materials, material_preview_chars=preview_chars,
-    )
+    # Build the prompts. If RAG retrieval succeeded, use the RAG path
+    # (structural map + retrieved chunks). Otherwise fall back to legacy
+    # truncation of the full material text.
+    if rag_chunks or structural_maps:
+        user_prompt = _build_rag_intake_prompt(
+            session, student_input, structural_maps, rag_chunks,
+        )
+    else:
+        user_prompt = _build_intake_user_prompt(
+            session, student_input, materials, material_preview_chars=preview_chars,
+        )
 
     try:
         # Retry on transient network failures (DNS, connection reset, etc.).

@@ -376,3 +376,47 @@ Stage Summary:
 Files changed:
 - aristotle/actors/intake.py: reverted auto-advance + softened system prompt + kept retry logic
 - tests/test_aristotle_intake.py: updated auto-advance tests to verify the server does NOT force-advance
+
+---
+Task ID: 13
+Agent: Super Z (main)
+Task: ADR-003 — Multi-phase paper ingestion + RAG retrieval pipeline (Phase 1 + 2 complete, Phase 3 pending)
+
+Work Log:
+- User feedback: "The paper truncates. This is really, really bad. This system should be designed to absorb entire textbooks, sometimes multiple textbooks." + "Chunking and rag retrieval capability is already inherent to the aip brain... however to create the learning plan will not be just one llm turn, this will be a process of chunking, ingesting, structuring... i feel that we have it designed too simple like almost a stub design and not really sincere."
+- User is right. The current design (single-row text storage + 20k char truncation per turn) is a stub. The infrastructure for proper ingestion exists in AIP_Brain but ARISTOTLE doesn't use it.
+- Wrote ADR-003 (docs/decisions/ADR-003-paper-ingestion-rag-pipeline.md) documenting the multi-phase pipeline: ingestion (background job) → RAG retrieval (per turn) → multi-step plan generation (background job). Designed for full textbooks + multiple papers + citation fetching.
+- Phase 1 (Ingestion) — COMPLETE:
+  - M008 migration: aristotle_ingest_job (job tracking) + aristotle_material_structure (per-chunk metadata) + aristotle_citation (extracted citations) + aristotle_plan_job (plan generation tracking)
+  - aristotle/ingestion/paper_ingestor.py: background job (parse → chunk → embed → index → analyze). Uses structural chunking (heading detection + paragraph grouping, not fixed char count). Embeds each chunk via container.embedding_provider, upserts to container.vector_store with domain="aristotle:textbook". Writes to CorpusTurnStore for FTS5 lexical search. Runs structural analysis at the end. Updates aristotle_ingest_job progress at each phase.
+  - aristotle/ingestion/structural_analysis.py: LLM call to extract concept_tags, prereq_tags, citations per chunk. Returns structured maps stored in aristotle_material_structure.
+  - Modified upload route: kicks off background ingestion job via supervised_task (from aip.adapter.extensions.supervision). Returns ingest_job_id + ingest_status="PENDING". Falls back to legacy truncation if ingestion fails.
+  - New API routes: GET /aristotle/ingest/{job_id}/status (progress polling), GET /aristotle/material/{material_id}/structure (TOC + concepts + citations)
+- Phase 2 (RAG retrieval in IntakeActor) — COMPLETE:
+  - Modified run_intake_step: before building the prompt, retrieves top-K chunks via retrieve_relevant_chunks() (vector search with domain filter). Also retrieves the paper's structural map (TOC + concept index — compact, ~2k tokens, shown every turn).
+  - New _build_rag_intake_prompt function: builds the prompt with structural map + retrieved chunks instead of truncated full text. The LLM sees the paper's structure always + the specific chunks relevant to the current question.
+  - Falls back to legacy _build_intake_user_prompt (truncation) if RAG retrieval returns nothing (ingestion job still running, or paper too short to chunk).
+  - retrieve_relevant_chunks() + get_structural_map() in paper_ingestor.py provide the RAG API.
+- Phase 3 (Multi-step plan generator) — PENDING:
+  - aristotle/actors/plan_generator.py not yet built (next task)
+  - aristotle/ingestion/citation_fetcher.py not yet built (Phase 4)
+- Config: added rag_top_k (default 5), rag_chunk_chars (default 1500), ingest_analysis_model_slot (default "beast") to AristotleSettings
+- Verified: 171 pass / 5 xfail / 0 regressions. Standalone smoke test 21/21 stages pass.
+
+Stage Summary:
+- The truncation problem is solved. Papers are now properly ingested (chunked + embedded + structurally analyzed) as background jobs. The IntakeActor retrieves relevant chunks via vector search instead of truncating the full text. This scales to full textbooks + multiple papers — each chunk is retrieved on demand, no truncation.
+- The ingestion job runs as a supervised background task. The GUI can poll GET /aristotle/ingest/{job_id}/status for progress (PARSING → CHUNKING → EMBEDDING → INDEXING → ANALYZING → COMPLETE).
+- The structural analysis (LLM call) extracts concept tags, prerequisite tags, and citations per chunk. This metadata powers the "structural map" shown to the LLM every turn + will power the multi-step plan generator (Phase 3).
+- The legacy truncation path is kept as a fallback — if RAG retrieval returns nothing (ingestion not done yet, or paper too short), the system falls back to the old behavior. This ensures backward compatibility with existing sessions.
+
+Files created:
+- docs/decisions/ADR-003-paper-ingestion-rag-pipeline.md (design doc)
+- aristotle/migrations/M008_aristotle_ingest_pipeline.sql (4 new tables)
+- aristotle/ingestion/__init__.py
+- aristotle/ingestion/paper_ingestor.py (background job + RAG retrieval API)
+- aristotle/ingestion/structural_analysis.py (LLM structural analysis)
+
+Files modified:
+- aristotle/api.py (upload route kicks off background job + 2 new API routes)
+- aristotle/actors/intake.py (RAG retrieval + _build_rag_intake_prompt)
+- aristotle/config.py (rag_top_k, rag_chunk_chars, ingest_analysis_model_slot)
