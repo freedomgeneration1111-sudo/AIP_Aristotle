@@ -876,6 +876,27 @@ async def upload_route(request: Request):
         }
     except HTTPException:
         raise
+    except ModuleNotFoundError as exc:
+        # Missing library (pypdf, pytesseract, PIL) — give the user a clear
+        # fix instruction instead of a generic "Text extraction failed".
+        missing_mod = str(exc).replace("No module named ", "").strip("'\"")
+        logger.error("upload_missing_library ct=%s missing=%s", content_type, missing_mod)
+        install_map = {
+            "pypdf": "pypdf",
+            "pytesseract": "pytesseract",
+            "PIL": "Pillow",
+        }
+        install_name = install_map.get(missing_mod, missing_mod)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Upload failed — required library '{missing_mod}' is not installed. "
+                f"Fix: cd ~/AIP_Aristotle && pip install {install_name}  "
+                f"(or: uv pip install {install_name}).  "
+                f"For image OCR, also install the system tesseract: "
+                f"sudo apt install tesseract-ocr"
+            ),
+        )
     except Exception as exc:
         logger.warning("upload_extraction_failed ct=%s error=%s:%s", content_type, type(exc).__name__, exc)
         raise HTTPException(status_code=500, detail=f"Text extraction failed: {exc}")

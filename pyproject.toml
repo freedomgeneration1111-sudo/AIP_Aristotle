@@ -14,6 +14,15 @@ dependencies = [
     "httpx>=0.24",
     "pyyaml>=6.0",
     "python-docx>=1.0",
+    # Upload route dependencies (aristotle/api.py::_extract_pdf_text etc.)
+    # Without these, PDF/image uploads fail with ModuleNotFoundError at
+    # extraction time. The upload route catches the exception and returns
+    # a generic "Text extraction failed" error — which masks the real
+    # cause (missing library). Declaring them here ensures they're
+    # installed automatically via `pip install -e .`
+    "pypdf>=4.0",           # PDF text extraction (upload route)
+    "Pillow>=10.0",         # Image handling for pytesseract
+    "pytesseract>=0.3.10",  # OCR for image uploads (requires system tesseract)
 ]
 
 # ADR-014 §6.4: the entry point the platform's ExtensionHost discovers.
