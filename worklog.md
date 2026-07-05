@@ -420,3 +420,45 @@ Files modified:
 - aristotle/api.py (upload route kicks off background job + 2 new API routes)
 - aristotle/actors/intake.py (RAG retrieval + _build_rag_intake_prompt)
 - aristotle/config.py (rag_top_k, rag_chunk_chars, ingest_analysis_model_slot)
+
+---
+Task ID: 14
+Agent: Super Z (main)
+Task: ADR-003 Phase 3 — multi-step retrieval-driven plan generation pipeline
+
+Work Log:
+- Built aristotle/actors/plan_generator.py: the multi-step pipeline that replaces the single-call generate_plan(). 6 steps:
+  1. STRUCTURE_RETRIEVAL — get paper's TOC + concept index via get_structural_map()
+  2. FOUNDATIONAL_RETRIEVAL — retrieve top-8 foundational chunks via retrieve_relevant_chunks("prerequisites foundations introduction basics")
+  3. GAP_ANALYSIS — LLM call with _GAP_ANALYSIS_PROMPT: identify knowledge gaps given learner's background + paper structure + foundational excerpts. Returns JSON with gaps (concept, severity, reason, paper_sections, estimated_study_time_hours).
+  4. GAP_RETRIEVAL — for each gap, retrieve top-3 chunks relevant to that gap concept
+  5. PLAN_DESIGN — LLM call with _PHASED_PLAN_PROMPT: design phased plan bridging gaps to paper. Returns JSON with phases (phase_number, name, goal, concepts, paper_sections, prerequisites, estimated_sessions, chunk_ids).
+  6. CONCEPT_DETAIL — for each phase, LLM call with _CONCEPT_DETAIL_PROMPT: produce detailed concepts (topic, subtopic, bloom_target, content_primary, prerequisite_concept_id, paper_chunk_ids). Ingests all concepts via IntakeActor.generate_plan().
+- Added 2 new API routes:
+  - POST /aristotle/plan/generate — trigger the pipeline as a background job. Returns job_id immediately.
+  - GET /aristotle/plan/{job_id}/status — poll for progress (phase, steps_done, steps_total, plan_id when complete)
+- Wired into IntakeActor: when the model returns next_focus=COMPLETE with a draft_plan, the multi-step pipeline is kicked off as a supervised background task. Returns immediately with state=GENERATING_PLAN + plan_job_id. Falls back to legacy single-call generate_plan() if the pipeline fails to start.
+- Updated aristotle/api.py::intake_step_route to pass through plan_job_id in the response (previously only plan_id was passed).
+- Updated GUI (Brain gui/pages/ask.py): when intake/step returns plan_job_id, shows "I'm now designing your learning plan..." message + polls GET /aristotle/plan/{job_id}/status every 5 seconds. When complete, shows "✅ Learning plan ready!" + transitions to PLACER phase.
+- Updated tests:
+  - test_llm_driven_complete_with_draft_plan_generates_plan → renamed to test_llm_driven_complete_with_draft_plan_triggers_pipeline. Accepts either GENERATING_PLAN+plan_job_id (pipeline) or COMPLETE+plan_id (legacy fallback).
+  - test_aristotle_intake_e2e.py: stage 7 accepts either path. Stages 8-9 (dashboard/concepts) only assert when plan_id is set (legacy path); pipeline path stores concepts asynchronously.
+- Updated standalone smoke test (scripts/smoke_test_intake_e2e.py): same dual-path acceptance.
+- Verified: 171 pass / 5 xfail / 0 regressions. Smoke test 21/21 stages pass (pipeline confirmed starting: plan_job_id=4b96ee54).
+
+Stage Summary:
+- Plan generation is now a multi-step retrieval-driven pipeline instead of a single LLM call. Each step retrieves ONLY the chunks it needs — no truncation, no resending the whole paper. The LLM sees the paper's structure + foundational sections + gap-specific sections + phase-specific sections across the pipeline.
+- The pipeline runs as a background job (supervised_task). The GUI polls for progress + transitions to PLACER when the plan is ready. The learner sees "I'm now designing your learning plan..." while it runs.
+- Falls back to the legacy single-call generate_plan() if the pipeline fails to start (e.g., no ingested paper, missing tables). This ensures the learner always gets a plan.
+- The 3 LLM prompts (_GAP_ANALYSIS_PROMPT, _PHASED_PLAN_PROMPT, _CONCEPT_DETAIL_PROMPT) are specialized for each step — gap analysis focuses on identifying missing prerequisites, plan design focuses on phasing + paper section mapping, concept detail focuses on bloom targets + chunk references.
+
+Files created:
+- aristotle/actors/plan_generator.py (multi-step pipeline + job tracking + 3 LLM prompts)
+
+Files modified:
+- aristotle/api.py (2 new routes: POST /plan/generate, GET /plan/{job_id}/status; intake_step_route passes through plan_job_id)
+- aristotle/actors/intake.py (COMPLETE path kicks off pipeline, falls back to legacy)
+- tests/test_aristotle_intake.py (updated test for dual-path acceptance)
+- tests/test_aristotle_intake_e2e.py (updated stages 7-9 for dual-path)
+- (Brain) gui/pages/ask.py (poll for plan_job_id progress, transition to PLACER on completion)
+- (Brain) scripts/smoke_test_intake_e2e.py (updated stage 7-9 for dual-path)

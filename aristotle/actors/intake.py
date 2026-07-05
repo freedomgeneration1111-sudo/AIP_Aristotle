@@ -1230,26 +1230,79 @@ async def run_intake_step(
     }
     session.state = focus_to_state.get(next_focus, session.state)
 
-    # If the model says COMPLETE and we have a draft plan, ingest the
-    # concepts + generate the plan row (Piece 3 refines this).
+    # If the model says COMPLETE and we have a draft plan, kick off the
+    # multi-step plan generation pipeline (ADR-003 Phase 3). The pipeline
+    # runs as a background job — retrieve structural map, retrieve foundational
+    # chunks, LLM gap analysis, retrieve gap-specific chunks, LLM plan design,
+    # LLM concept detail + ingest. Returns immediately with a plan_job_id
+    # the GUI can poll.
     if next_focus == "COMPLETE" and session.draft_plan:
-        actor = IntakeActor()
-        plan_result = await actor.generate_plan(ctx, session)
-        if plan_result.ok and plan_result.data:
-            session.plan_id = plan_result.data.get("plan_id", "")
-            session.state = IntakeState.COMPLETE
-            return {
-                "state": "COMPLETE",
-                "prompt": response_text,
-                "plan_id": session.plan_id,
-                "concept_count": plan_result.data.get("concept_count", len(session.draft_plan)),
-            }
-        else:
+        # Try the multi-step pipeline first. Falls back to the legacy
+        # single-call generate_plan() if the pipeline fails to start
+        # (e.g., no ingested paper, no model provider, or the plan_generator
+        # module can't be imported).
+        try:
+            from aristotle.actors.plan_generator import (
+                create_plan_job, generate_plan_pipeline,
+            )
+            from aip.adapter.extensions.supervision import supervised_task
+
+            material_id = session.material_ids[0] if session.material_ids else None
+            plan_job_id = await create_plan_job(ctx.container, session, material_id)
+
+            # Start the background pipeline
+            task = supervised_task(
+                f"aristotle:plan:{plan_job_id}",
+                generate_plan_pipeline(session, ctx.container, plan_job_id),
+            )
+            if not hasattr(ctx.container, "_aristotle_plan_tasks"):
+                ctx.container._aristotle_plan_tasks = {}
+            ctx.container._aristotle_plan_tasks[plan_job_id] = task
+
+            logger.info(
+                "plan_pipeline_started plan_job_id=%s material_id=%s — "
+                "multi-step retrieval-driven plan generation running in background",
+                plan_job_id, material_id,
+            )
+
+            # Return immediately — the GUI polls /aristotle/plan/{plan_job_id}/status
+            # The learner sees "Designing your learning plan..." while the pipeline runs.
             return {
                 "state": "GENERATING_PLAN",
-                "prompt": response_text or "I had trouble saving the plan. Could you confirm again?",
-                "error": plan_result.error,
+                "prompt": response_text or (
+                    "I'm now designing your learning plan. This involves analyzing "
+                    "the paper's structure, identifying your knowledge gaps, and "
+                    "building a phased curriculum. This takes 1-2 minutes — I'll "
+                    "let you know when it's ready."
+                ),
+                "plan_job_id": plan_job_id,
+                "plan_job_status": "PENDING",
             }
+        except Exception as exc:
+            # Pipeline failed to start — fall back to the legacy single-call path.
+            # This ensures the learner still gets a plan even if the multi-step
+            # pipeline has a bug or the paper wasn't ingested.
+            logger.warning(
+                "plan_pipeline_start_failed error=%s:%s — falling back to legacy generate_plan",
+                type(exc).__name__, exc,
+            )
+            actor = IntakeActor()
+            plan_result = await actor.generate_plan(ctx, session)
+            if plan_result.ok and plan_result.data:
+                session.plan_id = plan_result.data.get("plan_id", "")
+                session.state = IntakeState.COMPLETE
+                return {
+                    "state": "COMPLETE",
+                    "prompt": response_text,
+                    "plan_id": session.plan_id,
+                    "concept_count": plan_result.data.get("concept_count", len(session.draft_plan)),
+                }
+            else:
+                return {
+                    "state": "GENERATING_PLAN",
+                    "prompt": response_text or "I had trouble saving the plan. Could you confirm again?",
+                    "error": plan_result.error,
+                }
 
     return {
         "state": session.state.value,

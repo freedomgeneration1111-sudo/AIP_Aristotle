@@ -564,6 +564,11 @@ async def intake_step_route(request: Request):
     if result.get("state") == "COMPLETE":
         response["plan_id"] = result.get("plan_id", session.plan_id)
         response["concept_count"] = result.get("concept_count")
+    elif result.get("plan_job_id"):
+        # ADR-003 Phase 3: multi-step plan pipeline started as background job.
+        # The GUI polls GET /aristotle/plan/{plan_job_id}/status for progress.
+        response["plan_job_id"] = result["plan_job_id"]
+        response["plan_job_status"] = result.get("plan_job_status", "PENDING")
     return response
 
 
@@ -1000,6 +1005,107 @@ async def material_structure_route(request: Request, material_id: str):
         "concepts": structural_map.get("concepts", []),
         "citations": structural_map.get("citations", []),
     }
+
+
+# ------------------------------------------------------------------
+# Plan generation routes (ADR-003 Phase 3 — multi-step pipeline)
+# ------------------------------------------------------------------
+
+
+@router.post("/plan/generate")
+async def plan_generate_route(request: Request):
+    """Trigger multi-step plan generation as a background job.
+
+    Request body:
+      {
+        "session": IntakeSession_dict,
+        "material_id": str | None  # optional, inferred from session.material_ids
+      }
+
+    Returns:
+      {
+        "job_id": str,
+        "status": "PENDING",
+        "phases_total": 6,
+        "message": "Plan generation started — poll /aristotle/plan/{job_id}/status"
+      }
+
+    The pipeline runs 6 steps:
+      1. STRUCTURE_RETRIEVAL — get paper's TOC + concept index
+      2. FOUNDATIONAL_RETRIEVAL — retrieve foundational chunks
+      3. GAP_ANALYSIS — LLM identifies knowledge gaps
+      4. GAP_RETRIEVAL — retrieve chunks for each gap
+      5. PLAN_DESIGN — LLM designs phased plan
+      6. CONCEPT_DETAIL — LLM produces detailed concepts per phase + ingests
+
+    Poll GET /aristotle/plan/{job_id}/status for progress.
+    """
+    container = _get_container(request)
+    body = await request.json()
+    session_dict = body.get("session", {})
+    material_id = body.get("material_id") or None
+
+    from aristotle.actors.intake import intake_session_from_dict
+    from aristotle.actors.plan_generator import create_plan_job, generate_plan_pipeline
+    from aip.adapter.extensions.supervision import supervised_task
+
+    session = intake_session_from_dict(session_dict)
+
+    # Infer material_id from session if not provided
+    if material_id is None and session.material_ids:
+        material_id = session.material_ids[0]
+
+    # Create the job row
+    job_id = await create_plan_job(container, session, material_id)
+
+    # Start the background pipeline — supervised_task handles exception
+    # logging + cancellation on shutdown.
+    task = supervised_task(
+        f"aristotle:plan:{job_id}",
+        generate_plan_pipeline(session, container, job_id),
+    )
+
+    # Store the task on the container so shutdown cancels it.
+    if not hasattr(container, "_aristotle_plan_tasks"):
+        container._aristotle_plan_tasks = {}
+    container._aristotle_plan_tasks[job_id] = task
+
+    logger.info("plan_job_started job_id=%s material_id=%s", job_id, material_id)
+
+    return {
+        "job_id": job_id,
+        "status": "PENDING",
+        "steps_total": 6,
+        "message": "Plan generation started — poll /aristotle/plan/{job_id}/status",
+    }
+
+
+@router.get("/plan/{job_id}/status")
+async def plan_status_route(request: Request, job_id: str):
+    """Get the status of a plan generation job.
+
+    Returns:
+      {
+        "job_id": str,
+        "plan_id": str | None,      # present when COMPLETE
+        "material_id": str | None,
+        "phase": "PENDING"|"STRUCTURE_RETRIEVAL"|"FOUNDATIONAL_RETRIEVAL"|"GAP_ANALYSIS"|"GAP_RETRIEVAL"|"PLAN_DESIGN"|"CONCEPT_DETAIL"|"STORING"|"COMPLETE"|"FAILED",
+        "status": "PENDING"|"RUNNING"|"COMPLETE"|"FAILED",
+        "steps_total": 6,
+        "steps_done": int,
+        "error": str | None,
+        "started_at": str,
+        "updated_at": str,
+        "completed_at": str | None,
+      }
+    """
+    container = _get_container(request)
+    from aristotle.actors.plan_generator import get_plan_job_status
+
+    status = await get_plan_job_status(container, job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"Plan job {job_id!r} not found")
+    return status
 
 
 # ------------------------------------------------------------------
