@@ -875,6 +875,10 @@ def _build_rag_intake_prompt(
     # Structural map (TOC + concept index) — shown every turn so the LLM
     # always knows the paper's structure. Compact (~2k tokens).
     if structural_maps:
+        parts.append("=== UPLOADED PAPER STATUS ===")
+        parts.append("The learner HAS uploaded a paper. It is ingested + chunked + embedded.")
+        parts.append("You DO NOT need to ask them to upload it again. It is HERE.")
+        parts.append("")
         parts.append("Paper structure (table of contents + key concepts):")
         for smap in structural_maps:
             toc = smap.get("toc", [])

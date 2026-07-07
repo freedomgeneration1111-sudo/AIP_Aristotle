@@ -275,15 +275,25 @@ async def ingest_paper(
 
         # Embed + upsert each chunk. No batch API — one call per chunk.
         # Use a semaphore to limit concurrency (avoid rate limits).
+        # Each embed call has a 60s timeout — if OpenRouter is slow/down,
+        # we don't hang forever.
         sem = asyncio.Semaphore(3)
+        chunks_done_count = 0
 
-        async def embed_and_store(chunk: dict, idx: int) -> None:
+        async def embed_and_store(chunk: dict, idx: int) -> bool:
+            nonlocal chunks_done_count
             async with sem:
                 try:
                     chunk_text = chunk["text"]
                     # Truncate to 2000 chars for embedding (model limit)
                     embed_text = chunk_text[:2000]
-                    embedding = await embedding_provider.embed(embed_text)
+
+                    # 60s timeout per embed call — prevents indefinite hangs
+                    # on OpenRouter rate limits / network issues.
+                    embedding = await asyncio.wait_for(
+                        embedding_provider.embed(embed_text),
+                        timeout=60.0,
+                    )
 
                     # Upsert to vector store with domain filter
                     await vector_store.upsert(
@@ -303,10 +313,23 @@ async def ingest_paper(
                     )
 
                     # Also write to CorpusTurnStore for FTS5 lexical search
-                    # (the vector store + FTS5 are complementary retrieval channels)
                     await _write_corpus_turn(stores, material_id, filename, chunk)
 
-                    await _update_job(conn, job_id, chunks_done=idx + 1)
+                    chunks_done_count += 1
+                    await _update_job(conn, job_id, chunks_done=chunks_done_count)
+                    if chunks_done_count % 5 == 0:
+                        logger.info(
+                            "ingest_progress job_id=%s chunks_done=%d/%d",
+                            job_id, chunks_done_count, len(chunks),
+                        )
+                    return True
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "ingest_chunk_timeout job_id=%s chunk_index=%d — "
+                        "embed call timed out after 60s (OpenRouter slow/down?)",
+                        job_id, idx,
+                    )
+                    return False
                 except Exception as exc:
                     logger.warning(
                         "ingest_chunk_failed job_id=%s chunk_index=%d error=%s:%s",
@@ -314,21 +337,61 @@ async def ingest_paper(
                     )
                     # Don't fail the whole job — skip this chunk + continue
 
-        # Process chunks concurrently (bounded by semaphore)
+        # Process chunks concurrently (bounded by semaphore).
+        # Total timeout: 5 minutes for all chunks. If embedding is too slow
+        # (OpenRouter down), we fail the job instead of hanging forever.
         tasks = [embed_and_store(chunk, idx) for idx, chunk in enumerate(chunks)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=300.0,  # 5 minutes total
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "ingest_embedding_timeout job_id=%s chunks_done=%d/%d — "
+                "embedding took >5min, marking job as failed",
+                job_id, chunks_done_count, len(chunks),
+            )
+            await _fail_job(
+                container, job_id,
+                f"Embedding timed out after 5 minutes ({chunks_done_count}/{len(chunks)} chunks done). "
+                f"OpenRouter may be slow or down. Try again later.",
+            )
+            return
+
+        logger.info(
+            "ingest_embedding_complete job_id=%s chunks_done=%d/%d",
+            job_id, chunks_done_count, len(chunks),
+        )
+
+        # If 0 chunks succeeded, fail the job
+        if chunks_done_count == 0:
+            await _fail_job(
+                container, job_id,
+                "All chunk embeddings failed — check embedding provider config + network",
+            )
+            return
 
         # --- Phase 4: ANALYZE (structural analysis via LLM) ---
         await _update_job(conn, job_id, phase="ANALYZING")
         try:
             from aristotle.ingestion.structural_analysis import analyze_paper_structure
-            structure = await analyze_paper_structure(
-                material_id, filename, chunks, container,
+            # 120s timeout for structural analysis (1 LLM call)
+            structure = await asyncio.wait_for(
+                analyze_paper_structure(material_id, filename, chunks, container),
+                timeout=120.0,
             )
             # Store structural metadata
             await _store_structure(conn, material_id, chunks, structure)
             await _update_job(conn, job_id, analysis_complete=1)
             logger.info("ingest_analysis_complete job_id=%s", job_id)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "ingest_analysis_timeout job_id=%s — structural analysis took >120s, "
+                "skipping (chunks are indexed, RAG will work without structure)",
+                job_id,
+            )
+            # Don't fail the job — chunks are indexed, analysis is optional
         except Exception as exc:
             logger.warning(
                 "ingest_analysis_failed job_id=%s error=%s:%s — "
