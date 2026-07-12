@@ -13,10 +13,18 @@
 -- SQLite does not support multiple ADD COLUMN in one ALTER statement,
 -- so each new column gets its own ALTER TABLE. SQLite also has no
 -- IF NOT EXISTS for ADD COLUMN. Re-running M009 on a DB that already
--- has the columns will raise "duplicate column name" on each ALTER.
--- The migration runner treats that as a skip-with-warning (same as
--- M003's ADD COLUMN statements). The extension_applied_migrations
--- fingerprint table normally prevents re-runs entirely.
+-- has the columns would raise "duplicate column name" on each ALTER —
+-- but this cannot happen in normal operation: the migration runner
+-- (extensions/loaders/migration_loader.py) tracks applied migrations by
+-- name in extension_applied_migrations and skips ones already recorded
+-- BEFORE executing any of their SQL, so M009 is never re-run once
+-- applied. If that name-tracking were ever bypassed (manual DB surgery,
+-- a bug in the tracking table itself), the loader has no exception
+-- handling around statement execution — the duplicate-column error would
+-- propagate uncaught, and per the loader's own docstring the extension
+-- host catches it and transitions the extension to DEGRADED, not a
+-- silent skip. Idempotency here rests entirely on the name-tracking
+-- table doing its job, not on any per-statement error recovery.
 --
 -- IMPORTANT: the migration runner splits on semicolon naively (same as
 -- the core runner — src/aip/adapter/extensions/loaders/migration_loader.py:151).
