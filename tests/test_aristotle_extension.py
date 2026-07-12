@@ -315,6 +315,75 @@ async def test_aristotle_m004_creates_phase_d_schema(host: ExtensionHost, contai
     _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
 )
 @pytest.mark.asyncio
+async def test_aristotle_m009_creates_student_scoping_schema(host: ExtensionHost, container):
+    """M009_aristotle_student_scoping.sql creates the ADR-004 schema.
+
+    ADR-004 / Task 18 adds:
+      - aristotle_student: lightweight, name-only student identity.
+      - aristotle_learning_plan.student_id (NOT NULL DEFAULT 'definer') +
+        aristotle_learning_plan.material_id (nullable).
+      - aristotle_concept.plan_id (nullable) +
+        aristotle_concept.material_id (nullable).
+      - Indexes on aristotle_learning_plan(student_id) and
+        aristotle_concept(plan_id).
+
+    Also verifies the 'definer' backfill row exists in aristotle_student
+    after migration, so pre-migration tables that default to 'definer'
+    keep resolving to a real row.
+    """
+    await host.start()
+    assert host.state("aristotle") in (
+        ExtensionState.REGISTERED,
+        ExtensionState.MOUNTED,
+    ), (
+        f"ARISTOTLE should reach REGISTERED or MOUNTED; failures="
+        f"{[f.to_dict() for f in host.failures('aristotle')]}"
+    )
+
+    stores = await container.corpus_registry.get_stores("aristotle:textbook")
+
+    # New table
+    assert await _table_exists(stores, "aristotle_student"), (
+        "M009 should create aristotle_student table"
+    )
+
+    # New columns on aristotle_learning_plan
+    assert await _column_exists(stores, "aristotle_learning_plan", "student_id"), (
+        "M009 should add student_id to aristotle_learning_plan"
+    )
+    assert await _column_exists(stores, "aristotle_learning_plan", "material_id"), (
+        "M009 should add material_id to aristotle_learning_plan"
+    )
+
+    # New columns on aristotle_concept
+    assert await _column_exists(stores, "aristotle_concept", "plan_id"), (
+        "M009 should add plan_id to aristotle_concept"
+    )
+    assert await _column_exists(stores, "aristotle_concept", "material_id"), (
+        "M009 should add material_id to aristotle_concept"
+    )
+
+    # The 'definer' backfill row must exist so pre-migration tables that
+    # default to 'definer' (mastery, struggle_pattern, uploaded_material)
+    # keep resolving to a real aristotle_student row.
+    conn = stores.connection_manager.write_conn
+    cur = await conn.execute(
+        "SELECT name FROM aristotle_student WHERE id = ?", ("definer",)
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None, (
+        "M009 should backfill an aristotle_student row with id='definer'"
+    )
+    assert row[0] == "Definer", (
+        f"backfilled 'definer' row should have name='Definer'; got {row[0]!r}"
+    )
+
+
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
+@pytest.mark.asyncio
 async def test_aristotle_registers_actors(host: ExtensionHost):
     """All three actors are registered via hooks.py::on_load."""
     await host.start()

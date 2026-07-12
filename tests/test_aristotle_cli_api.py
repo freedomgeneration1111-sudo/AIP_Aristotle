@@ -134,19 +134,26 @@ class TestAPIRoutes:
 
     @pytest.mark.asyncio
     async def test_list_concepts_route(self):
-        """GET /aristotle/concepts returns concepts from the corpus."""
+        """GET /aristotle/concepts returns concepts from the corpus.
+
+        Task 18 (ADR-004): the route now selects 7 columns
+        (id, topic, subtopic, bloom_target, prerequisite_concept_id,
+        plan_id, material_id) and accepts optional ?plan_id= /
+        ?material_id= query params. With no params it returns every
+        concept (backward compat) and logs an unscoped-call warning.
+        """
         from aristotle.api import list_concepts_route
 
-        # Mock list_concepts to return canned data
+        # Mock list_concepts to return canned data — 7 columns now.
         conn = _FakeConn(
             rows=[
-                ("c1", "Inertia", None, 3, None),
-                ("c2", "Force", "c1", 4, None),
+                ("c1", "Inertia", None, 3, None, "plan-A", "mat-1"),
+                ("c2", "Force", "c1", 4, None, "plan-A", "mat-1"),
             ]
         )
         container = _make_container(stores=_FakeStores(conn))
 
-        # Build a fake Request
+        # Build a fake Request with empty query_params (unscoped path).
         request = type(
             "R",
             (),
@@ -158,19 +165,24 @@ class TestAPIRoutes:
                         "state": type("S", (), {"container": container})(),
                     },
                 )(),
+                "query_params": type(
+                    "Q",
+                    (),
+                    {"get": lambda self, key, default=None: default},
+                )(),
             },
         )()
 
         result = await list_concepts_route(request)
         assert isinstance(result, list)
         # The fake returns rows from fetchall — list_concepts maps them
-        # But the row shape here doesn't match the query in list_concepts
-        # (which selects id, topic, subtopic, bloom_target, prerequisite_concept_id)
-        # The _FakeConn returns the rows as-is. list_concepts does:
-        #   row[0]=id, row[1]=topic, row[2]=subtopic, row[3]=bloom, row[4]=prereq
-        # Our fake rows have 5 columns matching that query.
+        # row[0]=id, row[1]=topic, row[2]=subtopic, row[3]=bloom,
+        # row[4]=prereq, row[5]=plan_id, row[6]=material_id.
         if result:
             assert result[0]["id"] == "c1"
+            # Task 18: new fields are present.
+            assert result[0]["plan_id"] == "plan-A"
+            assert result[0]["material_id"] == "mat-1"
 
     @pytest.mark.asyncio
     async def test_session_start_route(self):
@@ -475,6 +487,15 @@ class TestDashboardRoute:
                     {
                         "state": type("S", (), {"container": container})(),
                     },
+                )(),
+                # Task 18 (ADR-004): dashboard_route now reads query_params
+                # for optional student_id/plan_id. Empty here = unscoped
+                # path, which preserves the pre-Task-18 behavior this test
+                # was written against.
+                "query_params": type(
+                    "Q",
+                    (),
+                    {"get": lambda self, key, default=None: default},
                 )(),
             },
         )()

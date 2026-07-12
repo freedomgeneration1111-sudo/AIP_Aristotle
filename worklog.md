@@ -589,3 +589,93 @@ Files changed (Brain-side — separate repo, separate worklog, flagged here for 
 Open follow-ups (NOT implemented in this task — flagged for Moses):
 - **Data cleanup needed (live database, NOT a code change — Moses to do directly against his db/ files)**: the pharmacy plan already generated before this fix (plan_id `a2a9ff17-a0cc-49ac-aad4-edf3c34c1243`) has physics content permanently baked into its `pharmacognosy_NNN` concept rows in `aristotle_concept`. That plan needs to be discarded and regenerated from scratch after this patch is applied — the new plan generation will correctly retrieve only pharmacy chunks. There is also likely leftover physics/other-subject content sitting in the shared `aristotle:textbook` vector store and `aristotle_concept` table from earlier dogfood/testing sessions on this machine — identifying and cleaning that up is a data/ops task, not a code change. Do NOT attempt to write a data-cleanup migration here; that's explicitly out of scope.
 - The over-fetch multiplier (5x, capped at 50) and the specific call sites that got material_id filtering (intake RAG, plan_generator foundational + gap-specific) are the verified-safe set. Extending material_id filtering to any other call site without auditing each one's context risks a different kind of regression (e.g. a legitimate cross-material lookup somewhere we haven't audited). Flag back to Moses before extending scope.
+
+---
+Task ID: 18
+Agent: Super Z (main)
+Task: ADR-004 backend implementation — student identity + plan/concept ownership schema, scoping API, and plan_generator population. GUI deliberately deferred (separate task pending Moses's API-shape review).
+
+Context:
+- ADR-004 was committed in its own commit (a13b3a6) BEFORE this implementation commit, so the design record exists independent of (and even if implementation had to stop partway through) the code that implements it. ADR-004's Status remains "Proposed" — Moses's call as DEFINER to flip it to "Accepted"; this task does not change ADR status.
+- Three production bugs (Tasks 15-17) traced back to one root cause: `aristotle_concept` and `aristotle_learning_plan` had no student/plan/material ownership columns at all. ADR-004 fixes the schema itself so the next caller can't repeat the same mistake by forgetting a filter — instead of patching each query call-site as it surfaces (which is what Tasks 15-17 did three times).
+- A fourth instance was found but not yet fixed by Task 17: `GET /dashboard` (the screen literally labeled "Teacher Dashboard") joined `aristotle_concept` with zero subject/plan filter against a hardcoded `student_id="definer"` — every subject's concepts showed up mixed together for every student. This task's `/dashboard?plan_id=X` filter closes that.
+
+Implementation (Step 3a-3d from the task brief):
+
+3a. New migration `aristotle/migrations/M009_aristotle_student_scoping.sql`:
+- `CREATE TABLE IF NOT EXISTS aristotle_student (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))`. Schema-minimal (id + name only, no credentials) — ADR-004 explicitly rejects authentication for this deployment stage. Kept this way so it can be promoted to a shared AIP_Brain-level table later without a rename.
+- `INSERT OR IGNORE INTO aristotle_student (id, name) VALUES ('definer', 'Definer')` — backfill row so every pre-migration table that already defaults to 'definer' (mastery, struggle_pattern, uploaded_material) keeps resolving to a real row instead of an orphaned string.
+- `ALTER TABLE aristotle_learning_plan ADD COLUMN student_id TEXT NOT NULL DEFAULT 'definer'` — defaults to 'definer' so existing plans keep their current effective owner.
+- `ALTER TABLE aristotle_learning_plan ADD COLUMN material_id TEXT` — nullable; deterministic-fallback plan path doesn't always have a material.
+- `ALTER TABLE aristotle_concept ADD COLUMN plan_id TEXT` — nullable; pre-M009 concepts (dogfood fixtures) were not created in any plan's context.
+- `ALTER TABLE aristotle_concept ADD COLUMN material_id TEXT` — nullable for the same reason.
+- `CREATE INDEX IF NOT EXISTS idx_learning_plan_student ON aristotle_learning_plan(student_id)` + `idx_concept_plan ON aristotle_concept(plan_id)` — for the two new filter columns.
+- Style: matches M001-M008 conventions exactly — header comment block explaining purpose + "additive only" + "migration runner splits on semicolon naively" warning, comment-only preamble before each statement group, no semicolons inside comments.
+
+3b. Best-effort backfill (in the same migration, idempotent):
+- `UPDATE aristotle_learning_plan SET material_id = (...) WHERE material_id IS NULL AND EXISTS (...)` — joins through `aristotle_plan_job` (the one pre-M009 table that carried both plan_id + material_id) to recover material_id for existing plans.
+- `UPDATE aristotle_concept SET plan_id = (...), material_id = (...) WHERE plan_id IS NULL AND EXISTS (...)` — uses SQLite's `json_each()` to walk each plan's `concept_ids_json` array and find the plan that owns each concept. Copies both plan_id and that plan's material_id onto the concept row.
+- Both backfills are best-effort NULL-guarded UPDATEs — safe no-ops on empty tables and when re-run. Per the task brief, this is likely a no-op against the current dev database (the poisoned pharmacy plan is being discarded separately via a reset script — explicitly NOT touched here).
+
+3c. API changes in `aristotle/api.py`:
+- `POST /aristotle/students {name}` → inserts a fresh UUID + name into aristotle_student, returns `{id, name}`. 400 on empty/missing name.
+- `GET /aristotle/students` → list all, ordered by created_at ascending.
+- `GET /aristotle/plans?student_id=X` → list plans for a student: `{id, subject, status, current_concept_idx, total_concepts, created_at, last_session_at, material_id}`. total_concepts computed from `json.loads(concept_ids_json)` (robust to malformed JSON — falls back to 0). Defaults `student_id` to 'definer' when not provided (preserves pre-Task-18 single-tenant behavior). This endpoint did not exist prior to Task 18 — the only way to find a plan was plan_id-by-plan_id.
+- `GET /aristotle/concepts` — now accepts optional `?plan_id=` / `?material_id=` filters. When neither is provided, returns every concept in the table (backward compat) AND logs a `concepts_route_unscoped_call` warning so future unscoped usage is visible in logs rather than silently reproducing the Task 17 / ADR-004 cross-contamination failure mode. Response shape now includes `plan_id` + `material_id` fields so callers can verify scoping without a second query.
+- `GET /dashboard` — accepts optional `?student_id=` (defaults to 'definer' only when not provided, preserves pre-Task-18 behavior) and `?plan_id=`. When `plan_id` is given, scopes the concept/mastery join to that plan only (`WHERE c.plan_id = ?`) instead of scanning every concept in the shared table. When `plan_id` is absent, logs a `dashboard_route_unscoped_call` warning. Response now includes `plan_id` field (None when unscoped) so the GUI can confirm what scope was applied.
+
+3d. `aristotle/actors/intake.py` (IntakeSession + IntakeActor.generate_plan):
+- `IntakeSession.student_id: str = "definer"` — new field, flows from `/intake/start` request body through `/intake/step`'s round-trip serialization to `generate_plan()`. Round-trips through `intake_session_to_dict` / `intake_session_from_dict` (defaults to 'definer' for legacy session dicts serialized before Task 18 — backward compat).
+- `IntakeActor.generate_plan()`:
+  - `plan_id = str(uuid.uuid4())` moved BEFORE the concept insertion loop (was after) so each concept row can carry `plan_id` at write time.
+  - `material_id = session.material_ids[0] if session.material_ids else None` — the primary uploaded material the plan was built from.
+  - Concept INSERT now includes `plan_id` + `material_id` in column list + VALUES — so every concept created by the LLM-driven path is born scoped. (Deterministic-fallback path doesn't create concepts, only reuses existing ones — their plan_id/material_id stay NULL, which is correct: they were not created by this plan.)
+  - Plan INSERT now includes `student_id` + `material_id` in column list + VALUES — so `GET /aristotle/plans?student_id=X` can find it.
+- `plan_generator.py`: NO code changes needed. It already calls `IntakeActor.generate_plan(ctx, session)` with the session object, and `session.student_id` + `session.material_ids` are already populated by the time it runs (set at `/intake/start`, persisted through `/intake/step`'s round-trip). The new columns are populated automatically.
+
+Tests (Step 4):
+- `tests/test_aristotle_extension.py` — added `test_aristotle_m009_creates_student_scoping_schema`: verifies aristotle_student table exists, the four new columns exist on aristotle_learning_plan + aristotle_concept, and the 'definer' backfill row is present with name='Definer'. Follows the exact pattern of the existing M003/M004 schema tests.
+- `tests/test_aristotle_student_scoping.py` (new, 21 tests):
+  - TestIntakeSessionStudentId (3): default='definer', round-trips through serialization, legacy session dicts default to 'definer'.
+  - TestGeneratePlanPopulatesScopingColumns (3): every concept INSERT carries plan_id + material_id, every plan INSERT carries student_id + material_id, default 'definer' when student_id not set.
+  - TestStudentsRoutes (3): POST creates + returns {id, name}, POST 400s on empty name, GET returns ordered list.
+  - TestPlansRoute (3): scopes by student_id (WHERE clause), defaults to 'definer', robust to malformed concept_ids_json.
+  - TestConceptsRouteScoping (3): unscoped returns everything + logs warning, plan_id filter adds WHERE + no warning, material_id filter adds WHERE + no warning.
+  - TestDashboardRouteScoping (3): unscoped logs warning + still returns results, plan_id filter adds WHERE c.plan_id + no warning, student_id defaults to 'definer'.
+  - TestIntakeStartRouteStudentId (2): /intake/start passes student_id to session, defaults to 'definer'.
+- Updated `tests/test_aristotle_cli_api.py::test_list_concepts_route` and `test_dashboard_shows_all_concepts_including_unstarted` — added `query_params` attribute to the fake Request (required by the new code paths) and updated the concepts test's canned row shape from 5 columns to 7 (matches the new SELECT). Both tests continue to exercise the unscoped path they were originally written for.
+
+Work Log:
+- Pulled latest on both repos (AIP_Aristotle @ d7b4b78, AIP_Brain @ 5ac9e14) — already up to date from Task 17.
+- Committed ADR-004 verbatim from Moses's upload to docs/decisions/ADR-004-student-identity-subject-scoping.md as commit a13b3a6 — its own commit, before any implementation, so the design record exists independent of the code that implements it. Did NOT edit ADR content. Did NOT change ADR status from "Proposed" (Moses's call as DEFINER).
+- Read M001/M002/M003/M004/M007/M008 migrations to match conventions exactly (header comment style, "additive only" note, "migration runner splits on semicolon" warning, IF NOT EXISTS usage, ALTER TABLE pattern).
+- Read ADR-004 itself for full reasoning — wrote M009 to match the schema block in the ADR's Decision section verbatim (table definition, backfill INSERT, four ALTERs, two indexes).
+- Wrote best-effort backfill as idempotent NULL-guarded UPDATEs using SQLite's json_each() for the concept->plan linkage. Per task brief, this is likely a no-op against current dev data (poisoned pharmacy plan is being wiped separately) — backfill is written to be safe-empty, not to invent data.
+- Modified IntakeSession to add student_id field + serialization round-trip. Default 'definer' preserves pre-Task-18 behavior.
+- Modified IntakeActor.generate_plan to (a) move plan_id generation before concept insertion, (b) add plan_id+material_id to concept INSERT, (c) add student_id+material_id to plan INSERT. Verified plan_generator.py needs NO changes (it already passes session through to generate_plan).
+- Added 3 new API routes (POST/GET /students, GET /plans) + updated 2 existing routes (/concepts, /dashboard) with optional filters + unscoped-call warnings. Added `import json` to api.py (was missing — needed for /plans route's JSON parsing).
+- Updated 2 existing CLI API tests to add query_params to the fake Request + updated concepts test's row shape from 5 to 7 columns. Both tests continue to exercise the unscoped path they were originally written for.
+- Wrote 21 new tests in tests/test_aristotle_student_scoping.py following the existing fake/mock patterns (reused _FakeConn/_FakeStores/_FakeRegistry/_make_ctx pattern from test_aristotle_intake.py / test_plan_generator.py — did not invent new helpers when existing ones sufficed).
+- Ran `pytest tests/`: **208 passed, 1 skipped, 5 xfailed, 0 failures** — exceeds the 187+ requirement (was 187 before Task 18; +20 new student_scoping tests + 1 new M009 schema test in test_aristotle_extension.py = 208). Breakdown: 14 actors + 8 cli_api + 11 extension (was 10, +1 for M009) + 5 gui_pages + 60 intake + 2 intake_e2e + 10 routes (3 xfail) + 71 tutoring + 7 curiosity_path + 2 import_boundary + 3 plan_generator + 6 retrieve_relevant_chunks + 21 student_scoping (1 placeholder skipped — the real M009 schema assertions live in test_aristotle_extension.py) + 2 teacher_dashboard (2 xfail) = 213 collected, 208 passed, 5 xfailed, 1 skipped.
+- Confirmed tests/test_import_boundary.py still passes (2/2) — the extension-contract boundary between Aristotle and AIP_Brain is intact. The new `import json` in api.py is a stdlib import, not an aip.* import — does not affect the boundary.
+
+Stage Summary:
+- Schema-level fix landed: aristotle_concept and aristotle_learning_plan now carry real ownership columns (plan_id, material_id, student_id). The next caller that wants "concepts for plan X" or "plans for student Y" is a WHERE clause, not a JSON-parsing loop or a table-wide scan.
+- API surface extended: POST/GET /students, GET /plans?student_id=X are new. /concepts and /dashboard accept optional plan_id/material_id/student_id filters; unscoped calls still work (backward compat) but now log a warning so future unscoped usage is visible instead of silent.
+- Plan generation writes the new columns at insertion time: every concept created by IntakeActor.generate_plan carries plan_id + material_id; every plan carries student_id + material_id. plan_generator.py needs no changes — it delegates to generate_plan, which now does the right thing automatically.
+- Backfill is best-effort and likely a no-op on the current dev database. The poisoned pharmacy plan is being discarded via a separate reset script (NOT this task).
+- ADR-004's status remains "Proposed" — Moses's call as DEFINER to flip to "Accepted" after he reviews the API shape.
+
+Files changed:
+- `aristotle/migrations/M009_aristotle_student_scoping.sql` (new) — schema + backfill
+- `aristotle/api.py` — 3 new routes (POST/GET /students, GET /plans), updated /concepts and /dashboard with optional filters + unscoped-call warnings, added `import json`
+- `aristotle/actors/intake.py` — IntakeSession.student_id field + serialization round-trip; IntakeActor.generate_plan populates plan_id+material_id on concepts and student_id+material_id on plans; plan_id generation moved before concept insertion
+- `tests/test_aristotle_extension.py` — added test_aristotle_m009_creates_student_scoping_schema
+- `tests/test_aristotle_student_scoping.py` (new) — 21 tests covering migration/endpoints/filtering/plan_generator population
+- `tests/test_aristotle_cli_api.py` — updated test_list_concepts_route (row shape 5→7 cols + query_params) and test_dashboard_shows_all_concepts_including_unstarted (query_params)
+
+NOT implemented in this task (flagged for next task):
+- **GUI (AIP_Brain/gui/pages/ask.py student picker / subject switcher)**: deliberately not implemented in this pass — pending Moses's review of the API shape (POST/GET /students, GET /plans?student_id=X, /concepts and /dashboard filter params). The ADR-004 §Decision GUI section describes the intended UI: a lightweight student picker dropdown populated from GET /aristotle/students with a "new student" option that calls POST /aristotle/students, plus a "My Subjects" view that calls GET /aristotle/plans?student_id=X to let the learner resume an existing subject or start a new one. This is the next task, scoped separately.
+- **ADR-004 status flip from "Proposed" to "Accepted"**: Moses's call as DEFINER, not done during implementation.
+- **Data cleanup of the already-poisoned pharmacy plan (plan_id a2a9ff17-...)**: still outstanding from Task 17 — Moses to do directly against his db/ files. The new M009 backfill does not attempt to fix it; the reset script is the right tool.
+- **Extending material_id filtering to other call sites not in Task 17's verified set**: still flagged from Task 17 — same caution applies, do not extend without auditing each one's context.

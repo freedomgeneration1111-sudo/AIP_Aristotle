@@ -44,6 +44,7 @@ The platform's app.py sets `app.state.container` in the lifespan.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -113,11 +114,73 @@ def _make_ctx(container: Any, config: Any = None) -> ActorContext:
 
 @router.get("/concepts")
 async def list_concepts_route(request: Request):
-    """List all ingested concepts in the textbook corpus."""
+    """List concepts in the textbook corpus, with optional scoping filters.
+
+    Query params (all optional, ADR-004 / Task 18):
+      - plan_id: scope to concepts created for a specific plan
+      - material_id: scope to concepts derived from a specific material
+
+    When neither filter is provided, returns every concept in the table
+    (the pre-Task-18 behavior) AND logs a `concepts_route_unscoped_call`
+    warning so future unscoped usage is visible in logs rather than
+    silently reproducing the Task 17 / ADR-004 cross-contamination
+    failure mode.
+
+    Returns: list of {id, topic, subtopic, bloom_target,
+    prerequisite_concept_id, plan_id, material_id}
+    """
     container = _get_container(request)
-    ctx = _make_ctx(container)
-    concepts = await list_concepts(ctx)
-    return concepts
+    plan_id = request.query_params.get("plan_id")
+    material_id = request.query_params.get("material_id")
+
+    if not plan_id and not material_id:
+        # Backwards-compatible unscoped path — but make it loud in logs
+        # so anyone reading the log sees that an unscoped call happened.
+        # The ADR's whole point is that unscoped calls are the bug source.
+        logger.warning("concepts_route_unscoped_call — returning all concepts table-wide")
+
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return []
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+        conn = stores.connection_manager.write_conn
+        # Task 18: now selects plan_id + material_id too so callers can
+        # verify scoping without a second query.
+        sql = (
+            "SELECT id, topic, subtopic, bloom_target, "
+            "prerequisite_concept_id, plan_id, material_id "
+            "FROM aristotle_concept"
+        )
+        where_parts: list[str] = []
+        params: list[Any] = []
+        if plan_id:
+            where_parts.append("plan_id = ?")
+            params.append(plan_id)
+        if material_id:
+            where_parts.append("material_id = ?")
+            params.append(material_id)
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+        sql += " ORDER BY id"
+        cur = await conn.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "id": row[0],
+                "topic": row[1],
+                "subtopic": row[2],
+                "bloom_target": row[3],
+                "prerequisite_concept_id": row[4],
+                "plan_id": row[5],
+                "material_id": row[6],
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
 
 
 @router.post("/ingest")
@@ -258,6 +321,153 @@ async def session_run_route(request: Request):
 
 
 # ------------------------------------------------------------------
+# Student + plan scoping routes (ADR-004 / Task 18)
+# ------------------------------------------------------------------
+
+
+@router.post("/students")
+async def create_student_route(request: Request):
+    """Create a new student identity (ADR-004 §Decision).
+
+    Request body: {"name": str}
+    Returns: {"id": str, "name": str}
+
+    The id is a fresh UUID. aristotle_student is name-only — no
+    credentials, no auth (the ADR explicitly rejects that for this
+    deployment stage). The GUI will call this from a "new student"
+    option in a picker dropdown.
+    """
+    import uuid as _uuid
+
+    container = _get_container(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"corpus access failed: {exc}")
+
+    conn = stores.connection_manager.write_conn
+    student_id = str(_uuid.uuid4())
+    await conn.execute(
+        "INSERT INTO aristotle_student (id, name) VALUES (?, ?)",
+        (student_id, name),
+    )
+    await conn.commit()
+    logger.info("student_created id=%s name=%s", student_id, name)
+    return {"id": student_id, "name": name}
+
+
+@router.get("/students")
+async def list_students_route(request: Request):
+    """List all students (ADR-004 §Decision).
+
+    Returns: list of {"id": str, "name": str, "created_at": str}
+    Ordered by created_at ascending (oldest first).
+    """
+    container = _get_container(request)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return []
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception:
+        return []
+
+    conn = stores.connection_manager.write_conn
+    cur = await conn.execute(
+        "SELECT id, name, created_at FROM aristotle_student "
+        "ORDER BY created_at ASC, id ASC"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [
+        {"id": row[0], "name": row[1], "created_at": row[2]}
+        for row in rows
+    ]
+
+
+@router.get("/plans")
+async def list_plans_route(request: Request):
+    """List learning plans for a student (ADR-004 §Decision).
+
+    Query params:
+      - student_id (optional, defaults to 'definer'): scope to this
+        student's plans.
+
+    Returns: list of {
+        "id": str,
+        "subject": str,
+        "status": str,
+        "current_concept_idx": int,
+        "total_concepts": int,
+        "created_at": str,
+        "last_session_at": str | None,
+        "material_id": str | None,
+    }
+
+    This is the endpoint a subject-switcher UI calls to populate its
+    "resume existing subject / start new subject" view. It does not
+    exist prior to Task 18 — the only way to find a plan was
+    plan_id-by-plan_id.
+    """
+    container = _get_container(request)
+    student_id = request.query_params.get("student_id") or "definer"
+
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        return []
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception:
+        return []
+
+    conn = stores.connection_manager.write_conn
+    # Task 18: reads student_id + material_id (new M009 columns) so the
+    # GUI can show "which material this plan was built from" alongside
+    # the subject. total_concepts is computed from json_array_length on
+    # concept_ids_json — same approach _finalize_placement uses.
+    cur = await conn.execute(
+        "SELECT id, subject, status, current_concept_idx, "
+        "  concept_ids_json, created_at, last_session_at, material_id "
+        "FROM aristotle_learning_plan "
+        "WHERE student_id = ? "
+        "ORDER BY created_at DESC",
+        (student_id,),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    plans: list[dict] = []
+    for row in rows:
+        concept_ids_json = row[4] or "[]"
+        try:
+            concept_ids = json.loads(concept_ids_json)
+            total_concepts = len(concept_ids)
+        except (json.JSONDecodeError, TypeError):
+            total_concepts = 0
+        plans.append({
+            "id": row[0],
+            "subject": row[1],
+            "status": row[2],
+            "current_concept_idx": row[3],
+            "total_concepts": total_concepts,
+            "created_at": row[5],
+            "last_session_at": row[6],
+            "material_id": row[7],
+        })
+    return plans
+
+
+# ------------------------------------------------------------------
 # Dashboard route (Phase B — teacher view, ADR-001 §8)
 # ------------------------------------------------------------------
 
@@ -266,9 +476,19 @@ async def session_run_route(request: Request):
 async def dashboard_route(request: Request):
     """Teacher dashboard — per-student mastery + struggle + due items (ADR-001 §8).
 
+    Query params (ADR-004 / Task 18, both optional):
+      - student_id: defaults to 'definer' when absent (preserves the
+        pre-Task-18 single-tenant behavior). When provided, scopes the
+        struggle_pattern lookup.
+      - plan_id: when provided, scopes the concept/mastery join to
+        concepts belonging to that plan only — instead of scanning every
+        concept in the shared aristotle_concept table (the pre-Task-18
+        behavior that mixed every subject's concepts together).
+
     Returns:
         {
-            "student_id": "definer",
+            "student_id": str,
+            "plan_id": str | None,
             "total_concepts": int,
             "mastered_count": int,
             "due_count": int,
@@ -297,8 +517,7 @@ async def dashboard_route(request: Request):
 
     Pulls from aristotle_mastery + aristotle_concept +
     aristotle_struggle_pattern via
-    corpus_registry.get_stores("aristotle:textbook"). student_id is
-    always "definer" (single-tenant pre-alpha).
+    corpus_registry.get_stores("aristotle:textbook").
     """
     container = _get_container(request)
     registry = getattr(container, "corpus_registry", None)
@@ -311,7 +530,11 @@ async def dashboard_route(request: Request):
         raise HTTPException(status_code=503, detail=f"corpus access failed: {exc}")
 
     conn = stores.connection_manager.write_conn
-    student_id = "definer"
+    # Task 18 (ADR-004): default student_id to 'definer' ONLY when not
+    # provided — preserves the pre-Task-18 single-tenant behavior, but
+    # now a caller can pass ?student_id=someone_else to scope.
+    student_id = request.query_params.get("student_id") or "definer"
+    plan_id = request.query_params.get("plan_id") or None
 
     # 1. Read struggle_pattern
     cur = await conn.execute(
@@ -322,21 +545,47 @@ async def dashboard_route(request: Request):
     await cur.close()
     struggle_pattern = row[0] if row is not None else None
 
-    # 2. LEFT JOIN all concepts with mastery records.
-    #    Concepts with no mastery row get NULLs (never studied).
-    cur = await conn.execute(
-        "SELECT c.id, c.topic, "
-        "  COALESCE(m.mastered, 0) AS mastered, "
-        "  m.last_score, "
-        "  COALESCE(m.repetitions, 0) AS repetitions, "
-        "  m.next_review_at, "
-        "  m.updated_at "
-        "FROM aristotle_concept c "
-        "LEFT JOIN aristotle_mastery m "
-        "  ON c.id = m.concept_id AND m.student_id = ? "
-        "ORDER BY c.id",
-        (student_id,),
-    )
+    # 2. LEFT JOIN concepts with mastery records.
+    #    Task 18 (ADR-004): when plan_id is provided, scope to that
+    #    plan's concepts only — closes the "every subject's concepts
+    #    show up mixed together" bug. When plan_id is absent, preserve
+    #    the pre-Task-18 behavior (all concepts) for backward compat,
+    #    but log a warning so an unscoped dashboard call is visible.
+    if plan_id:
+        sql = (
+            "SELECT c.id, c.topic, "
+            "  COALESCE(m.mastered, 0) AS mastered, "
+            "  m.last_score, "
+            "  COALESCE(m.repetitions, 0) AS repetitions, "
+            "  m.next_review_at, "
+            "  m.updated_at "
+            "FROM aristotle_concept c "
+            "LEFT JOIN aristotle_mastery m "
+            "  ON c.id = m.concept_id AND m.student_id = ? "
+            "WHERE c.plan_id = ? "
+            "ORDER BY c.id"
+        )
+        cur = await conn.execute(sql, (student_id, plan_id))
+    else:
+        logger.warning(
+            "dashboard_route_unscoped_call student_id=%s — returning every "
+            "concept in the shared table (no plan_id filter). Pass "
+            "?plan_id=X to scope.",
+            student_id,
+        )
+        sql = (
+            "SELECT c.id, c.topic, "
+            "  COALESCE(m.mastered, 0) AS mastered, "
+            "  m.last_score, "
+            "  COALESCE(m.repetitions, 0) AS repetitions, "
+            "  m.next_review_at, "
+            "  m.updated_at "
+            "FROM aristotle_concept c "
+            "LEFT JOIN aristotle_mastery m "
+            "  ON c.id = m.concept_id AND m.student_id = ? "
+            "ORDER BY c.id"
+        )
+        cur = await conn.execute(sql, (student_id,))
     rows = await cur.fetchall()
     await cur.close()
 
@@ -421,6 +670,7 @@ async def dashboard_route(request: Request):
 
     return {
         "student_id": student_id,
+        "plan_id": plan_id,
         "total_concepts": len(rows),
         "mastered_count": mastered_count,
         "due_count": due_count,
@@ -438,7 +688,7 @@ async def dashboard_route(request: Request):
 async def intake_start_route(request: Request):
     """Start an onboarding intake conversation (ADR-002 §9).
 
-    Request body: {"plan_id": str | None, "deep_intake": bool | None}
+    Request body: {"plan_id": str | None, "deep_intake": bool | None, "student_id": str | None}
       - plan_id None or absent → new learner; full intake from GREETING.
       - plan_id present → check_intake_triggers() decides whether to
         re-surface (full / checkin / partial) or skip intake entirely
@@ -449,6 +699,11 @@ async def intake_start_route(request: Request):
         unbounded probing, intended for self-directed research curricula.
         Can also be set mid-session by the learner via a few trigger
         phrases (see _detect_deep_intake_opt_in in actors/intake.py).
+      - student_id (Task 18 / ADR-004, default 'definer') → flows into
+        aristotle_learning_plan.student_id at plan generation time so
+        GET /aristotle/plans?student_id=X and GET /dashboard?student_id=X
+        can scope to this student. Default preserves the single-tenant
+        pre-alpha behavior when the GUI doesn't send one.
 
     Returns:
       {
@@ -464,6 +719,10 @@ async def intake_start_route(request: Request):
     body = await request.json()
     plan_id = body.get("plan_id") or None
     deep_intake = bool(body.get("deep_intake", False))
+    # Task 18 (ADR-004): student_id flows into aristotle_learning_plan.student_id
+    # at plan generation time. Defaults to 'definer' for the single-tenant
+    # pre-alpha case (preserves prior behavior when the GUI doesn't send one).
+    student_id = body.get("student_id") or "definer"
     ctx = _make_ctx(container)
 
     trigger = await check_intake_triggers(ctx, plan_id)
@@ -478,6 +737,7 @@ async def intake_start_route(request: Request):
         entry_state=trigger.entry_state,
         plan_id=plan_id or "",
         deep_intake=deep_intake,
+        student_id=student_id,
     )
 
     # If the trigger carries a pre-built prompt (checkin / completed-plan

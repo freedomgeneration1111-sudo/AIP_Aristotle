@@ -108,6 +108,12 @@ class IntakeSession:
     draft_plan: list = field(default_factory=list)
     current_focus: str = "SUBJECT"
     plan_confirmed: bool = False
+    # Task 18 (ADR-004): student_id flows from the API (/intake/start
+    # request body, default 'definer') through generate_plan() into
+    # aristotle_learning_plan.student_id. Required so GET /aristotle/plans
+    # and GET /dashboard can scope by student instead of returning every
+    # plan/concept in the shared table.
+    student_id: str = "definer"
     # BUG-001 fix: turns spent in the current focus area. Incremented each
     # turn the model returns the same next_focus; reset to 0 on focus change.
     # Passed to the model via the user prompt so it knows how many turns
@@ -270,6 +276,15 @@ class IntakeActor:
 
             concept_ids: list[str] = []
 
+            # Task 18 (ADR-004): generate plan_id BEFORE inserting concepts
+            # so each concept row can carry plan_id + material_id at write
+            # time. The plan row is inserted further down. material_id is
+            # the first uploaded material (the primary source the plan was
+            # built from), or None for the deterministic-fallback path that
+            # has no material context.
+            plan_id = str(uuid.uuid4())
+            material_id = session.material_ids[0] if session.material_ids else None
+
             if session.draft_plan:
                 # LLM-driven path: ingest each proposed concept as a new
                 # aristotle_concept row. The draft_plan is a list of dicts
@@ -297,12 +312,18 @@ class IntakeActor:
                     # INSERT OR REPLACE so re-ingestion (learner amends +
                     # reconfirms) updates the concept rather than failing
                     # on the PRIMARY KEY collision.
+                    # Task 18 (ADR-004): now includes plan_id + material_id
+                    # so future callers can scope by plan without parsing
+                    # concept_ids_json. Both are nullable in the schema, so
+                    # the deterministic-fallback path (which doesn't have a
+                    # draft_plan and never enters this branch) is unaffected.
                     await conn.execute(
                         "INSERT OR REPLACE INTO aristotle_concept "
                         "(id, textbook_chapter, topic, subtopic, bloom_target, "
                         "content_primary, content_alt, content_alt_lang, "
-                        "prerequisite_concept_id, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, datetime('now'))",
+                        "prerequisite_concept_id, created_at, "
+                        "plan_id, material_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, datetime('now'), ?, ?)",
                         (
                             cid,
                             subject_slug,
@@ -311,6 +332,8 @@ class IntakeActor:
                             bloom,
                             content_primary,
                             prereq_id,
+                            plan_id,
+                            material_id,
                         ),
                     )
                     concept_ids.append(cid)
@@ -325,6 +348,10 @@ class IntakeActor:
                 # aristotle_concept matching the subject, or all concepts
                 # if no match. This is the old behavior — kept for the
                 # no-model fallback path and legacy sessions.
+                # Task 18 (ADR-004): concepts loaded here were not created
+                # by this plan, so their plan_id/material_id stay NULL
+                # (or whatever they were before). The plan row itself
+                # still gets student_id + material_id below.
                 cur = await conn.execute(
                     "SELECT id FROM aristotle_concept "
                     "WHERE topic LIKE ? OR subtopic LIKE ? "
@@ -343,17 +370,19 @@ class IntakeActor:
                     await cur.close()
                     concept_ids = [row[0] for row in rows] if rows else []
 
-            # Generate a UUID for the plan.
-            plan_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc).isoformat()
             concept_ids_json = json.dumps(concept_ids)
 
             # Write the learning_plan row.
+            # Task 18 (ADR-004): now includes student_id + material_id so
+            # GET /aristotle/plans?student_id=X and GET /dashboard?plan_id=Y
+            # can scope without parsing concept_ids_json.
             await conn.execute(
                 "INSERT INTO aristotle_learning_plan "
                 "(id, subject, goals, schedule_minutes_per_day, "
-                "concept_ids_json, current_concept_idx, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "concept_ids_json, current_concept_idx, status, created_at, "
+                "student_id, material_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     plan_id,
                     session.subject,
@@ -363,6 +392,8 @@ class IntakeActor:
                     0,
                     "active",
                     now,
+                    session.student_id,
+                    material_id,
                 ),
             )
 
@@ -1617,6 +1648,10 @@ def intake_session_to_dict(session: IntakeSession) -> dict:
         # survives the round-trip through /intake/step.
         "turns_in_focus": session.turns_in_focus,
         "deep_intake": session.deep_intake,
+        # Task 18 (ADR-004): student_id round-trips so the value set at
+        # /intake/start reaches generate_plan() at /intake/step's COMPLETE
+        # transition. Default 'definer' for legacy sessions.
+        "student_id": session.student_id,
     }
 
 
@@ -1642,6 +1677,9 @@ def intake_session_from_dict(d: dict) -> IntakeSession:
         # Restore deep_intake (default False — legacy sessions and new
         # sessions both get the guided/fast path unless opted in).
         deep_intake=d.get("deep_intake", False),
+        # Restore student_id (default 'definer' for legacy sessions
+        # serialized before Task 18).
+        student_id=d.get("student_id", "definer"),
     )
 
 
