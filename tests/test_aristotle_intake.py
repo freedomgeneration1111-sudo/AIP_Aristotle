@@ -853,16 +853,15 @@ class TestIntakeLLMDriven:
         assert session.current_focus == "GOALS"
 
     @pytest.mark.asyncio
-    async def test_llm_driven_does_not_force_advance_to_plan_draft(self):
-        """REVERTED: the server does NOT force-advance to PLAN_DRAFT.
+    async def test_llm_driven_deep_mode_does_not_force_advance_to_plan_draft(self):
+        """deep_intake=True: the server does NOT force-advance to PLAN_DRAFT.
 
         A custom curriculum (e.g., NBCM) legitimately requires many
-        questions to gauge the student's state. The server trusts the
-        model to advance when it has enough signal. The turns_in_focus
-        counter is for the model's awareness (passed via the prompt),
-        NOT a forcing function. This test verifies the server respects
-        the model's focus choice even when all 4 fields are filled +
-        turns_in_focus is high.
+        questions to gauge the student's state. For sessions that opted
+        into deep_intake, the server trusts the model to advance when
+        it has enough signal — turns_in_focus is visibility only. This
+        preserves the Task 12 behavior, but now scoped to deep_intake=True
+        instead of being the global default (Task 15).
         """
         fake = _FakeModelProvider(
             responses={
@@ -883,6 +882,7 @@ class TestIntakeLLMDriven:
         session = IntakeSession(
             current_focus="SCHEDULE",
             turns_in_focus=5,  # many turns in this focus — but server doesn't force
+            deep_intake=True,
             extracted={
                 "subject": "physics",
                 "prior_knowledge": "basic",
@@ -898,11 +898,154 @@ class TestIntakeLLMDriven:
         assert session.turns_in_focus == 6  # incremented, not reset
 
     @pytest.mark.asyncio
-    async def test_llm_driven_does_not_auto_advance_before_turn_cap(self):
-        """The server never force-advances — turns_in_focus is visibility only.
+    async def test_llm_driven_guided_mode_forces_plan_draft_when_stuck(self):
+        """deep_intake=False (default): server DOES force-advance to
+        PLAN_DRAFT once all 4 fields are filled and the model is stuck
+        (turns_in_focus >= 2). This is the Task 15 fix for the reported
+        'insufferable intake' bug — a weak/free-tier model that keeps
+        re-asking a GOALS-type question in different words, even after
+        the learner gave a clear answer, no longer loops forever.
+        """
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Just one more thing about your schedule...",
+                    "next_focus": "SCHEDULE",  # model still wants to probe further
+                    "extracted": {
+                        "subject": "pharmacognosy",
+                        "prior_knowledge": "high school biology and chemistry",
+                        "goals": "career as a pharmacist",
+                        "schedule_minutes": 30,
+                    },
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="SCHEDULE",
+            turns_in_focus=2,  # already stuck for 2 turns
+            deep_intake=False,
+            extracted={
+                "subject": "pharmacognosy",
+                "prior_knowledge": "high school biology and chemistry",
+                "goals": "career as a pharmacist",
+                "schedule_minutes": 30,
+            },
+        )
 
-        The model gets to decide when it has enough signal. The server
-        respects the model's focus choice at any turn count.
+        await run_intake_step(session, "30 minutes", ctx)
+
+        # Server should have overridden to PLAN_DRAFT despite the model
+        # wanting to keep probing SCHEDULE.
+        assert session.current_focus == "PLAN_DRAFT"
+        assert session.turns_in_focus == 0
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_guided_mode_forces_next_stage_when_fields_incomplete(self):
+        """deep_intake=False (default): if the model is stuck 2+ turns in
+        one focus area but the 4 fields aren't all filled yet, the server
+        forces onward to the NEXT stage in the flow (not straight to
+        PLAN_DRAFT) — e.g. GOALS -> SCHEDULE. This is the direct fix for
+        the screenshot: 4+ turns of reworded GOALS questions with no
+        schedule question ever reached.
+        """
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Is your goal to pass the exam or build deep mastery?",
+                    "next_focus": "GOALS",  # model still re-probing goals
+                    "extracted": {
+                        "subject": "pharmacognosy",
+                        "prior_knowledge": "high school biology and chemistry",
+                        "goals": "career as a pharmacist",
+                        # schedule_minutes not yet asked
+                    },
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="GOALS",
+            turns_in_focus=2,  # already re-asked goals twice
+            deep_intake=False,
+            extracted={
+                "subject": "pharmacognosy",
+                "prior_knowledge": "high school biology and chemistry",
+                "goals": "career as a pharmacist",
+            },
+        )
+
+        await run_intake_step(session, "a career as a pharmacist", ctx)
+
+        # Forced onward to SCHEDULE (the next stage), not PLAN_DRAFT —
+        # schedule_minutes hasn't been collected yet.
+        assert session.current_focus == "SCHEDULE"
+        assert session.turns_in_focus == 0
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_guided_mode_does_not_force_before_turn_cap(self):
+        """deep_intake=False (default): the model still gets 2 tries in a
+        focus area before the server steps in — this isn't a hair-trigger.
+        """
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Tell me more about your goals.",
+                    "next_focus": "GOALS",
+                    "extracted": {
+                        "subject": "pharmacognosy",
+                        "prior_knowledge": "high school biology and chemistry",
+                        "goals": "career as a pharmacist",
+                    },
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(
+            current_focus="GOALS",
+            turns_in_focus=0,  # first turn in this focus
+            deep_intake=False,
+            extracted={
+                "subject": "pharmacognosy",
+                "prior_knowledge": "high school biology and chemistry",
+            },
+        )
+
+        await run_intake_step(session, "a career as a pharmacist", ctx)
+
+        assert session.current_focus == "GOALS"
+        assert session.turns_in_focus == 1
+
+    @pytest.mark.asyncio
+    async def test_deep_intake_opt_in_keyword_sets_flag_mid_session(self):
+        """A learner saying a deep-intake trigger phrase mid-session flips
+        session.deep_intake to True for the rest of the conversation."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": json.dumps({
+                    "response": "Got it — let's go deep on this.",
+                    "next_focus": "SUBJECT",
+                    "extracted": {},
+                    "draft_plan": None,
+                })
+            }
+        )
+        ctx = _make_ctx(model_provider=fake)
+        session = IntakeSession(current_focus="SUBJECT", deep_intake=False)
+
+        await run_intake_step(
+            session, "this is a custom research curriculum, take your time", ctx,
+        )
+
+        assert session.deep_intake is True
+
+    @pytest.mark.asyncio
+    async def test_llm_driven_does_not_auto_advance_before_turn_cap(self):
+        """The server never force-advances before the turn cap — the model
+        gets to decide when it has enough signal, up to the cap.
         """
         fake = _FakeModelProvider(
             responses={
@@ -934,6 +1077,7 @@ class TestIntakeLLMDriven:
         await run_intake_step(session, "30 minutes", ctx)
 
         # Should NOT auto-advance on the first turn in this focus
+        # (turns_in_focus goes 0 -> 1, cap is 2)
         assert session.current_focus == "SCHEDULE"
         assert session.turns_in_focus == 1
 

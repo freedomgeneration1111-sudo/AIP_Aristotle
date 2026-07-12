@@ -111,13 +111,39 @@ class IntakeSession:
     # BUG-001 fix: turns spent in the current focus area. Incremented each
     # turn the model returns the same next_focus; reset to 0 on focus change.
     # Passed to the model via the user prompt so it knows how many turns
-    # it has spent in the current focus — the model decides when it has
-    # enough signal to advance. This is VISIBILITY ONLY, not a forcing
-    # function: a custom curriculum (e.g., NBCM) legitimately requires
-    # many questions to gauge the student's state, so the server does NOT
-    # override the model's focus choice. The model is trusted to advance
-    # when it has enough understanding.
+    # it has spent in the current focus.
     turns_in_focus: int = 0
+    # BUG-001-REDUX (Task 15): whether this session gets thorough,
+    # open-ended probing (True) or a bounded, fast-converging interview
+    # (False, default).
+    #
+    # History: BUG-001's server-side forcing function was implemented
+    # (Task 11), then reverted (Task 12) because it cut off legitimate
+    # deep probing for a custom curriculum built around a complex,
+    # single-author paper (NBCM). But the revert applied globally — it
+    # also removed the safety net for the much more common case: a
+    # learner on a standard, already-structured institutional textbook
+    # (e.g. Sameer's Punjab Pharmacy Council pharmacognosy material) who
+    # gives clear, simple answers and just needs the interview to move on.
+    # For that case an unconstrained free-tier model can re-ask the same
+    # question 4-5 times in different words with nothing to stop it.
+    #
+    # deep_intake=False (default): the guided/fast path. The system
+    # prompt carries a hard cap + auto-advance rule, AND the server
+    # enforces it (see run_intake_step) regardless of whether the model
+    # follows the prompt instruction. This is the right default for
+    # pilot students (Rameez, Sameer, Freedom Generation classroom).
+    #
+    # deep_intake=True: the exploratory path (current pre-Task-13
+    # behavior, unchanged) — no server-side cap, the model paces itself.
+    # Intended for self-directed research curricula (e.g. Moses/NBCM).
+    #
+    # Set at session start via the /intake/start request body, or
+    # mid-session via a small set of trigger phrases the learner can say
+    # (see _DEEP_INTAKE_KEYWORDS below) — e.g. "this is a custom research
+    # curriculum, take your time." Once set True it is never auto-reset
+    # to False.
+    deep_intake: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +468,30 @@ _PLAN_KEYWORDS = [
     "extend my plan",
     "more advanced",
 ]
+# Task 15: mid-session opt-in to the exploratory (deep_intake=True) path.
+# Matches the existing keyword-detector idiom used for GOALS/SCHEDULE/PLAN
+# pivots above. Deliberately narrow — false positives just mean a few extra
+# thoughtful questions, not a broken interview, so precision matters more
+# than recall here. TODO (same caveat as _detect_intake_intent): a
+# classifier would be more robust than keywords; fine for pre-alpha.
+_DEEP_INTAKE_KEYWORDS = [
+    "custom curriculum",
+    "custom research",
+    "my own paper",
+    "my own research",
+    "research curriculum",
+    "take your time",
+    "ask as many questions",
+]
+
+
+def _detect_deep_intake_opt_in(text: str) -> bool:
+    """True if the learner's text signals they want the exploratory,
+    unbounded-probing intake path rather than the default guided path."""
+    if not text:
+        return False
+    lower = text.lower()
+    return any(kw in lower for kw in _DEEP_INTAKE_KEYWORDS)
 
 
 def _detect_intake_intent(text: str) -> IntakeTrigger | None:
@@ -658,13 +708,25 @@ async def _fetch_material_texts(ctx: ActorContext, material_ids: list) -> list[d
         return []
 
 
-# System prompt for the LLM-driven intake loop. Describes INTAKE's role,
-# the structured JSON output schema, and the rules for advancing focus.
-_INTAKE_SYSTEM_PROMPT = """You are Aristotle, an adaptive tutor conducting the onboarding intake interview with a new learner. You are the ONLY voice the learner meets — they never see "INTAKE" as a persona.
+# System prompt for the LLM-driven intake loop. Built dynamically per
+# session (Task 15) — the pacing guidance differs between the guided
+# (fast, bounded) and deep (exploratory, unbounded) paths; everything
+# else — identity, JSON schema, materials handling — is shared.
+_INTAKE_SYSTEM_PROMPT_HEADER = """You are Aristotle, an adaptive tutor conducting the onboarding intake interview with a new learner. You are the ONLY voice the learner meets — they never see "INTAKE" as a persona.
 
-YOUR JOB: Have a real conversation to understand what the learner wants to study, what they already know, what their goals are, how much time they have, and what materials they've brought. Then propose a learning plan.
+YOUR JOB: Have a real conversation to understand what the learner wants to study, what they already know, what their goals are, how much time they have, and what materials they've brought. Then propose a learning plan."""
 
-This is NOT a rigid questionnaire. Each focus area (subject, prior knowledge, goals, schedule, materials) is a PHASE, not a single turn. You can ask follow-up questions, dig deeper, circle back, or adjust based on what the learner says. You decide when you have enough signal to advance.
+_INTAKE_PACING_GUIDED = """This is NOT a rigid questionnaire, but it IS a bounded one. Each focus area (subject, prior knowledge, goals, schedule, materials) gets at most 2 turns before you must advance — this is enforced by the server regardless of your choice, so treat it as a real constraint, not a suggestion. If the learner has already given you a clear, specific, usable answer (a named subject, a concrete goal like "become a pharmacist", a stated time budget), do NOT re-ask the same question in different words to gather more nuance — advance. Precision is nice; a completed intake the learner can actually start learning from is more important. Most learners are on a known, already-structured course (a textbook, an institutional curriculum) — you don't need to reconstruct their whole educational history, just enough to propose a sensible first plan.
+
+HARD CAP ON INTERROGATION: advance next_focus after at most 2 turns in any one focus area, even if your understanding feels incomplete — you can always refine later, in TUTORING.
+AUTO-ADVANCE RULE: once subject, prior_knowledge, goals, and schedule_minutes are all populated in "extracted", set next_focus="PLAN_DRAFT" on your very next turn.
+FOCUS COHERENCE: the question you ask in "response" must match the next_focus you declare this same turn — don't declare next_focus="GOALS" while asking a prior-knowledge question, or vice versa. If you notice you're about to ask something you've already asked (even reworded), that's your signal to advance instead."""
+
+_INTAKE_PACING_DEEP = """This is NOT a rigid questionnaire. Each focus area (subject, prior knowledge, goals, schedule, materials) is a PHASE, not a single turn. You can ask follow-up questions, dig deeper, circle back, or adjust based on what the learner says. You decide when you have enough signal to advance. This learner has opted into thorough intake for a custom or research-grade curriculum — for a custom curriculum built around a complex paper, TAKE YOUR TIME — it's better to ask 8-10 thoughtful questions and build a precise plan than to rush to PLAN_DRAFT with a shallow understanding.
+
+FOCUS COHERENCE: the question you ask in "response" should still match the next_focus you declare this same turn."""
+
+_INTAKE_SYSTEM_PROMPT_BODY = """
 
 UPLOADED MATERIALS ARE THE CURRICULUM. When the learner uploads a paper, textbook chapter, or notes, that material IS the curriculum — you must read it deeply and derive the learning plan's concepts from its actual content. Do NOT ask the learner to summarize the paper for you; read it yourself from the "Uploaded materials" section of the user prompt. Acknowledge specifically what you read (e.g., "I see this paper covers Newton's three laws and includes worked examples on inclined planes" — not "I see you uploaded a paper"). When you propose a draft_plan, the concepts should come from the paper's actual sections, equations, theorems, or chapters — ordered by prerequisite dependency as the paper presents them.
 
@@ -710,9 +772,21 @@ When next_focus == "COMPLETE", the learner has confirmed the plan. Keep draft_pl
 
 The "extracted" field should be updated each turn with your current understanding. Start with empty strings and fill in as you learn. "subject" must be the extracted subject (e.g., "physics", "null boundary constraint manifolds"), NOT the learner's raw words.
 
-Be conversational. Reflect back what you heard. Ask one question at a time. For a custom curriculum built around a complex paper, TAKE YOUR TIME — it's better to ask 8-10 thoughtful questions and build a precise plan than to rush to PLAN_DRAFT with a shallow understanding. Probe the learner's actual knowledge: ask about specific topics (calculus? tensors? quantum mechanics? differential geometry?) and listen to the answers. The turns_in_focus counter is for your awareness — if you've spent many turns in one focus area, consider whether you have enough signal or whether you're asking the same question in different ways. But don't advance just because of a counter — advance when you genuinely understand the learner's state well enough to propose a meaningful plan.
+Be conversational. Reflect back what you heard. Ask one question at a time. The turns_in_focus counter is for your awareness — if you've spent many turns in one focus area, consider whether you have enough signal or whether you're asking the same question in different ways.
 
 When you do propose a draft_plan, ground every concept in the paper's actual content (sections, equations, theorems) AND in what you learned about the learner's gaps. The plan should bridge from the learner's current knowledge to the paper's advanced topics."""
+
+
+def _build_intake_system_prompt(deep_intake: bool) -> str:
+    """Assemble the intake system prompt for this session's pacing mode.
+
+    Task 15: the header + body (identity, JSON schema, materials handling)
+    are shared; the pacing section — how aggressively to advance next_focus
+    — differs between guided (default, bounded) and deep (opted-in,
+    exploratory) sessions. See IntakeSession.deep_intake for the rationale.
+    """
+    pacing = _INTAKE_PACING_DEEP if deep_intake else _INTAKE_PACING_GUIDED
+    return f"{_INTAKE_SYSTEM_PROMPT_HEADER}\n\n{pacing}{_INTAKE_SYSTEM_PROMPT_BODY}"
 
 
 def _build_intake_user_prompt(
@@ -1021,6 +1095,14 @@ async def run_intake_step(
     if student_input:
         session.responses.append(student_input)
 
+    # Task 15: mid-session opt-in to the exploratory (deep_intake) path.
+    # Checked every turn, never auto-reset — once a learner signals they
+    # want thorough probing (e.g. "this is a custom research curriculum"),
+    # that preference sticks for the rest of the session.
+    if not session.deep_intake and _detect_deep_intake_opt_in(student_input):
+        session.deep_intake = True
+        logger.info("intake_deep_mode_opted_in student_input=%r", student_input[:80])
+
     # ADR-003: RAG retrieval. Build a retrieval query from the current
     # conversation context + retrieve top-K chunks from the vector store.
     # This replaces the legacy truncation path — the LLM sees relevant
@@ -1096,7 +1178,7 @@ async def run_intake_step(
                 result = await model_provider.call(
                     slot_name="beast",
                     messages=[
-                        {"role": "system", "content": _INTAKE_SYSTEM_PROMPT},
+                        {"role": "system", "content": _build_intake_system_prompt(session.deep_intake)},
                         {"role": "user", "content": user_prompt},
                     ],
                 )
@@ -1212,16 +1294,6 @@ async def run_intake_step(
     if draft_plan:
         session.draft_plan = draft_plan
 
-    # NOTE: The server does NOT force-advance to PLAN_DRAFT. A custom
-    # curriculum (e.g., NBCM) legitimately requires many questions to
-    # gauge the student's state — the model decides when it has enough
-    # signal to propose a plan. The turns_in_focus counter is passed to
-    # the model via the user prompt for visibility, but the server trusts
-    # the model's judgment. The original BUG-001 fix had a server-side
-    # override (force PLAN_DRAFT after turns_in_focus >= 2 when all 4
-    # fields were filled) — it was reverted because it cut off legitimate
-    # probing that a complex subject requires.
-
     # Map next_focus to IntakeState for backwards compat.
     focus_to_state = {
         "SUBJECT": IntakeState.SUBJECT,
@@ -1232,6 +1304,49 @@ async def run_intake_step(
         "PLAN_DRAFT": IntakeState.GENERATING_PLAN,
         "COMPLETE": IntakeState.COMPLETE,
     }
+
+    # BUG-001-REDUX (Task 15): scoped server-side forcing function.
+    # deep_intake=True (opted in, e.g. Moses/NBCM) → unchanged behavior,
+    # the model paces itself with no server override, same as Task 12.
+    # deep_intake=False (default, e.g. Sameer/Rameez/Freedom Generation
+    # students) → the server enforces what the guided system prompt
+    # promises, even if the model ignores its instructions. Both cases
+    # below require turns_in_focus >= 2 (same threshold as the original
+    # Task 11 fix) so the model always gets at least two tries to notice
+    # and advance on its own before the server steps in:
+    #   (a) all 4 extracted fields filled + stuck 2+ turns → force PLAN_DRAFT;
+    #   (b) not yet all filled but stuck 2+ turns in one focus area →
+    #       force onward to the next stage in the flow, so no single
+    #       dimension can be re-asked indefinitely.
+    if not session.deep_intake and next_focus not in ("PLAN_DRAFT", "COMPLETE") \
+            and session.turns_in_focus >= 2:
+        all_four_filled = all(
+            session.extracted.get(k) not in (None, "", 0)
+            for k in ("subject", "prior_knowledge", "goals", "schedule_minutes")
+        )
+        if all_four_filled:
+            logger.info(
+                "intake_force_advance reason=all_fields_filled from=%s", next_focus,
+            )
+            next_focus = "PLAN_DRAFT"
+            session.turns_in_focus = 0
+        else:
+            cur_state = focus_to_state.get(next_focus, session.state)
+            idx = _state_index(cur_state)
+            if idx + 1 < len(_FLOW_ORDER):
+                forced_state = _FLOW_ORDER[idx + 1]
+                forced_focus = (
+                    "PLAN_DRAFT" if forced_state == IntakeState.GENERATING_PLAN
+                    else forced_state.value
+                )
+                logger.info(
+                    "intake_force_advance reason=turn_cap from=%s to=%s",
+                    next_focus, forced_focus,
+                )
+                next_focus = forced_focus
+                session.turns_in_focus = 0
+        session.current_focus = next_focus
+
     session.state = focus_to_state.get(next_focus, session.state)
 
     # If the model says COMPLETE and we have a draft plan, kick off the
@@ -1500,6 +1615,7 @@ def intake_session_to_dict(session: IntakeSession) -> dict:
         # turns_in_focus persists across API calls so the counter
         # survives the round-trip through /intake/step.
         "turns_in_focus": session.turns_in_focus,
+        "deep_intake": session.deep_intake,
     }
 
 
@@ -1522,6 +1638,9 @@ def intake_session_from_dict(d: dict) -> IntakeSession:
         plan_confirmed=d.get("plan_confirmed", False),
         # Restore turns_in_focus (default 0 for legacy sessions).
         turns_in_focus=d.get("turns_in_focus", 0),
+        # Restore deep_intake (default False — legacy sessions and new
+        # sessions both get the guided/fast path unless opted in).
+        deep_intake=d.get("deep_intake", False),
     )
 
 

@@ -462,3 +462,42 @@ Files modified:
 - tests/test_aristotle_intake_e2e.py (updated stages 7-9 for dual-path)
 - (Brain) gui/pages/ask.py (poll for plan_job_id progress, transition to PLACER on completion)
 - (Brain) scripts/smoke_test_intake_e2e.py (updated stage 7-9 for dual-path)
+
+---
+Task ID: 15
+Agent: Super Z (main)
+Task: Re-scope the Task 12 revert — restore the forcing function for guided (default) sessions, preserve deep/exploratory mode for custom curricula
+
+Context:
+- Task 11 added a server-side forcing function (2-turn cap per focus area, auto-advance to PLAN_DRAFT once all 4 extracted fields are filled).
+- Task 12 reverted it globally because it cut off legitimate deep probing for Moses's NBCM self-study curriculum (single-author paper, custom curriculum, genuine need for 8-10 thoughtful questions).
+- The revert had a side effect nobody caught at the time: it also removed the safety net for the much more common case — a student on a known, already-structured textbook (e.g. Sameer's SAICH pharmacy program) who gives clear, simple answers. Without any cap, a weaker free-tier model can re-ask a GOALS-type question 4-5 times in reworded form even after the learner clearly answered ("a career as a pharmacist"). Confirmed from a real onboarding screenshot — the "insufferable intake" bug.
+
+Fix (applied patch, tested):
+- New IntakeSession.deep_intake: bool field, default False.
+- deep_intake=False (default — most learners): Task 11's forcing function is back. Stuck 2+ turns in one focus area with all 4 fields (subject, prior_knowledge, goals, schedule_minutes) filled → forced to PLAN_DRAFT. Stuck 2+ turns with fields still missing → forced onward to the next stage in _FLOW_ORDER (e.g. GOALS→SCHEDULE), not straight to a plan.
+- deep_intake=True (opt-in): exact Task 12 behavior preserved, unchanged — no cap, model paces itself. Set via `deep_intake: true` in the POST /aristotle/intake/start body, or mid-conversation via a keyword trigger (_detect_deep_intake_opt_in in intake.py — phrases like "custom research curriculum", "take your time").
+- System prompt (_build_intake_system_prompt) is now built dynamically per session: shared identity/JSON-schema/materials-handling text, plus a pacing section that differs between guided and deep mode. Also added a FOCUS COHERENCE instruction — the transcript showed the model declaring next_focus=GOALS while asking a prior-knowledge-flavored question; this is a prompt-level nudge, not code-enforced.
+- intake_session_to_dict/from_dict updated so deep_intake round-trips through the API.
+
+Work Log:
+- Pulled latest AIP_Aristotle (commit f219d58 — "fix(ingest): add timeouts to embedding + analysis, strengthen paper-status prompt").
+- Verified working tree clean, no conflicting changes since the patch was cut.
+- Applied aristotle-intake-forcing-function-fix.patch via `git apply` — applied cleanly with no manual reconciliation needed.
+- Patch touches 3 files: aristotle/actors/intake.py (+165/-36), aristotle/api.py (+10/-2), tests/test_aristotle_intake.py (+168/-12). Total +307/-36.
+- Ran `pytest tests/ -v` in AIP_Aristotle: 175 passed, 5 xfailed, 0 failures, 0 regressions. Matches the expected baseline from the task brief.
+- Confirmed tests/test_import_boundary.py still passes (2/2) — the extension-contract boundary between Aristotle and AIP_Brain is machine-enforced and intact.
+- Verified deep_intake plumbing end-to-end: field on IntakeSession, round-trips through intake_session_to_dict/from_dict, read from request body in intake_start_route, mid-session opt-in via _detect_deep_intake_opt_in, system prompt branches via _build_intake_system_prompt(deep_intake), forcing function in run_intake_step gated on `not session.deep_intake`.
+
+Stage Summary:
+- The "insufferable intake" bug is fixed for the default (guided) path without regressing the deep/exploratory path that Moses's NBCM self-study needs.
+- Re-scope rather than blanket revert: Task 12's revert was correct in spirit (don't cap custom curricula) but too broad (it also uncapped standard textbook onboarding). Task 15 narrows the revert to deep_intake=True sessions only. The default path gets the forcing function back; the opt-in path keeps Task 12's behavior verbatim.
+- The turns_in_focus threshold (2), the flow-order-based "advance to next stage" logic, and the deep_intake default (False) are Moses's judgment calls — flagged in the patch comments and not to be changed without his sign-off.
+
+Open follow-up (NOT implemented in this task — flagged for Moses):
+- (Brain) gui/pages/ask.py doesn't send deep_intake at all yet, so every session defaults to guided/fast — including Moses's own NBCM sessions. Until the GUI is wired to set deep_intake per-persona (e.g. Moses=deep by default, students=guided by default), Moses needs to either (a) pass `deep_intake: true` in the POST /aristotle/intake/start body manually, or (b) trigger deep mode mid-conversation with a phrase like "custom research curriculum" or "take your time" (see _detect_deep_intake_opt_in in aristotle/actors/intake.py). This is a GUI change to be scoped separately, not implemented speculatively here.
+
+Files changed:
+- aristotle/actors/intake.py — deep_intake field, _detect_deep_intake_opt_in, _build_intake_system_prompt (dynamic), forcing function gated on not deep_intake, FOCUS COHERENCE prompt nudge, serialization
+- aristotle/api.py — intake_start_route reads deep_intake from request body, passes to IntakeSession
+- tests/test_aristotle_intake.py — new tests for guided (forcing function fires) + deep (forcing function does NOT fire) + mid-session opt-in + serialization round-trip

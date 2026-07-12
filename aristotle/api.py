@@ -438,11 +438,17 @@ async def dashboard_route(request: Request):
 async def intake_start_route(request: Request):
     """Start an onboarding intake conversation (ADR-002 §9).
 
-    Request body: {"plan_id": str | None}
+    Request body: {"plan_id": str | None, "deep_intake": bool | None}
       - plan_id None or absent → new learner; full intake from GREETING.
       - plan_id present → check_intake_triggers() decides whether to
         re-surface (full / checkin / partial) or skip intake entirely
         (returns trigger=None when the plan is healthy and mid-stream).
+      - deep_intake (Task 15, default False) → False gives a bounded,
+        fast-converging interview (the right default for most learners
+        on a known, already-structured course). True opts into thorough,
+        unbounded probing, intended for self-directed research curricula.
+        Can also be set mid-session by the learner via a few trigger
+        phrases (see _detect_deep_intake_opt_in in actors/intake.py).
 
     Returns:
       {
@@ -457,6 +463,7 @@ async def intake_start_route(request: Request):
     container = _get_container(request)
     body = await request.json()
     plan_id = body.get("plan_id") or None
+    deep_intake = bool(body.get("deep_intake", False))
     ctx = _make_ctx(container)
 
     trigger = await check_intake_triggers(ctx, plan_id)
@@ -470,6 +477,7 @@ async def intake_start_route(request: Request):
         state=trigger.entry_state,
         entry_state=trigger.entry_state,
         plan_id=plan_id or "",
+        deep_intake=deep_intake,
     )
 
     # If the trigger carries a pre-built prompt (checkin / completed-plan
