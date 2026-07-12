@@ -1562,7 +1562,7 @@ class TestPlacerStep:
                 {"concept_id": "c3", "score": 0.3, "mastery_achieved": False},
             ],
         )
-        await _finalize_placement(session, ctx)
+        next_concept_id = await _finalize_placement(session, ctx)
         # Should have issued an UPDATE setting current_concept_idx = 1 (c2 is the first non-mastered)
         update_calls = [
             (sql, params)
@@ -1572,6 +1572,68 @@ class TestPlacerStep:
         assert len(update_calls) == 1
         _sql, params = update_calls[0]
         assert params[0] == 1  # starting_concept_idx
+        # Task 17: the resolved concept_id must also be returned directly,
+        # so callers don't need a second, unscoped lookup to discover it.
+        assert next_concept_id == "c2"
+
+    @pytest.mark.asyncio
+    async def test_finalize_returns_none_when_all_mastered(self):
+        """_finalize_placement returns None (not a stale/wrong concept_id)
+        when every concept in the plan was already mastered."""
+        from aristotle.actors.intake import PlacerSession, _finalize_placement
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2"]',)])
+                return _FakeCursor(None)
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            results=[
+                {"concept_id": "c1", "score": 0.9, "mastery_achieved": True},
+                {"concept_id": "c2", "score": 0.9, "mastery_achieved": True},
+            ],
+        )
+        next_concept_id = await _finalize_placement(session, ctx)
+        assert next_concept_id is None
+
+    @pytest.mark.asyncio
+    async def test_run_placer_step_includes_next_concept_id_on_complete(self):
+        """Task 17: run_placer_step's COMPLETE result carries next_concept_id
+        end-to-end, not just _finalize_placement in isolation — this is
+        what the API route and GUI actually consume."""
+        from aristotle.actors.intake import PlacerSession, run_placer_step
+
+        class _RoutingConn:
+            async def execute(self, sql, params=()):
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2"]',)])
+                return _FakeCursor(None)
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            current_idx=1,
+            concepts_to_assess=["c1"],
+            results=[{"concept_id": "c1", "score": 0.2, "mastery_achieved": False}],
+        )
+        result = await run_placer_step(session, "", ctx)
+        assert result["state"] == "COMPLETE"
+        assert result["next_concept_id"] == "c1"
 
 
 class TestPlacerRoutes:
@@ -1722,3 +1784,79 @@ class TestPlacerRoutes:
         assert result["concepts_placed"] == 1
         # The session should have advanced (either to next question or COMPLETE)
         assert result["session"]["current_idx"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_placer_step_route_surfaces_next_concept_id_on_complete(self):
+        """Task 17: POST /placer/step's HTTP response includes next_concept_id
+        when placement completes — this is the field ask.py now reads
+        instead of falling back to the unscoped GET /aristotle/concepts.
+        """
+        from aristotle.api import placer_step_route
+        from aristotle.actors.intake import PlacerSession, placer_session_to_dict
+
+        eval_json = json.dumps(
+            {
+                "score": 0.2,
+                "mastery_achieved": False,
+                "feedback": "Not quite",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+
+        class _RoutingConn:
+            async def execute(self, sql, params=()):
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2"]',)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            },
+        )()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
+
+        # Only one concept to assess — completes after this single answer.
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        async def _json():
+            return {
+                "session": placer_session_to_dict(session),
+                "student_input": "I'm not sure",
+            }
+
+        request.json = _json
+
+        result = await placer_step_route(request)
+        assert result["state"] == "COMPLETE"
+        # c1 was not mastered, so it's the (correct) starting concept —
+        # not whatever happened to be first in the global concept table.
+        assert result["next_concept_id"] == "c1"

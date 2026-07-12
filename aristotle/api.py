@@ -678,6 +678,14 @@ async def placer_step_route(request: Request):
         "question": str | None,         # next probe question, or None
         "concepts_placed": int,
         "concepts_known": int | None,   # only at COMPLETE
+        "next_concept_id": str | None,  # only at COMPLETE (Task 17) — the
+                                         # plan's actual next concept,
+                                         # authoritative source for
+                                         # starting tutoring. Use this
+                                         # instead of GET /aristotle/concepts,
+                                         # which returns every concept ever
+                                         # ingested by anyone with no
+                                         # plan/material scoping.
         "session": PlacerSession_dict,
       }
     """
@@ -699,6 +707,7 @@ async def placer_step_route(request: Request):
     }
     if result.get("state") == "COMPLETE":
         response["concepts_known"] = result.get("concepts_known")
+        response["next_concept_id"] = result.get("next_concept_id")
     return response
 
 

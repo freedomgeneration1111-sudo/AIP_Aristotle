@@ -501,3 +501,91 @@ Files changed:
 - aristotle/actors/intake.py — deep_intake field, _detect_deep_intake_opt_in, _build_intake_system_prompt (dynamic), forcing function gated on not deep_intake, FOCUS COHERENCE prompt nudge, serialization
 - aristotle/api.py — intake_start_route reads deep_intake from request body, passes to IntakeSession
 - tests/test_aristotle_intake.py — new tests for guided (forcing function fires) + deep (forcing function does NOT fire) + mid-session opt-in + serialization round-trip
+
+---
+Task ID: 16
+Agent: Super Z (main)
+Task: Fix plan_generator.py Step 1 hard-fail on empty structural map — unrecoverable dead end for any textbook over ~30 chunks
+
+Context:
+- Reproduced against a real 99-chunk pharmacognosy textbook (Sameer's Punjab Pharmacy Council material). Server log showed `plan_pipeline_started -> plan_generation_started` with no `plan_step_1_complete` ever appearing — the job silently vanished. The user re-confirms the plan; same dead end forever.
+- Root cause: `generate_plan_pipeline` Step 1 hard-failed with "No structural map found — paper may not be ingested yet" whenever `get_structural_map()` returned no TOC. But an empty TOC is the ACCEPTED degraded mode when `structural_analysis.py`'s single-call-for-the-whole-paper design (documented as reliable only up to ~30 chunks) times out on a larger textbook and gets skipped — see `paper_ingestor.py`'s `ingest_analysis_timeout ... skipping (chunks are indexed, RAG will work without structure)`. Since nothing ever retries the skipped analysis, the old check was an unrecoverable dead end for any real textbook over ~30 chunks. "Please try confirming your plan again" just re-ran the same doomed Step 1 check.
+- All three downstream prompt builders (`_analyze_knowledge_gaps`, `_design_phased_plan`, `_generate_concept_details`) already iterate `structural_maps` defensively with `for smap in structural_maps:` — safe on an empty list. So an empty TOC degrades plan quality (no TOC context for the LLM) but does not break plan generation.
+
+Fix (applied, tested):
+- Step 1 no longer hard-fails on empty `structural_maps`. Logs a `plan_step_1_no_structural_map` warning and proceeds — the plan will rely on retrieved chunk excerpts only (lower structure, not lower content).
+- The real "was this material actually ingested" check moved to after Step 2 (foundational chunk retrieval) — if BOTH `structural_maps` is empty AND `foundational_chunks` is empty, the job fails. This retry actually works: once embeddings finish, `foundational_chunks` returns >0 and the pipeline runs.
+- New failure message describes the real problem: "No content retrieved for this material — it may not be ingested yet. Please try confirming your plan again." (Old message incorrectly singled out structural map, which is normal for large textbooks.)
+
+Work Log:
+- Read uploaded bug report: 524-line server log showing the silent-failure pattern.
+- Confirmed bug independently against current `main` (commit e40ee02): grep on `No structural map found` returned a hit at aristotle/actors/plan_generator.py:233 — bug present.
+- Verified `paper_ingestor.py` lines 388-401 explicitly treat the structural-analysis TimeoutError as accepted degraded mode and `get_structural_map()` returns `{"toc": [], ...}` rather than raising.
+- Verified all 3 downstream prompt builders iterate `structural_maps` defensively (safe on empty list).
+- Applied fix to aristotle/actors/plan_generator.py — identical to the patch's plan_generator hunks: warning instead of hard-fail at Step 1, real failure check after Step 2.
+- Created tests/test_aristotle_plan_generator.py (later superseded by tests/test_plan_generator.py — see Task 17 note) — three cases: proceeds-without-structural-map-when-chunks-exist (Sameer's exact case), still-fails-when-genuinely-not-ingested (safety net preserved), proceeds-normally-when-structural-map-present (sanity).
+- Ran tests with PYTHONPATH pointing at AIP_Brain/src + AIP_Aristotle: 3/3 new tests pass; 67/67 related existing tests pass (test_aristotle_intake, test_aristotle_actors, test_import_boundary) — no regressions.
+- Committed as 2a9a9ab on main, pushed to origin.
+
+Stage Summary:
+- The "plan silently fails for any real textbook" dead-end is fixed. A 99-chunk textbook with skipped structural analysis now produces a plan based on retrieved chunks alone, instead of hard-failing at Step 1 forever.
+- The safety net is preserved, just moved to the right signal: only fail if BOTH structural map is empty AND no chunks are retrievable. That retry can actually succeed once embedding finishes — unlike the old check, which was structurally unrecoverable.
+- File changes: aristotle/actors/plan_generator.py (+35/-2 comments + warning-instead-of-fail + new post-Step-2 failure check), tests/test_aristotle_plan_generator.py (new — 3 tests, later renamed to tests/test_plan_generator.py in Task 17 to match the patch's filename for forward-compatibility).
+
+---
+Task ID: 17
+Agent: Super Z (main)
+Task: Fix material-concept cross-contamination — physics content bleeding into pharmacy student's plan + "newton_first_law" dogfood-bootstrap concept as every student's first tutoring concept
+
+Context:
+- Two independent, stacked bugs, both rooted in the same fact: `aristotle:textbook` is a single shared vector-store domain and `aristotle_concept` is a single shared table (bare `id TEXT PRIMARY KEY`, no material_id/plan_id/student_id column at all — see M001_aristotle.sql) across every material and every student, ever.
+- Bug A (content contamination): `retrieve_relevant_chunks()` in paper_ingestor.py filtered only by `domain="aristotle:textbook"`, with no material_id filter, despite material_id already being stamped into every chunk's metadata at ingestion time. Every gap-analysis and concept-generation call in plan_generator.py (and intake's own RAG retrieval) did a global nearest-neighbor search across every paper ever ingested by anyone, not just the current student's material. Reproduced in production: a pharmacy student's plan pulled physics content (tangent spaces, field operators/spin, Quantum Darwinism) into freshly-generated `pharmacognosy_NNN` concepts.
+- Bug B (wrong starting concept — the direct cause of "newton_first_law"): in AIP_Brain's gui/pages/ask.py, when PLACER finished, the code called `_start_tutoring()` directly without ever setting `_concept_id` from the placement result — its own comment admitted the intended behavior ("read concept_ids_json from the plan and take the first one") was never implemented. `_start_tutoring()`'s fallback then called `GET /aristotle/concepts`, which returns EVERY concept ever ingested table-wide with no plan scoping, and took `concepts[0]` — always "newton_first_law" (the oldest row in the table, a leftover dogfood-bootstrap concept from concepts_sample.yaml), regardless of which plan is active. Meanwhile the backend's `_finalize_placement` had already correctly computed the right starting concept_id (visible in the `placer_finalized ... starting at idx=%d (concept=%s)` log line) — it just never reached the frontend.
+
+Fix A — material_id scoping in retrieve_relevant_chunks (Aristotle-side):
+- `retrieve_relevant_chunks()` now accepts an optional `material_ids: list[str] | None = None` param.
+- When `material_ids` is provided (truthy and non-empty), the function over-fetches from the underlying vector store (`fetch_k = min(top_k * 5, 50)`) and filters client-side on chunk metadata — no change needed to the shared AIP_Brain vector store's own interface (which only exposes domain filtering, not arbitrary metadata filters). Capped at 50 to keep this cheap even in brute-force vector search mode (no VSS extension).
+- When `material_ids` is None or empty, behavior is unchanged from before — callers that intentionally want cross-material retrieval (none currently) still can.
+- Wired into all three call sites: intake.py's RAG prompt building (top_k=5), plan_generator.py's foundational retrieval (top_k=8), plan_generator.py's gap-specific retrieval (top_k=3).
+- Defense in depth: chunks missing `material_id` in their metadata (e.g. ingested before this field existed) are excluded when filtering is active, not silently included.
+
+Fix B — placer returns next_concept_id, GUI consumes it directly (Aristotle + Brain):
+- Aristotle-side: `_finalize_placement()` now RETURNS `next_concept_id` (previously it only wrote it to the DB and logged it, returning None). Returns the resolved concept_id (or None if the plan is already fully mastered) so callers can hand tutoring the CORRECT starting concept directly. Also moved `await conn.commit()` inside each branch (previously it was after the if/else, so the early `return None` paths skipped it — bug in the original code that this fix incidentally corrects).
+- Aristotle-side: `run_placer_step()` now captures the returned `next_concept_id` and includes it in its COMPLETE result dict (new field: `next_concept_id`).
+- Aristotle-side: `placer_step_route` in api.py now surfaces `next_concept_id` in the HTTP response when state==COMPLETE, with a docstring update explaining why this field exists (don't fall back to the unscoped `GET /aristotle/concepts`).
+- Brain-side (separate repo, separate worklog — flagged here for traceability): gui/pages/ask.py now reads `next_concept_id` from the `/placer/step` response and sets `_concept_id` directly before calling `_start_tutoring()`, instead of falling through to the unscoped global fallback. The old comment ("For now, simplest: read concept_ids_json from the plan and take the first one") is replaced with a Task 17 comment explaining the fix.
+
+Work Log:
+- Sequencing check: Task 16's fix was already on `main` (commit 2a9a9ab from the previous turn). Confirmed via `grep -n "No structural map found" aristotle/actors/plan_generator.py` — string not present, Task 16 fix IS applied.
+- Read both uploaded patches: aristotle-material-scoping-fix.patch (bundles Task 16 + Task 17 Aristotle-side changes) and brain-ask-py-concept-id-fix.patch (Task 17 Brain-side change, single file).
+- Applied aristotle-material-scoping-fix.patch via `git apply --reject` — 3 hunks rejected (the Task 16 hunks in plan_generator.py, already applied). Hunk #4 (material_ids for gap_chunks) applied cleanly. All other files (intake.py, paper_ingestor.py, api.py, test_aristotle_intake.py, test_plan_generator.py, test_retrieve_relevant_chunks.py) applied cleanly.
+- Manually applied the missing Task 17 hunk for foundational_chunks (the rejected hunk #3 bundled Task 16's "if not structural_maps and not foundational_chunks" check — already present — with Task 17's `material_ids=session.material_ids` addition — was missing). Applied via Edit tool.
+- Reconciled test file naming: I had created `tests/test_aristotle_plan_generator.py` last turn (Task 16) following the repo's `test_aristotle_*.py` convention; the patch adds `tests/test_plan_generator.py` with identical content. Deleted my `test_aristotle_plan_generator.py` to avoid duplicate test collection and to keep filenames matching the patch author's intent (forward-compatibility for future patches).
+- Cleaned up reject file (aristotle/actors/plan_generator.py.rej).
+- Installed missing test deps: `pip install -e AIP_Brain` (pulled in nicegui + aiosqlite + others) and `pip install -e AIP_Aristotle` (registered the `aip.extension_gui` entry point that test_aristotle_gui_pages.py::test_entry_point_registered checks).
+- Ran `pytest tests/` in AIP_Aristotle: **187 passed, 5 xfailed, 0 failures** — matches the expected baseline exactly. Breakdown: 14 actors + 8 cli_api + 10 extension + 5 gui_pages + 60 intake + 2 intake_e2e + 10 routes (3 xfail) + 71 tutoring + 7 curiosity_path + 2 import_boundary + 3 plan_generator + 6 retrieve_relevant_chunks + 2 teacher_dashboard (2 xfail) = 192 collected, 187 passed, 5 xfailed.
+- Confirmed tests/test_import_boundary.py still passes (2/2) — the extension-contract boundary between Aristotle and AIP_Brain is intact.
+- Applied brain-ask-py-concept-id-fix.patch to AIP_Brain via `git apply` — applied cleanly. Single file: gui/pages/ask.py (+14/-7).
+- Verified gui/pages/ask.py parses cleanly via `python -m py_compile gui/pages/ask.py`. No GUI test suite exists for this file; compile check is the verification step.
+
+Stage Summary:
+- Bug A fixed: RAG retrieval in plan generation and intake is now scoped to the current student's materials. A pharmacy student's plan will no longer pull physics chunks from a past dogfood/test ingest on the same machine. The over-fetch multiplier (5x, capped at 50) is the verified-safe value — extending it or adding material_id filtering to other call sites not in this patch is OUT OF SCOPE and flagged back to Moses.
+- Bug B fixed: PLACER's `next_concept_id` flows end-to-end from `_finalize_placement` (returns it) → `run_placer_step` (passes it through) → `placer_step_route` (HTTP response field) → ask.py (sets `_concept_id` directly). The "newton_first_law" fallback path is now unreachable when placement completes normally. The fallback still exists for the no-next-concept-id case (e.g. plan already fully mastered, or backend older than this patch) — it just won't fire in normal operation.
+- Test coverage added: 6 new tests in test_retrieve_relevant_chunks.py (no-filter backwards compat, material_id filter, over-fetch behavior, top_k cap, empty-list-as-none, legacy-chunks-excluded), 3 new tests in test_aristotle_intake.py (_finalize_placement returns concept_id, returns None when all mastered, run_placer_step includes next_concept_id on COMPLETE, placer_step_route surfaces it). Plus the 3 plan_generator tests from Task 16.
+- The shared-corpus architecture is unchanged — `aristotle:textbook` is still a single shared vector-store domain and `aristotle_concept` is still a single shared table. This patch is a defense-in-depth filter at the retrieval and concept-selection boundaries, not a schema migration. The shared-corpus design is appropriate for the multi-corpus feature on `feat/multi-corpus` branch; the fix is at the right layer.
+
+Files changed (Aristotle-side — this repo):
+- aristotle/ingestion/paper_ingestor.py — retrieve_relevant_chunks gains material_ids param, over-fetch + client-side filter
+- aristotle/actors/intake.py — run_intake_step passes session.material_ids to retrieve_relevant_chunks; run_placer_step captures and returns next_concept_id; _finalize_placement returns next_concept_id (was None), moves commit inside branches
+- aristotle/actors/plan_generator.py — foundational_chunks + gap_chunks calls pass material_ids=session.material_ids
+- aristotle/api.py — placer_step_route surfaces next_concept_id in HTTP response + docstring
+- tests/test_aristotle_intake.py — 3 new tests for next_concept_id end-to-end
+- tests/test_plan_generator.py — new file, 3 tests (Task 16 — supersedes the test_aristotle_plan_generator.py I created last turn)
+- tests/test_retrieve_relevant_chunks.py — new file, 6 tests for material_id scoping
+
+Files changed (Brain-side — separate repo, separate worklog, flagged here for traceability):
+- gui/pages/ask.py — read next_concept_id from /placer/step response, set _concept_id directly before _start_tutoring()
+
+Open follow-ups (NOT implemented in this task — flagged for Moses):
+- **Data cleanup needed (live database, NOT a code change — Moses to do directly against his db/ files)**: the pharmacy plan already generated before this fix (plan_id `a2a9ff17-a0cc-49ac-aad4-edf3c34c1243`) has physics content permanently baked into its `pharmacognosy_NNN` concept rows in `aristotle_concept`. That plan needs to be discarded and regenerated from scratch after this patch is applied — the new plan generation will correctly retrieve only pharmacy chunks. There is also likely leftover physics/other-subject content sitting in the shared `aristotle:textbook` vector store and `aristotle_concept` table from earlier dogfood/testing sessions on this machine — identifying and cleaning that up is a data/ops task, not a code change. Do NOT attempt to write a data-cleanup migration here; that's explicitly out of scope.
+- The over-fetch multiplier (5x, capped at 50) and the specific call sites that got material_id filtering (intake RAG, plan_generator foundational + gap-specific) are the verified-safe set. Extending material_id filtering to any other call site without auditing each one's context risks a different kind of regression (e.g. a legitimate cross-material lookup somewhere we haven't audited). Flag back to Moses before extending scope.

@@ -258,6 +258,7 @@ async def generate_plan_pipeline(
         foundational_query = "prerequisites foundations introduction basics definitions notation"
         foundational_chunks = await retrieve_relevant_chunks(
             container, foundational_query, top_k=8,
+            material_ids=session.material_ids,
         )
         logger.info(
             "plan_step_2_complete job_id=%s foundational_chunks=%d",
@@ -297,6 +298,7 @@ async def generate_plan_pipeline(
             if gap_concept:
                 chunks = await retrieve_relevant_chunks(
                     container, gap_concept, top_k=3,
+                    material_ids=session.material_ids,
                 )
                 gap_chunks[gap_concept] = chunks
 

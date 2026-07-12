@@ -623,11 +623,39 @@ async def retrieve_relevant_chunks(
     container: Any,
     query: str,
     top_k: int = 5,
+    material_ids: list[str] | None = None,
 ) -> list[dict]:
     """Retrieve top-K chunks from the vector store relevant to the query.
 
     Filters by domain="aristotle:textbook" to scope to ARISTOTLE paper
     chunks only (no collision with definer corpus chunks).
+
+    Task 17: "aristotle:textbook" is a SINGLE SHARED corpus across every
+    material ever ingested by every student — there is no per-material
+    partition at the vector-store or table level (aristotle_concept.id is
+    a bare TEXT PRIMARY KEY with no material_id/plan_id/student_id column
+    at all; see M001_aristotle.sql). Without a material_id filter here,
+    retrieval for one learner's paper can surface chunks from a
+    completely different paper someone else (or a past dogfood/test
+    session) ingested earlier — reproduced in production: a pharmacy
+    student's plan pulled physics chunks (tangent spaces, field
+    operators/spin, Quantum Darwinism) into freshly-generated
+    "pharmacognosy_NNN" concepts, because gap analysis and concept-detail
+    generation retrieved from the whole shared corpus, not just this
+    student's uploaded textbook.
+
+    material_id IS already written into each chunk's metadata at
+    ingestion time (paper_ingestor.py's ingest_paper_pipeline ->
+    vector_store.upsert(..., metadata={"material_id": material_id, ...})),
+    so the data needed to scope this is present — vector_store.retrieve()
+    just doesn't expose a metadata filter (domain-only). Rather than
+    extend that shared AIP_Brain-core interface (bigger blast radius,
+    affects every extension), this over-fetches within the existing
+    domain filter and filters by material_id client-side, Aristotle-only.
+
+    When material_ids is None (or empty), behavior is unchanged from
+    before — callers that intentionally want cross-material retrieval
+    (none currently) still can.
 
     Returns: list of {chunk_id, content, score, metadata}
     """
@@ -640,10 +668,14 @@ async def retrieve_relevant_chunks(
 
     try:
         query_vec = await embedding_provider.embed(query[:2000])
+        # Over-fetch when we need to filter client-side, so top_k results
+        # can still survive the material_id filter. Capped to keep this
+        # cheap even in brute-force vector search mode (no VSS extension).
+        fetch_k = min(top_k * 5, 50) if material_ids else top_k
         chunks = await vector_store.retrieve(
-            query_vec, domain="aristotle:textbook", top_k=top_k,
+            query_vec, domain="aristotle:textbook", top_k=fetch_k,
         )
-        return [
+        results = [
             {
                 "chunk_id": c.id,
                 "content": c.content,
@@ -652,6 +684,13 @@ async def retrieve_relevant_chunks(
             }
             for c in chunks
         ]
+        if material_ids:
+            material_id_set = set(material_ids)
+            results = [
+                r for r in results
+                if r["metadata"].get("material_id") in material_id_set
+            ]
+        return results[:top_k]
     except Exception as exc:
         logger.warning(
             "rag_retrieval_failed query=%r error=%s:%s",

@@ -1125,6 +1125,7 @@ async def run_intake_step(
 
             rag_chunks = await retrieve_relevant_chunks(
                 container, retrieval_query, top_k=5,
+                material_ids=session.material_ids,
             )
             # Get the structural map (TOC + concepts) for each material —
             # this is compact (~2k tokens) and shown every turn so the LLM
@@ -1734,7 +1735,7 @@ async def run_placer_step(
 
     if session.current_idx >= len(session.concepts_to_assess):
         # All concepts assessed — finalize.
-        await _finalize_placement(session, ctx)
+        next_concept_id = await _finalize_placement(session, ctx)
         session.state = "COMPLETE"
         return {
             "state": "COMPLETE",
@@ -1742,6 +1743,7 @@ async def run_placer_step(
             "concepts_known": sum(
                 1 for r in session.results if r.get("mastery_achieved")
             ),
+            "next_concept_id": next_concept_id,
         }
 
     concept_id = session.concepts_to_assess[session.current_idx]
@@ -1868,7 +1870,7 @@ async def run_placer_step(
 
         if session.current_idx >= len(session.concepts_to_assess):
             # All concepts assessed — finalize.
-            await _finalize_placement(session, ctx)
+            next_concept_id = await _finalize_placement(session, ctx)
             session.state = "COMPLETE"
             return {
                 "state": "COMPLETE",
@@ -1876,6 +1878,7 @@ async def run_placer_step(
                 "concepts_known": sum(
                     1 for r in session.results if r.get("mastery_achieved")
                 ),
+                "next_concept_id": next_concept_id,
             }
 
         # More concepts to assess — generate the next question immediately
@@ -1893,7 +1896,7 @@ async def run_placer_step(
         }
 
 
-async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None:
+async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> str | None:
     """Find the first non-mastered concept + set current_concept_idx on the plan.
 
     Reads aristotle_learning_plan.concept_ids_json, finds the first concept
@@ -1901,13 +1904,23 @@ async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None
     current_concept_idx to that position. If all concepts mastered, sets
     status='complete'.
 
-    Best-effort — non-fatal on DB error.
+    Task 17: returns the resolved next_concept_id (or None if the plan is
+    already fully mastered) so callers can hand tutoring the CORRECT
+    starting concept directly, instead of the GUI falling back to
+    GET /aristotle/concepts and taking whatever happens to be first in the
+    entire shared, unscoped table (see ask.py's _start_tutoring — that
+    fallback is where "newton_first_law", a leftover dogfood-bootstrap
+    concept from concepts_sample.yaml, was silently returned for every
+    student's very first tutoring concept, since it was the oldest row in
+    aristotle_concept regardless of which plan was actually active).
+
+    Best-effort — non-fatal on DB error (returns None).
     """
     logger = ctx.logger
     container: Any = ctx.container
     registry = getattr(container, "corpus_registry", None)
     if registry is None:
-        return
+        return None
 
     try:
         stores = await registry.get_stores("aristotle:textbook")
@@ -1922,7 +1935,7 @@ async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None
         await cur.close()
 
         if row is None:
-            return
+            return None
 
         concept_ids = json.loads(row[0]) if row[0] else []
 
@@ -1946,24 +1959,29 @@ async def _finalize_placement(session: PlacerSession, ctx: ActorContext) -> None
                 "UPDATE aristotle_learning_plan SET status = 'complete' WHERE id = ?",
                 (session.plan_id,),
             )
+            await conn.commit()
             logger.info(
                 "placer_finalized plan=%s — all %d concepts mastered, plan complete",
                 session.plan_id,
                 len(concept_ids),
             )
+            return None
         else:
             await conn.execute(
                 "UPDATE aristotle_learning_plan SET current_concept_idx = ? WHERE id = ?",
                 (starting_idx, session.plan_id),
             )
+            await conn.commit()
+            next_concept_id = (
+                concept_ids[starting_idx] if starting_idx < len(concept_ids) else None
+            )
             logger.info(
                 "placer_finalized plan=%s — starting at idx=%d (concept=%s)",
                 session.plan_id,
                 starting_idx,
-                concept_ids[starting_idx] if starting_idx < len(concept_ids) else "?",
+                next_concept_id if next_concept_id else "?",
             )
-
-        await conn.commit()
+            return next_concept_id
     except Exception as exc:
         logger.warning(
             "placer_finalize_failed plan=%s error=%s:%s",

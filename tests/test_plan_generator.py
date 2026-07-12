@@ -12,7 +12,7 @@ old check meant any real textbook over ~30 chunks could NEVER get a plan:
 "please try confirming your plan again" just re-ran the same doomed check
 forever. Reproduced against a real 99-chunk pharmacognosy textbook.
 
-Run: pytest tests/test_aristotle_plan_generator.py -v
+Run: pytest tests/test_plan_generator.py -v
 """
 
 from __future__ import annotations
