@@ -223,6 +223,19 @@ async def generate_plan_pipeline(
         # --- Step 1: Retrieve structural map ---
         await _update_plan_job(conn, job_id, phase="STRUCTURE_RETRIEVAL", status="RUNNING", steps_done=0)
 
+        # Task 16: structural analysis (structural_analysis.py) is a single
+        # LLM call for the whole paper and is documented as only reliable up
+        # to ~30 chunks; larger textbooks routinely exceed the 120s ingest
+        # timeout and get skipped (see paper_ingestor.py's
+        # "ingest_analysis_timeout ... skipping (chunks are indexed, RAG
+        # will work without structure)"). That's an accepted degraded mode
+        # at ingestion time — get_structural_map() returns {"toc": [], ...}
+        # rather than raising. Every downstream prompt-builder in this file
+        # already loops over structural_maps defensively (safe on an empty
+        # list), so there is no reason to hard-fail the whole plan job here.
+        # Doing so previously meant any material over ~30 chunks could NEVER
+        # get a plan — "confirming the plan again" just re-ran the same
+        # doomed check forever, since nothing retries the skipped analysis.
         structural_maps: list[dict] = []
         for mid in session.material_ids:
             smap = await get_structural_map(container, mid)
@@ -230,8 +243,12 @@ async def generate_plan_pipeline(
                 structural_maps.append(smap)
 
         if not structural_maps:
-            await _fail_plan_job(container, job_id, "No structural map found — paper may not be ingested yet")
-            return
+            logger.warning(
+                "plan_step_1_no_structural_map job_id=%s — proceeding without "
+                "TOC/concept-index context; plan will rely on retrieved "
+                "chunk excerpts only (lower structure, not lower content)",
+                job_id,
+            )
 
         logger.info("plan_step_1_complete job_id=%s structural_maps=%d", job_id, len(structural_maps))
 
@@ -246,6 +263,22 @@ async def generate_plan_pipeline(
             "plan_step_2_complete job_id=%s foundational_chunks=%d",
             job_id, len(foundational_chunks),
         )
+
+        # Task 16: THIS is the real "was this material actually ingested"
+        # check — chunk retrieval hitting the vector store, not the
+        # structural-analysis side-channel. If neither structure nor any
+        # retrievable content exists, there is genuinely nothing to build a
+        # plan from, and failing here (with a message the GUI already
+        # surfaces as "please try confirming your plan again") is correct —
+        # unlike the old Step 1 check, retrying this one can actually
+        # succeed once ingestion embedding finishes.
+        if not structural_maps and not foundational_chunks:
+            await _fail_plan_job(
+                container, job_id,
+                "No content retrieved for this material — it may not be "
+                "ingested yet. Please try confirming your plan again.",
+            )
+            return
 
         # --- Step 3: LLM gap analysis ---
         await _update_plan_job(conn, job_id, phase="GAP_ANALYSIS", steps_done=2)
