@@ -679,3 +679,76 @@ NOT implemented in this task (flagged for next task):
 - **ADR-004 status flip from "Proposed" to "Accepted"**: Moses's call as DEFINER, not done during implementation.
 - **Data cleanup of the already-poisoned pharmacy plan (plan_id a2a9ff17-...)**: still outstanding from Task 17 — Moses to do directly against his db/ files. The new M009 backfill does not attempt to fix it; the reset script is the right tool.
 - **Extending material_id filtering to other call sites not in Task 17's verified set**: still flagged from Task 17 — same caution applies, do not extend without auditing each one's context.
+
+---
+Task ID: 19
+Agent: Super Z (main)
+Task: Fix "no information in dashboard / can't resume my lessons" — two stacked bugs: (1) Aristotle GUI api_client pointed at a non-existent port; (2) ask.py always started fresh intake, never listed existing plans. ADR-004 GUI half (plan picker / subject switcher) lands here.
+
+Context:
+- User report: "I have been through the entire onboarding and begun the first lesson. Yet when I close the session and log back in there is NO information in the Teacher Dashboard, Session Stats, Curriculum Map or Settings. When I say I want to resume my lessons it acts like it doesn't know what I'm talking about. Previously I began another physics tutoring lesson as well. That also is undiscoverable. There should be a selectable list of databases to resume in the UI."
+- Per the CODING PROTOCOL: oriented by reading PLANNED_FEATURES.md, TECH_DEBT.md, ROADMAP.md, STATUS.md, AIP_Aristotle/AGENTS.md, AIP_Aristotle/aristotle/AGENTS.md, AIP_Brain/gui/AGENTS.md. Verified by examining the actual GUI tree (not reconstructing from docs).
+- Two independent bugs found, both with the same symptom (empty / undiscoverable UI):
+
+Bug A (dashboard / stats / map / settings all empty):
+- aristotle/gui/api_client.py:13 hardcoded `_BASE = os.getenv("ARISTOTLE_BACKEND_URL", "http://localhost:8001")`. Port 8001 has nothing listening on it. Aristotle's API is mounted on Brain's backend at :8000 (the user's startup log shows `extension_api_router_mounted ext=('aristotle',)` against the :8000 backend; Brain's own gui/pages/ask.py:1583 correctly uses `http://127.0.0.1:8000`). Every dashboard / stats / map / settings / session-history call hit :8001, raised ConnectionRefused, was caught by the `except Exception: return {}` / `return []` fall-through, and the GUI rendered empty.
+- One-line behavior change, big visible effect.
+
+Bug B (can't resume, no list of plans):
+- AIP_Brain/gui/pages/ask.py:_ask_page_aristotle unconditionally called `_start_intake()` with `plan_id=None` on page load (line 2419 in the pre-Task-19 file). /intake/start with plan_id=None always returns a "full" trigger (fresh GREETING) — see aristotle/actors/intake.py::check_intake_triggers line 598-602. Existing plans were undiscoverable from the UI; saying "resume my lessons" went into the intake as a regular student reply.
+- Task 18 already shipped the API the picker needs (GET /aristotle/plans?student_id=X), but the GUI half was explicitly deferred. This task lands that GUI half.
+
+Fix A — port alignment (aristotle/gui/api_client.py):
+- `_BASE` now reads `ARISTOTLE_BACKEND_URL` (still respected if set, for the rare case where someone runs Aristotle's API on a separate port) falling back to `AIP_BACKEND_URL` (same env var as Brain's gui/pages/ask.py) falling back to `http://127.0.0.1:8000`. Matches the default in start.sh.
+- Added module docstring explaining the mount model (extension host mounts the aristotle router at stage 6 of the ExtensionHost lifecycle, /aristotle/* routes live on Brain's backend, NOT a separate port).
+
+Fix B — plan picker (AIP_Brain/gui/pages/ask.py):
+- Replaced the unconditional `_intake_start_task = asyncio.create_task(_start_intake())` at page load with `_intake_start_task = asyncio.create_task(_show_plan_picker())`.
+- `_show_plan_picker()`:
+  - Calls GET /aristotle/plans (no student_id — defaults to 'definer' on the API side, which is the correct default for the current single-tenant deployment).
+  - If plans list is empty (genuinely first-time user, or backend unreachable), falls through to `_start_intake()` — pre-Task-19 behavior preserved.
+  - If plans exist, renders a picker inside chat_container: "Welcome back / I found existing learning plans on this machine. Pick one to resume, or start a new subject." + one button per plan + a "Start a new subject" button at the bottom.
+  - Each plan button shows: `Resume: <subject>  (<idx>/<total> concepts, <status_str>)` where status_str is "complete" / "last session YYYY-MM-DD" / "not started yet".
+  - Sets `_picker_showing = True` and disables the chat bar (`input_field.set_enabled(False)`) so the learner can't type "resume my lessons" into the chat bar while the picker is showing — that would have bypassed the picker via _on_aristotle_send's "no _intake_session → retry _start_intake" branch.
+- `_resume_plan(plan_id)`:
+  - Clears the picker, re-enables the chat bar.
+  - Calls POST /aristotle/intake/start with `{"plan_id": plan_id}`.
+  - If response has `trigger=None` (plan is healthy — check_intake_triggers returned None): set `_plan_id`, jump straight to PLACER phase, call `_start_placer()`. No intake conversation needed.
+  - Otherwise (trigger is "full" / "checkin" / "partial"): set `_intake_session` from the response, render the re-engagement prompt, leave the phase at INTAKE so the learner can reply through the normal chat bar.
+- `_start_new_plan()`: clears the picker, re-enables the chat bar, calls existing `_start_intake()` — pre-Task-19 fresh-onboarding flow.
+- `_on_aristotle_send`: added `if _picker_showing: return` guard at the top (belt-and-braces alongside the input_field disable) so any programmatic submit or keyboard shortcut while the picker is showing is a no-op rather than a bypass.
+
+Work Log:
+- Pulled latest on both repos (AIP_Aristotle @ 4c48cd1, AIP_Brain @ 5ac9e14) — already up to date.
+- Per the coding protocol's "Orient" step, read PLANNED_FEATURES.md (canonical tracker), TECH_DEBT.md (debt status), ROADMAP.md (phase plan), STATUS.md (operational state), AIP_Aristotle/AGENTS.md + aristotle/AGENTS.md (folder contracts). Confirmed: neither the port bug nor the plan-picker gap was a known debt or a planned feature — both are net-new fixes.
+- Per "Verify, don't reconstruct": examined the actual GUI tree. Confirmed aristotle/gui/api_client.py:13 hardcodes :8001; confirmed AIP_Brain/gui/pages/ask.py:1583 uses :8000; confirmed ask.py:2419 (pre-Task-19) unconditionally calls _start_intake() at page load.
+- Per "Contract Check": verified the API producer/consumer attribute names match:
+  - /plans returns list of {id, subject, status, current_concept_idx, total_concepts, created_at, last_session_at, material_id} — the picker reads id, subject, status, total_concepts, current_concept_idx, last_session_at. All present, all spelled correctly.
+  - /intake/start returns {trigger, prompt, session} where trigger can be None — _resume_plan handles both branches (None → PLACER; not-None → INTAKE with prompt).
+- Applied Fix A to aristotle/gui/api_client.py: changed _BASE default chain, added module docstring explaining the mount model. Added get_students(), create_student(name), get_plans(student_id) helpers (Task 18 API endpoints) — the picker needs get_plans; the other two are added now so the GUI student-picker can land in a future task without another api_client.py edit.
+- Applied Fix B to AIP_Brain/gui/pages/ask.py: added _picker_showing flag, _show_plan_picker, _resume_plan, _start_new_plan helpers; replaced page-load _start_intake() with _show_plan_picker(); added the picker-showing gate to _on_aristotle_send.
+- Verified: `python -m py_compile gui/pages/ask.py` — clean. `python -c "import ast; ast.parse(open('aristotle/gui/api_client.py').read())"` — clean.
+- Ran `pytest tests/` in AIP_Aristotle: 208 passed, 1 skipped, 5 xfailed, 0 failures (unchanged from Task 18 baseline — the api_client.py changes are additive helpers + a default URL change; no test logic touched).
+- Confirmed tests/test_import_boundary.py still passes (2/2) — no new aip.* imports added in the Aristotle changes.
+- Per "Document" step: updated aristotle/AGENTS.md "Last Cycle" section with Task 19 entry (port fix + picker helpers + test impact + import boundary). Updated PLANNED_FEATURES.md Change Log with Task 19 entry.
+
+Stage Summary:
+- Bug A fixed: dashboard, stats, map, settings, session-history pages now actually fetch data from Brain's backend at :8000 instead of silently failing against :8001. The user will see real mastery / struggle / concept / session data on those pages for the first time.
+- Bug B fixed: the /ask page now shows a plan picker on load when existing plans are present. Each plan is a button labeled "Resume: <subject> (N/M concepts, last session YYYY-MM-DD)". Clicking Resume calls /intake/start with the plan_id; the backend's check_intake_triggers decides whether to skip intake entirely (healthy plan → straight to PLACER) or surface a re-engagement prompt (stale / completed plan). "Start a new subject" runs the existing fresh-intake flow.
+- Chat bar is gated while the picker is showing so typing "resume my lessons" can't bypass the picker — the learner must click a button.
+- The plan picker is the GUI half of ADR-004 (the "subject switcher" the ADR describes in its §Decision GUI section). The student-picker half (dropdown populated from GET /aristotle/students with a "new student" option) is still deferred — the api_client.py helpers (get_students, create_student) are now in place so that GUI work can land without another api_client.py edit, but the UI itself is out of scope for this task.
+- 208 passed / 5 xfailed / 0 failures. No regressions.
+
+Files changed (Aristotle-side — this repo):
+- aristotle/gui/api_client.py — _BASE default chain (port fix) + module docstring + 3 new helpers (get_students, create_student, get_plans)
+- aristotle/AGENTS.md — Last Cycle entry for Task 19
+- PLANNED_FEATURES.md — Change Log entry for Task 19
+- worklog.md — this entry
+
+Files changed (Brain-side — separate repo, separate commit):
+- gui/pages/ask.py — _show_plan_picker, _resume_plan, _start_new_plan helpers; page-load task changed from _start_intake to _show_plan_picker; _picker_showing gate added to _on_aristotle_send; _picker_showing flag declared in shared state
+
+NOT implemented in this task (flagged for next task):
+- **Student picker dropdown**: the ADR-004 §Decision GUI section describes a student picker in addition to the plan picker. The api_client.py helpers (get_students, create_student) are now in place, but the UI itself (dropdown populated from GET /aristotle/students, "new student" option that calls POST /aristotle/students, threading student_id through every Aristotle API call) is out of scope for Task 19. This is the next GUI task.
+- **ADR-004 status flip from "Proposed" to "Accepted"**: still Moses's call as DEFINER.
+- **Data cleanup of the already-poisoned pharmacy plan (plan_id a2a9ff17-...)**: still outstanding from Task 17. The plan picker will surface it alongside any other existing plans — the user can choose to resume it (and see the physics-contaminated concepts) or start fresh. Cleaning the poisoned data is a separate ops task.

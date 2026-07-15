@@ -178,7 +178,43 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   asked to generate a question without a model.
 
 ## Last Cycle
-- **Onboarding gateway + API bug fixes** (this cycle):
+- **Task 19 — GUI port fix + plan picker (ADR-004 GUI half)** (this cycle):
+  - **Bug fix**: `aristotle/gui/api_client.py` was hardcoded to
+    `ARISTOTLE_BACKEND_URL=http://localhost:8001` — a port nothing was
+    listening on. Aristotle's API is mounted on Brain's backend at :8000
+    (extension_api_router_mounted ext='aristotle'), NOT a separate port.
+    Every dashboard / stats / map / settings / session-history call
+    silently failed into {} / [] and the GUI rendered empty. Fixed:
+    `_BASE` now reads `ARISTOTLE_BACKEND_URL` (still respected if set)
+    falling back to `AIP_BACKEND_URL` (same env var as Brain's
+    `gui/pages/ask.py`) falling back to `http://127.0.0.1:8000`. One-line
+    behavior change, big visible effect: dashboard, stats, map, settings,
+    session-history now actually fetch data.
+  - **Feature**: added `get_students()`, `create_student(name)`,
+    `get_plans(student_id)` helpers to `aristotle/gui/api_client.py`.
+    These back the plan picker that `AIP_Brain/gui/pages/ask.py` now
+    renders on page load (see Task 19 commit on AIP_Brain
+    `feat/multi-corpus`). The picker lists existing learning plans and
+    lets the learner resume one or start a new subject — without it,
+    every page load kicked off a fresh intake and existing plans were
+    undiscoverable from the UI. Closes the "no information in dashboard
+    / can't resume my lessons" bug report.
+  - **Test impact**: 208 passed / 5 xfailed / 0 failures (unchanged
+    from Task 18 baseline — the api_client.py changes are additive
+    helpers + a default URL change; no test logic touched).
+  - **Import boundary**: 2/2 pass — no new aip.* imports added.
+- **Task 18 — ADR-004 backend (student identity + scoping)** (prior cycle):
+  - M009 migration: aristotle_student table, definer backfill, four new
+    columns (aristotle_learning_plan.student_id + material_id,
+    aristotle_concept.plan_id + material_id), two indexes, best-effort
+    backfill. See worklog.md Task 18 for full context.
+  - API: POST/GET /students, GET /plans?student_id=X (new); /concepts
+    and /dashboard now accept optional plan_id/material_id/student_id
+    filters and log unscoped-call warnings.
+  - IntakeSession.student_id field flows from /intake/start through
+    generate_plan into aristotle_learning_plan.student_id.
+  - 208 passed / 5 xfailed / 0 failures (was 187, +21 new tests).
+- **Onboarding gateway + API bug fixes** (prior cycle):
   - Fixed map click handler in `gui/pages.py`: concept cards now navigate to
     `/ask?extension=aristotle&concept={cid}` instead of bare `/ask`, passing
     the concept_id through to the ask page.

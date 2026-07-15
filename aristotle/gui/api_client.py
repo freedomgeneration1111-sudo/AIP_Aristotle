@@ -1,7 +1,22 @@
 """ARISTOTLE GUI API client — thin httpx client for ARISTOTLE API.
 
 All functions are best-effort: catch httpx exceptions, return {} or [].
-The ARISTOTLE backend runs on port 8001 (separate from Brain's :8000).
+
+The ARISTOTLE API is mounted on the SAME backend as Brain's core API —
+the extension host mounts the aristotle router at stage 6 of the
+ExtensionHost lifecycle (extension_api_router_mounted ext='aristotle'),
+so /aristotle/* routes live on Brain's :8000 backend, NOT a separate
+port. The AIP_BACKEND_URL env var (same one Brain's gui/pages/ask.py
+reads) selects the backend; default http://127.0.0.1:8000 matches the
+default in start.sh.
+
+(Task 19 / bug fix: this previously pointed at
+ARISTOTLE_BACKEND_URL=http://localhost:8001 — a port nothing was
+listening on. Every dashboard / stats / map / settings / session-history
+call silently failed into {} / [] and the GUI rendered empty. The
+ARISTOTLE_BACKEND_URL env var is still respected if set, for the rare
+case where someone runs Aristotle's API on a separate port — but the
+default now matches reality.)
 """
 
 from __future__ import annotations
@@ -10,7 +25,10 @@ import os
 
 import httpx
 
-_BASE = os.getenv("ARISTOTLE_BACKEND_URL", "http://localhost:8001")
+# Same env var + default as Brain's gui/pages/ask.py::_BACKEND_URL — the
+# Aristotle router is mounted on Brain's backend, not a separate one.
+_BASE = os.getenv("ARISTOTLE_BACKEND_URL",
+                  os.getenv("AIP_BACKEND_URL", "http://127.0.0.1:8000"))
 
 
 async def get_mastery(student_id: str | None = None) -> dict:
@@ -101,5 +119,75 @@ async def get_session_history(limit: int = 15) -> list:
             )
             r.raise_for_status()
             return r.json().get("sessions", [])
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Task 19: student + plan scoping (ADR-004 GUI half — picker surface).
+# These back the "resume an existing subject / start a new one" picker on
+# the /ask page. Without them, every page load kicked off a fresh intake
+# and existing plans were undiscoverable from the UI.
+# ---------------------------------------------------------------------------
+
+
+async def get_students() -> list:
+    """GET /aristotle/students — list of {id, name, created_at}.
+
+    Used by the student picker (planned: full ADR-004 GUI; current:
+    picker not yet wired, this helper exists so the GUI can call it
+    when it lands).
+    """
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{_BASE}/aristotle/students", timeout=3.0)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return []
+
+
+async def create_student(name: str) -> dict:
+    """POST /aristotle/students — create a new student identity.
+
+    Returns {id, name} on success, {} on failure.
+    """
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{_BASE}/aristotle/students",
+                json={"name": name},
+                timeout=3.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return {}
+
+
+async def get_plans(student_id: str | None = None) -> list:
+    """GET /aristotle/plans?student_id=X — list of learning plans.
+
+    Returns a list of {id, subject, status, current_concept_idx,
+    total_concepts, created_at, last_session_at, material_id} dicts.
+    Defaults student_id to 'definer' when None (preserves pre-Task-18
+    single-tenant behavior on the API side).
+
+    This is the endpoint the /ask page picker calls to populate its
+    "Resume <subject>" list. Each plan represents one subject's worth
+    of tutoring — what the user called a "database" in the bug report.
+    """
+    params = {}
+    if student_id:
+        params["student_id"] = student_id
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{_BASE}/aristotle/plans",
+                params=params,
+                timeout=3.0,
+            )
+            r.raise_for_status()
+            return r.json()
     except Exception:
         return []
