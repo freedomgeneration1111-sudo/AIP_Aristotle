@@ -31,11 +31,23 @@ _BASE = os.getenv("ARISTOTLE_BACKEND_URL",
                   os.getenv("AIP_BACKEND_URL", "http://127.0.0.1:8000"))
 
 
-async def get_mastery(student_id: str | None = None) -> dict:
-    """GET /aristotle/dashboard — mastery + struggle + due items."""
+async def get_mastery(
+    student_id: str | None = None,
+    plan_id: str | None = None,
+) -> dict:
+    """GET /aristotle/dashboard — mastery + struggle + due items.
+
+    Task 20: optional plan_id scopes the concept/mastery join to one
+    plan (closes the "every subject mixed together" bug on /stats and
+    /map). When plan_id is None the call is unscoped — the backend
+    logs a dashboard_route_unscoped_call warning so the unscoped usage
+    is visible in logs.
+    """
     params = {}
     if student_id:
         params["student_id"] = student_id
+    if plan_id:
+        params["plan_id"] = plan_id
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{_BASE}/aristotle/dashboard", params=params, timeout=3.0)
@@ -45,9 +57,23 @@ async def get_mastery(student_id: str | None = None) -> dict:
         return {}
 
 
-async def get_misconceptions(student_id: str | None = None, limit: int = 20) -> list:
-    """GET /aristotle/misconceptions — recent misconception log entries."""
+async def get_misconceptions(
+    student_id: str | None = None,
+    limit: int = 20,
+    plan_id: str | None = None,
+) -> list:
+    """GET /aristotle/misconceptions — recent misconception log entries.
+
+    Task 20: plan_id param added for symmetry with the other helpers.
+    Note: the /misconceptions route itself is still unwired on the
+    backend (see STATUS.md "Still unwired" list) — this helper will
+    return [] until that route lands. The plan_id param is accepted
+    now so the GUI can thread it through without another api_client
+    edit when the route ships.
+    """
     params = {"limit": limit}
+    if plan_id:
+        params["plan_id"] = plan_id
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(
@@ -59,14 +85,20 @@ async def get_misconceptions(student_id: str | None = None, limit: int = 20) -> 
         return []
 
 
-async def get_struggle_patterns(student_id: str | None = None) -> list:
+async def get_struggle_patterns(
+    student_id: str | None = None,
+    plan_id: str | None = None,
+) -> list:
     """GET struggle patterns from MENTOR synthesis.
 
     The dashboard route returns a single struggle_pattern string (not a list).
     We wrap it in a list for the GUI to render uniformly.
+
+    Task 20: plan_id is forwarded to get_mastery() so the struggle
+    pattern lookup honors the same scope as the rest of the page.
     """
     try:
-        data = await get_mastery(student_id)
+        data = await get_mastery(student_id=student_id, plan_id=plan_id)
         pattern = data.get("struggle_pattern")
         if pattern:
             return [{"concept_name": "Overall", "pattern": pattern}]
@@ -75,11 +107,20 @@ async def get_struggle_patterns(student_id: str | None = None) -> list:
         return []
 
 
-async def get_concepts() -> list:
-    """GET /aristotle/concepts — concept list with id, topic, subtopic."""
+async def get_concepts(plan_id: str | None = None) -> list:
+    """GET /aristotle/concepts — concept list with id, topic, subtopic.
+
+    Task 20: optional plan_id filters server-side to one plan's
+    concepts only (closes the "every subject mixed together" bug on
+    /map and /stats). When plan_id is None the call is unscoped — the
+    backend logs a concepts_route_unscoped_call warning.
+    """
+    params = {}
+    if plan_id:
+        params["plan_id"] = plan_id
     try:
         async with httpx.AsyncClient() as c:
-            r = await c.get(f"{_BASE}/aristotle/concepts", timeout=3.0)
+            r = await c.get(f"{_BASE}/aristotle/concepts", params=params, timeout=3.0)
             r.raise_for_status()
             return r.json()
     except Exception:
@@ -87,7 +128,15 @@ async def get_concepts() -> list:
 
 
 async def get_settings(student_id: str | None = None) -> dict:
-    """GET /aristotle/settings — student settings or defaults."""
+    """GET /aristotle/settings — student settings or defaults.
+
+    Task 20: settings are student-global, NOT per-plan — confirmed by
+    reading M005_aristotle_settings.sql (PRIMARY KEY on student_id,
+    no plan_id column). So this helper takes no plan_id and the
+    /aristotle/settings page does NOT get a plan selector. Forcing
+    per-plan scoping here would build a selector that doesn't do
+    anything — flagged back per the task brief rather than faked.
+    """
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{_BASE}/aristotle/settings", timeout=3.0)
@@ -108,13 +157,27 @@ async def update_settings(student_id: str | None = None, settings: dict = {}) ->
         return {}
 
 
-async def get_session_history(limit: int = 15) -> list:
-    """GET /aristotle/session-history — list of session dicts."""
+async def get_session_history(
+    limit: int = 15,
+    plan_id: str | None = None,
+) -> list:
+    """GET /aristotle/session-history — list of session dicts.
+
+    Task 20: plan_id param added for symmetry. Note: like
+    /misconceptions, the /session-history route is still unwired on
+    the backend (STATUS.md "Still unwired") — this helper returns []
+    until that route lands. The plan_id param is accepted now so the
+    GUI can thread it through without another api_client edit when
+    the route ships.
+    """
+    params = {"limit": limit}
+    if plan_id:
+        params["plan_id"] = plan_id
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(
                 f"{_BASE}/aristotle/session-history",
-                params={"limit": limit},
+                params=params,
                 timeout=3.0,
             )
             r.raise_for_status()
@@ -191,3 +254,30 @@ async def get_plans(student_id: str | None = None) -> list:
             return r.json()
     except Exception:
         return []
+
+
+async def delete_plan(plan_id: str) -> dict:
+    """DELETE /aristotle/plans/{plan_id} — cascade-delete a plan + all its rows.
+
+    Task 20: backs the delete affordance in the /ask plan picker.
+    Destructive — no soft-delete, no undo. Returns {} on failure (the
+    GUI shows the user the error rather than retrying silently).
+
+    Returns on success: {
+        "deleted": True,
+        "plan_id": str,
+        "subject": str,
+        "concepts_deleted": int,
+        "cascade_rows_deleted": int,
+    }
+    """
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{_BASE}/aristotle/plans/{plan_id}",
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return {}

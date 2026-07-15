@@ -178,7 +178,49 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   asked to generate a question without a model.
 
 ## Last Cycle
-- **Task 19 — GUI port fix + plan picker (ADR-004 GUI half)** (this cycle):
+- **Task 20 — DELETE plan route + plan-scoped GUI pages + delete affordance** (this cycle):
+  - **Backend**: new `DELETE /aristotle/plans/{plan_id}` route in
+    `aristotle/api.py`. Explicit cascade (SQLite foreign keys are not
+    enforced — no PRAGMA foreign_keys anywhere): placement_event →
+    intake_session → (per concept: mastery, predict_event,
+    misconception_log) → concept → plan_job → learning_plan. Single
+    transaction, rollback on any failure. Does NOT touch
+    aristotle_uploaded_material or vector store chunks — material may
+    be shared/re-used. Returns {deleted, plan_id, subject,
+    concepts_deleted, cascade_rows_deleted}. 404 on unknown plan_id.
+  - **Backend**: `GET /dashboard` response's `mastery_by_concept[]`
+    rows now include `plan_id` (8th SELECT column, was 7) — so the
+    Teacher Dashboard can label each row with its subject without a
+    second lookup. Backward-compatible additive field.
+  - **GUI helpers**: `aristotle/gui/api_client.py` — added `plan_id`
+    param to `get_mastery()`, `get_concepts()`, `get_misconceptions()`,
+    `get_struggle_patterns()`, `get_session_history()`. Added
+    `delete_plan(plan_id)` calling the new DELETE route. (Settings
+    helper deliberately NOT given plan_id — confirmed
+    `aristotle_settings` is keyed by `student_id` only, no `plan_id`
+    column; per-plan scoping there would be fake.)
+  - **GUI pages**: `aristotle/gui/pages.py` — `/aristotle/stats` and
+    `/aristotle/map` now have a plan selector at the top (populated
+    from `get_plans()`, defaults to most-recently-active plan).
+    `/aristotle/teacher` (dashboard) gets an optional "All subjects"
+    filter (default — preserves cross-subject aggregation behavior)
+    plus subject labels on every Needs-Attention, Recent-Sessions, and
+    ALL-CONCEPTS row (label is "Unlabeled" for pre-Task-18 legacy rows
+    with no plan_id, not hidden or crashing). `/aristotle/settings`
+    gets NO selector — settings are student-global per M005 schema.
+  - **GUI picker** (Brain-side, separate commit on feat/multi-corpus):
+    `_show_plan_picker()` in `gui/pages/ask.py` now renders a trash
+    icon next to each "Resume: X" button. Click opens a modal dialog
+    with "Delete permanently" + "Cancel" — two-step confirm, no
+    one-click delete on live student data. On confirm, calls DELETE
+    route, shows a "Deleted X — N concepts and M related records
+    removed" message, then re-renders the picker.
+  - **Tests**: 5 new tests in `test_aristotle_student_scoping.py`
+    (TestDeletePlanRoute): 404 on unknown plan_id, full cascade in
+    dependency order, does-not-touch-uploaded-material, rollback on
+    mid-cascade failure, no-concepts edge case. 213 passed / 5 xfailed
+    / 0 failures (was 208, +5 new).
+- **Task 19 — GUI port fix + plan picker (ADR-004 GUI half)** (prior cycle):
   - **Bug fix**: `aristotle/gui/api_client.py` was hardcoded to
     `ARISTOTLE_BACKEND_URL=http://localhost:8001` — a port nothing was
     listening on. Aristotle's API is mounted on Brain's backend at :8000

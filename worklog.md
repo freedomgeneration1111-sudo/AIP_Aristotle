@@ -752,3 +752,263 @@ NOT implemented in this task (flagged for next task):
 - **Student picker dropdown**: the ADR-004 §Decision GUI section describes a student picker in addition to the plan picker. The api_client.py helpers (get_students, create_student) are now in place, but the UI itself (dropdown populated from GET /aristotle/students, "new student" option that calls POST /aristotle/students, threading student_id through every Aristotle API call) is out of scope for Task 19. This is the next GUI task.
 - **ADR-004 status flip from "Proposed" to "Accepted"**: still Moses's call as DEFINER.
 - **Data cleanup of the already-poisoned pharmacy plan (plan_id a2a9ff17-...)**: still outstanding from Task 17. The plan picker will surface it alongside any other existing plans — the user can choose to resume it (and see the physics-contaminated concepts) or start fresh. Cleaning the poisoned data is a separate ops task.
+
+---
+Task ID: 20
+Agent: Super Z (main)
+Task: DELETE /aristotle/plans/{plan_id} + thread plan_id through GUI helpers + plan selector on map/stats pages + dashboard subject labels + delete affordance in plan picker with explicit confirmation.
+
+Context:
+- Two gaps in the ADR-004 / Task 18-19 work surfaced by the user:
+  (A) No way to delete a plan. Task 19's plan picker finally surfaced
+  existing plans — including duplicates from before the picker existed
+  (3 duplicate pharmacognosy plans, 2 physics/NBCM plans, all real).
+  The user could see them but had no way to remove the duplicates.
+  (B) Three GUI pages (Curriculum Map, Session Stats, Teacher
+  Dashboard) called get_concepts()/get_mastery()/etc. completely
+  unscoped — aristotle/gui/api_client.py's helper functions were never
+  given a plan_id parameter to USE the backend filtering Task 18
+  shipped. Real-world result: every subject's concepts mixed into one
+  undifferentiated list on every page.
+- Per the CODING PROTOCOL: oriented by reading AGENTS.md (root +
+  aristotle/), PLANNED_FEATURES.md, STATUS.md. Verified by examining
+  the actual tree — confirmed get_concepts() took zero arguments,
+  get_mastery()/get_settings() took student_id but not plan_id. Read
+  M005_aristotle_settings.sql to answer the B2 scoping question (see
+  Decision below).
+
+Decision on B2 settings-scoping question:
+- aristotle_settings (M005) has PRIMARY KEY on student_id, NO plan_id
+  column. Settings (session length, mastery threshold, hint
+  aggressiveness) are genuinely student-global, NOT per-plan. Per the
+  task brief: "if aristotle_settings has no plan_id column, don't fake
+  per-plan scoping in the GUI for data that isn't actually per-plan
+  on the backend — flag that back rather than building a selector that
+  doesn't do anything." → /aristotle/settings page gets NO plan
+  selector. Student-profile fields (display name, language) are also
+  global, left as-is. No backend schema changes needed.
+
+Part A — DELETE /aristotle/plans/{plan_id} (aristotle/api.py):
+- New route, matches the style of POST /students / GET /plans
+  (container access, corpus_registry.get_stores, error handling).
+- SQLite foreign keys are NOT enforced anywhere in this codebase (no
+  PRAGMA foreign_keys — confirmed by grep). Cascade deletion is
+  explicit, in dependency order:
+    1. aristotle_placement_event (plan_id column)
+    2. aristotle_intake_session (plan_id column)
+    3. For every concept_id belonging to this plan
+       (aristotle_concept WHERE plan_id = ?):
+         a. aristotle_mastery (concept_id)
+         b. aristotle_predict_event (concept_id)
+         c. aristotle_misconception_log (concept_id)
+       — delete these BEFORE the concept rows, then:
+         d. aristotle_concept rows for this plan_id
+    4. aristotle_plan_job (plan_id column — has both plan_id and
+       material_id; we delete plan_job rows but DO NOT touch
+       aristotle_uploaded_material or its vector store chunks — a
+       material may be shared or re-used, deleting a plan must not
+       delete the source material it was built from)
+    5. aristotle_learning_plan itself (the plan_id row — last)
+- Wrapped in a single transaction: commit at the end, rollback on any
+  failure so a partial delete can't happen.
+- Returns {deleted: true, plan_id, subject, concepts_deleted,
+  cascade_rows_deleted}. 404 if the plan doesn't exist. 500 with
+  "rolled back" in the detail on mid-cascade failure.
+- Destructive — no soft-delete, no undo, no audit log (deferred per
+  task brief; flagged as a follow-up if warranted).
+- IN-clause chunking at 500 concept_ids per chunk (SQLite's parameter
+  limit is 999; a plan with >999 concepts is unusual but chunked just
+  in case).
+
+Part B1 — thread plan_id through api_client.py (aristotle/gui/api_client.py):
+- Added `plan_id: str | None = None` param to: get_mastery(),
+  get_misconceptions(), get_struggle_patterns(), get_concepts(),
+  get_session_history(). Passes through as a query param when set,
+  matching the existing student_id pattern.
+- Added `delete_plan(plan_id: str) -> dict` calling the new DELETE
+  route. Returns {} on failure (GUI shows the error rather than
+  retrying silently).
+- get_settings() deliberately NOT given plan_id — settings are
+  student-global per M005 schema (see Decision above).
+- Note in docstrings: /misconceptions and /session-history routes are
+  still unwired on the backend (STATUS.md "Still unwired" list —
+  pre-existing, NOT in scope for Task 20). The plan_id param is
+  accepted now so the GUI can thread it through without another
+  api_client edit when those routes ship.
+
+Part B2 — plan selector on map/stats pages + dashboard labels + filter (aristotle/gui/pages.py):
+- Added shared helpers: _pick_default_plan_id(plans) returns the
+  most-recently-active plan_id (highest last_session_at, falls back to
+  newest by created_at). _build_plan_selector(plans, initial_plan_id,
+  on_change) renders a labeled ui.select. _build_plan_filter_dropdown
+  is the variant with an "All subjects" option (value=None) for the
+  Teacher Dashboard. _label_for_plan(plan_id, plans_by_id) returns
+  the subject string or "Unlabeled" for None/unknown plan_id.
+- /aristotle/stats: plan selector at top, defaults to
+  most-recently-active plan. get_mastery(plan_id=...),
+  get_struggle_patterns(plan_id=...), get_misconceptions(plan_id=...)
+  all scoped. Empty-plans case renders "No learning plans yet."
+- /aristotle/map: same pattern. get_concepts(plan_id=...),
+  get_mastery(plan_id=...) scoped.
+- /aristotle/teacher (dashboard): optional "All subjects" filter
+  (default None — preserves the cross-subject aggregation behavior
+  per task brief). Every Needs-Attention row now shows a subject
+  label badge. Every Recent-Sessions row shows a subject label.
+  ALL-CONCEPTS table gets a new "Subject" column (2nd). Rows with no
+  plan_id (pre-Task-18 legacy data) are labeled "Unlabeled" rather
+  than hidden or crashing.
+- /aristotle/settings: NO selector (settings are student-global).
+- Backend change to support dashboard labels: GET /dashboard's SELECT
+  now includes c.plan_id as the 8th column, and the response's
+  mastery_by_concept[] rows now carry a "plan_id" field. Additive,
+  backward-compatible.
+
+Part B3 — delete affordance in plan picker (AIP_Brain/gui/pages/ask.py):
+- _show_plan_picker(): each plan row is now a ui.row containing the
+  Resume button (main click target, left-aligned, flex:1) + a small
+  trash-icon button (separate click target, right-aligned). Clicking
+  Resume must NEVER trigger delete — they are sibling elements, not
+  nested.
+- _confirm_delete_plan(plan_id, subject): first click on trash icon
+  opens a ui.dialog modal with "Delete this learning plan?" + plan
+  name + clear "irreversible, no undo" warning + Cancel + "Delete
+  permanently" buttons. Modal semantics — learner must pick one
+  button to dismiss, no way to accidentally trigger delete by
+  clicking elsewhere.
+- _delete_plan(plan_id, subject): only called from the Confirm button
+  (second click). Calls DELETE /aristotle/plans/{plan_id}, shows a
+  "Deleted X — N concepts and M related records removed" message,
+  then re-renders the picker (deleted plan is gone, rest remain).
+  On failure: shows the error inline and re-renders the picker so
+  the learner can retry.
+- Chat bar stays gated (_picker_showing remains True) throughout the
+  confirmation flow — the learner can't type into the chat bar while
+  the dialog is up.
+
+Tests (5 new in tests/test_aristotle_student_scoping.py::TestDeletePlanRoute):
+- test_delete_returns_404_when_plan_not_found: unknown plan_id → 404,
+  no DELETE statements issued.
+- test_delete_cascades_through_all_tables_in_order: known plan_id →
+  8 DELETE statements in the right order (placement_event,
+  intake_session, mastery, predict_event, misconception_log, concept,
+  plan_job, learning_plan). concepts_deleted=2, cascade_rows_deleted=8
+  (placement 3 + intake 1 + mastery 2 + predict 1 + misconception 0 +
+  plan_job 1; concept rows counted separately; plan row not counted).
+  Commit called, rollback not called.
+- test_delete_does_not_touch_uploaded_material: verifies NO DELETE
+  against aristotle_uploaded_material — material may be shared/re-used.
+- test_delete_rolls_back_on_mid_cascade_failure: simulated failure on
+  the mastery DELETE → 500 with "rolled back" in detail. Rollback
+  called, commit NOT called.
+- test_delete_with_no_concepts_still_succeeds: plan with zero concepts
+  → concept-keyed child DELETEs (mastery, predict_event,
+  misconception_log, concept) are skipped. concepts_deleted=0,
+  cascade_rows_deleted=0.
+- Used a new _FakeConnWithRowcount class (the existing _FakeConn's
+  cursor doesn't support rowcount, which the DELETE route reads after
+  each DELETE to count cascade rows).
+
+Work Log:
+- Pulled latest on both repos — already up to date from Task 19.
+- Per "Orient" step: read AGENTS.md (root + aristotle/),
+  PLANNED_FEATURES.md, STATUS.md. Confirmed neither the delete route
+  nor the plan-scoping gap was a known debt or planned feature.
+- Per "Verify, don't reconstruct": examined the actual GUI tree.
+  Confirmed get_concepts() took zero arguments, get_mastery()/
+  get_settings() took student_id but not plan_id. Confirmed
+  /misconceptions, /settings, /session-history routes don't exist in
+  api.py (STATUS.md "Still unwired" — pre-existing, flagged in
+  docstrings but not in scope for Task 20).
+- Read M005_aristotle_settings.sql to answer the B2 scoping question:
+  PRIMARY KEY on student_id, no plan_id column. Settings are
+  student-global. /aristotle/settings gets NO selector.
+- Per "Contract Check": verified /plans returns {id, subject, status,
+  current_concept_idx, total_concepts, created_at, last_session_at,
+  material_id} — the selector reads id, subject, status,
+  current_concept_idx, total_concepts, last_session_at. All present.
+  Verified /dashboard's mastery_by_concept[] rows needed plan_id
+  added to the SELECT + response (was 7 columns, now 8) so the
+  dashboard can label rows without a second lookup.
+- Implemented Part A (DELETE route) — explicit cascade, single
+  transaction, rollback on failure, IN-clause chunking at 500.
+- Implemented Part B1 (api_client helpers) — added plan_id param to
+  5 helpers + new delete_plan(). Settings helper deliberately not
+  given plan_id.
+- Implemented Part B2 (GUI pages) — shared helpers
+  (_pick_default_plan_id, _build_plan_selector,
+  _build_plan_filter_dropdown, _label_for_plan). Stats + map get
+  selector; teacher gets filter + labels + Subject column; settings
+  gets nothing.
+- Backend change for dashboard labels: added c.plan_id to both
+  dashboard SELECTs (plan_id-filtered + unscoped) + to the response
+  dict. Additive, backward-compatible.
+- Implemented Part B3 (delete affordance in picker) — trash icon per
+  row, modal dialog with Cancel + Delete permanently, two-step
+  confirm, no one-click delete.
+- Wrote 5 new tests in TestDeletePlanRoute. All pass.
+- Ran `pytest tests/`: 213 passed, 1 skipped, 5 xfailed, 0 failures
+  (was 208, +5 new DELETE route tests). Import boundary 2/2 pass.
+- Per "Document" step: updated aristotle/AGENTS.md Last Cycle,
+  PLANNED_FEATURES.md Change Log, this worklog entry.
+
+Stage Summary:
+- Plan deletion is now reachable from the GUI with a two-step
+  confirmation. The user can clean up the duplicate pharmacognosy
+  plans + the poisoned-pharmacy plan from Task 17 without needing a
+  separate reset script. Material uploads are preserved (a material
+  may be shared/re-used by another plan).
+- /aristotle/stats and /aristotle/map now scope to a single plan by
+  default. The cross-contamination bug (every subject's concepts
+  mixed into one list) is closed at the GUI layer — Task 18 closed it
+  at the API layer but the GUI never consumed the new params until now.
+- /aristotle/teacher (dashboard) preserves its cross-subject
+  aggregation default but now labels every row with its subject and
+  offers an optional filter. Pre-Task-18 legacy rows are labeled
+  "Unlabeled" rather than hidden or crashing.
+- /aristotle/settings deliberately NOT given a selector — settings
+  are student-global per M005 schema. Flagged back rather than faked.
+- Two-step delete confirmation verified: trash icon → modal dialog
+  with Cancel + Delete permanently → only the second click calls the
+  DELETE route. No one-click delete on live student data.
+- 213 passed / 5 xfailed / 0 failures. No regressions.
+
+Files changed (Aristotle-side — this repo):
+- aristotle/api.py — new DELETE /aristotle/plans/{plan_id} route;
+  GET /dashboard SELECT + response now include c.plan_id
+- aristotle/gui/api_client.py — plan_id param on 5 helpers + new
+  delete_plan() helper
+- aristotle/gui/pages.py — shared helpers (_pick_default_plan_id,
+  _build_plan_selector, _build_plan_filter_dropdown, _label_for_plan);
+  plan selector on /stats and /map; optional filter + subject labels
+  on /teacher; NO selector on /settings
+- tests/test_aristotle_student_scoping.py — 5 new TestDeletePlanRoute
+  tests + _FakeCursorWithRowcount + _FakeConnWithRowcount helpers
+- aristotle/AGENTS.md — Last Cycle entry for Task 20
+- PLANNED_FEATURES.md — Change Log entry for Task 20
+- worklog.md — this entry
+
+Files changed (Brain-side — separate repo, separate commit):
+- gui/pages/ask.py — trash icon per plan row in _show_plan_picker;
+  _confirm_delete_plan (modal dialog); _delete_plan (calls DELETE
+  route + refreshes picker)
+
+NOT implemented in this task (flagged for follow-up):
+- **Soft-delete / undo / audit log for deletions**: not asked for in
+  the task brief. The current delete is hard + irreversible. If
+  accidental deletions become a real concern, an audit log table
+  (aristotle_plan_deletion_event with plan_id, subject,
+  concepts_deleted, cascade_rows_deleted, deleted_at, deleted_by)
+  would be the right shape — captures what was removed without
+  preserving the data itself. Flag back if warranted.
+- **Wire /misconceptions, /settings, /session-history routes**:
+  pre-existing gap (STATUS.md "Still unwired"). The api_client.py
+  helpers now thread plan_id through, so when these routes ship the
+  GUI will automatically scope correctly without another api_client
+  edit. But the routes themselves are out of scope for Task 20.
+- **Student picker dropdown**: still deferred from Task 19. The
+  api_client.py helpers (get_students, create_student) are in place;
+  the UI itself (dropdown populated from GET /aristotle/students,
+  threading student_id through every Aristotle API call) is the next
+  GUI task.
+- **ADR-004 status flip from "Proposed" to "Accepted"**: still Moses's
+  call as DEFINER.

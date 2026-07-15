@@ -860,3 +860,302 @@ class TestIntakeStartRouteStudentId:
 
         # Trigger with a prompt returns early — session is in the response.
         assert result["session"]["student_id"] == "definer"
+
+
+# ---------------------------------------------------------------------------
+# Task 20: DELETE /aristotle/plans/{plan_id} — cascade + 404 + rollback
+# ---------------------------------------------------------------------------
+
+
+class _FakeCursorWithRowcount:
+    """Cursor that supports rowcount for DELETE/UPDATE statements.
+
+    The _FakeCursor above only supports fetchone/fetchall (SELECT). The
+    DELETE route reads cur.rowcount after each DELETE to count cascade
+    rows. This fake returns a configurable rowcount per execute() call.
+    """
+
+    def __init__(self, rows=None, rowcount: int = 0):
+        self._rows = rows or []
+        self.rowcount = rowcount
+
+    async def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    async def fetchall(self):
+        return self._rows
+
+    async def close(self):
+        pass
+
+
+class _FakeConnWithRowcount:
+    """Fake conn that supports DELETE rowcount + rollback tracking.
+
+    Routes SQL by substring to (rows, rowcount) pairs. Tracks every
+    execute() call + whether rollback() was called.
+    """
+
+    def __init__(
+        self,
+        routes: list[tuple[str, list[tuple], int]] | None = None,
+    ):
+        # routes: list of (sql_substring, rows_to_return, rowcount_for_delete)
+        self._routes = routes or []
+        self.executed: list[tuple[str, tuple]] = []
+        self.rollback_called = False
+        self.commit_called = False
+
+    async def execute(self, sql: str, params: tuple = ()):
+        self.executed.append((sql, params))
+        for substring, rows, rowcount in self._routes:
+            if substring.lower() in sql.lower():
+                return _FakeCursorWithRowcount(rows=rows, rowcount=rowcount)
+        return _FakeCursorWithRowcount(rows=[], rowcount=0)
+
+    async def commit(self):
+        self.commit_called = True
+
+    async def rollback(self):
+        self.rollback_called = True
+
+
+class TestDeletePlanRoute:
+    """Tests for DELETE /aristotle/plans/{plan_id} (Task 20)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_returns_404_when_plan_not_found(self):
+        """Unknown plan_id → 404, no DELETE statements issued."""
+        from aristotle.api import delete_plan_route
+        from fastapi import HTTPException
+
+        # The existence-check SELECT returns no rows.
+        conn = _FakeConnWithRowcount(
+            routes=[("FROM aristotle_learning_plan WHERE id", [], 0)]
+        )
+        container = type(
+            "C",
+            (),
+            {"corpus_registry": _FakeRegistry(_FakeStores(conn))},
+        )()
+        request = _build_request(container=container)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_plan_route(request, "nonexistent-plan-id")
+        assert exc_info.value.status_code == 404
+        assert "plan not found" in exc_info.value.detail
+
+        # Verify NO DELETE was issued (we should bail before cascade).
+        delete_sqls = [sql for sql, _ in conn.executed if "DELETE FROM" in sql]
+        assert delete_sqls == [], (
+            f"no DELETE should run for unknown plan_id; saw {delete_sqls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_delete_cascades_through_all_tables_in_order(self):
+        """Known plan_id → DELETE in dependency order: placement →
+        intake_session → mastery/predict/misconception (per concept) →
+        concept → plan_job → learning_plan."""
+        from aristotle.api import delete_plan_route
+
+        # Plan exists (subject = 'Pharmacognosy'), has 2 concepts.
+        # Each route is (sql_substring, rows, rowcount).
+        routes = [
+            # 0. existence check
+            ("FROM aristotle_learning_plan WHERE id", [("Pharmacognosy",)], 1),
+            # 1. placement_event delete (3 rows)
+            ("DELETE FROM aristotle_placement_event", [], 3),
+            # 2. intake_session delete (1 row)
+            ("DELETE FROM aristotle_intake_session", [], 1),
+            # 3. SELECT concept ids for this plan (2 concepts)
+            ("SELECT id FROM aristotle_concept WHERE plan_id",
+             [("c1",), ("c2",)], 0),
+            # 4. mastery delete (2 rows)
+            ("DELETE FROM aristotle_mastery", [], 2),
+            # 5. predict_event delete (1 row)
+            ("DELETE FROM aristotle_predict_event", [], 1),
+            # 6. misconception_log delete (0 rows)
+            ("DELETE FROM aristotle_misconception_log", [], 0),
+            # 7. concept delete (2 rows)
+            ("DELETE FROM aristotle_concept", [], 2),
+            # 8. plan_job delete (1 row)
+            ("DELETE FROM aristotle_plan_job", [], 1),
+            # 9. learning_plan delete (1 row — the plan itself)
+            ("DELETE FROM aristotle_learning_plan WHERE id", [], 1),
+        ]
+        conn = _FakeConnWithRowcount(routes=routes)
+        container = type(
+            "C",
+            (),
+            {"corpus_registry": _FakeRegistry(_FakeStores(conn))},
+        )()
+        request = _build_request(container=container)
+
+        result = await delete_plan_route(request, "plan-to-delete")
+
+        assert result["deleted"] is True
+        assert result["plan_id"] == "plan-to-delete"
+        assert result["subject"] == "Pharmacognosy"
+        assert result["concepts_deleted"] == 2
+        # cascade = placement(3) + intake(1) + mastery(2) + predict(1) +
+        # misconception(0) + plan_job(1) = 8 (concept rows counted
+        # separately; plan row not counted)
+        assert result["cascade_rows_deleted"] == 8
+
+        # Verify the DELETE statements were issued in the right order.
+        delete_sqls = [sql for sql, _ in conn.executed if "DELETE FROM" in sql]
+        # 8 DELETE statements (placement, intake, mastery, predict,
+        # misconception, concept, plan_job, learning_plan).
+        assert len(delete_sqls) == 8, (
+            f"expected 8 DELETE statements; saw {len(delete_sqls)}: {delete_sqls}"
+        )
+        # Verify ordering by table name.
+        tables_deleted_in_order = []
+        for sql in delete_sqls:
+            # Extract table name from "DELETE FROM <table>"
+            after = sql.split("DELETE FROM", 1)[1].strip()
+            table = after.split()[0]
+            tables_deleted_in_order.append(table)
+        assert tables_deleted_in_order == [
+            "aristotle_placement_event",
+            "aristotle_intake_session",
+            "aristotle_mastery",
+            "aristotle_predict_event",
+            "aristotle_misconception_log",
+            "aristotle_concept",
+            "aristotle_plan_job",
+            "aristotle_learning_plan",
+        ], f"DELETE order wrong: {tables_deleted_in_order}"
+
+        # Commit should have been called (transaction committed).
+        assert conn.commit_called is True
+        # Rollback should NOT have been called (no failure).
+        assert conn.rollback_called is False
+
+    @pytest.mark.asyncio
+    async def test_delete_does_not_touch_uploaded_material(self):
+        """The cascade must NOT delete aristotle_uploaded_material —
+        a material may be shared or re-used by another plan. Deleting
+        a plan should not delete the source material it was built from."""
+        from aristotle.api import delete_plan_route
+
+        routes = [
+            ("FROM aristotle_learning_plan WHERE id", [("Physics",)], 1),
+            ("DELETE FROM aristotle_placement_event", [], 0),
+            ("DELETE FROM aristotle_intake_session", [], 0),
+            ("SELECT id FROM aristotle_concept WHERE plan_id", [], 0),
+            ("DELETE FROM aristotle_plan_job", [], 0),
+            ("DELETE FROM aristotle_learning_plan WHERE id", [], 1),
+        ]
+        conn = _FakeConnWithRowcount(routes=routes)
+        container = type(
+            "C",
+            (),
+            {"corpus_registry": _FakeRegistry(_FakeStores(conn))},
+        )()
+        request = _build_request(container=container)
+
+        await delete_plan_route(request, "plan-1")
+
+        # Verify NO DELETE was issued against aristotle_uploaded_material.
+        material_deletes = [
+            sql for sql, _ in conn.executed
+            if "DELETE FROM aristotle_uploaded_material" in sql
+        ]
+        assert material_deletes == [], (
+            "DELETE must not touch aristotle_uploaded_material — "
+            "material may be shared/re-used by another plan"
+        )
+
+    @pytest.mark.asyncio
+    async def test_delete_rolls_back_on_mid_cascade_failure(self):
+        """If any DELETE raises, the transaction rolls back and the
+        route returns 500. No partial delete should be visible to the
+        caller."""
+        from aristotle.api import delete_plan_route
+        from fastapi import HTTPException
+
+        class _FailingConn(_FakeConnWithRowcount):
+            async def execute(self, sql: str, params: tuple = ()):
+                self.executed.append((sql, params))
+                # Fail on the mastery DELETE (mid-cascade).
+                if "DELETE FROM aristotle_mastery" in sql:
+                    raise RuntimeError("simulated mid-cascade failure")
+                for substring, rows, rowcount in self._routes:
+                    if substring.lower() in sql.lower():
+                        return _FakeCursorWithRowcount(rows=rows, rowcount=rowcount)
+                return _FakeCursorWithRowcount(rows=[], rowcount=0)
+
+        routes = [
+            ("FROM aristotle_learning_plan WHERE id", [("Pharmacy",)], 1),
+            ("DELETE FROM aristotle_placement_event", [], 1),
+            ("DELETE FROM aristotle_intake_session", [], 1),
+            ("SELECT id FROM aristotle_concept WHERE plan_id",
+             [("c1",)], 0),
+            ("DELETE FROM aristotle_mastery", [], 1),  # will raise
+        ]
+        conn = _FailingConn(routes=routes)
+        container = type(
+            "C",
+            (),
+            {"corpus_registry": _FakeRegistry(_FakeStores(conn))},
+        )()
+        request = _build_request(container=container)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_plan_route(request, "plan-1")
+        assert exc_info.value.status_code == 500
+        assert "rolled back" in exc_info.value.detail
+
+        # Rollback MUST have been called.
+        assert conn.rollback_called is True, (
+            "rollback must be called on mid-cascade failure so partial "
+            "deletes don't persist"
+        )
+        # Commit must NOT have been called.
+        assert conn.commit_called is False
+
+    @pytest.mark.asyncio
+    async def test_delete_with_no_concepts_still_succeeds(self):
+        """A plan with zero concepts (e.g. one where intake completed
+        but plan_generator hasn't created concepts yet) still deletes
+        cleanly — the concept-keyed child deletes are skipped, cascade
+        count is 0 for those tables."""
+        from aristotle.api import delete_plan_route
+
+        routes = [
+            ("FROM aristotle_learning_plan WHERE id", [("Empty",)], 1),
+            ("DELETE FROM aristotle_placement_event", [], 0),
+            ("DELETE FROM aristotle_intake_session", [], 0),
+            # SELECT concept ids returns empty.
+            ("SELECT id FROM aristotle_concept WHERE plan_id", [], 0),
+            ("DELETE FROM aristotle_plan_job", [], 0),
+            ("DELETE FROM aristotle_learning_plan WHERE id", [], 1),
+        ]
+        conn = _FakeConnWithRowcount(routes=routes)
+        container = type(
+            "C",
+            (),
+            {"corpus_registry": _FakeRegistry(_FakeStores(conn))},
+        )()
+        request = _build_request(container=container)
+
+        result = await delete_plan_route(request, "empty-plan")
+
+        assert result["deleted"] is True
+        assert result["concepts_deleted"] == 0
+        assert result["cascade_rows_deleted"] == 0
+
+        # Verify the concept-keyed child DELETEs were SKIPPED (no
+        # concepts → no IN clause → no mastery/predict/misconception
+        # deletes).
+        for table in ["aristotle_mastery", "aristotle_predict_event",
+                      "aristotle_misconception_log", "aristotle_concept"]:
+            table_deletes = [
+                sql for sql, _ in conn.executed
+                if f"DELETE FROM {table}" in sql
+            ]
+            assert table_deletes == [], (
+                f"{table} DELETE should be skipped when plan has no "
+                f"concepts; saw {table_deletes}"
+            )

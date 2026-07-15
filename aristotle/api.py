@@ -467,6 +467,211 @@ async def list_plans_route(request: Request):
     return plans
 
 
+@router.delete("/plans/{plan_id}")
+async def delete_plan_route(request: Request, plan_id: str):
+    """Delete a learning plan and cascade-clean every row that references it.
+
+    (Task 20, ADR-004 follow-on.) Task 19's plan picker finally surfaced
+    existing plans — including duplicates from before the picker existed.
+    Without this route, the user could see stale/duplicate plans but had
+    no way to remove them.
+
+    Destructive — no soft-delete, no undo, no audit log (deferred per
+    task brief). The response makes it very clear what was removed,
+    since there is no recovery path.
+
+    SQLite foreign keys are NOT enforced anywhere in this codebase
+    (no PRAGMA foreign_keys — confirmed), so cascade deletion is
+    explicit, in dependency order:
+
+      1. aristotle_placement_event (plan_id column)
+      2. aristotle_intake_session (plan_id column)
+      3. For every concept_id belonging to this plan
+         (aristotle_concept WHERE plan_id = ?):
+           a. aristotle_mastery (concept_id)
+           b. aristotle_predict_event (concept_id)
+           c. aristotle_misconception_log (concept_id)
+         — delete these BEFORE the concept rows themselves, then:
+           d. aristotle_concept rows for this plan_id
+      4. aristotle_plan_job (plan_id column — has both plan_id and
+         material_id; we delete plan_job rows but DO NOT touch
+         aristotle_uploaded_material or its vector store chunks — a
+         material may be shared or re-used, deleting a plan must not
+         delete the source material it was built from)
+      5. aristotle_learning_plan itself (the plan_id row — last, after
+         everything that references it is gone)
+
+    Wrapped in a single transaction: commit at the end, rollback on
+    any failure so a partial delete can't happen.
+
+    Returns: {
+        "deleted": True,
+        "plan_id": str,
+        "subject": str,
+        "concepts_deleted": int,    # count of aristotle_concept rows removed
+        "cascade_rows_deleted": int # count of all OTHER rows removed
+                                     # (placement, intake_session, mastery,
+                                     # predict_event, misconception_log,
+                                     # plan_job — excludes the plan row
+                                     # itself and the concept rows counted
+                                     # separately)
+    }
+
+    404 if the plan doesn't exist. 503 if corpus_registry is unavailable
+    or the corpus can't be opened.
+    """
+    container = _get_container(request)
+    registry = getattr(container, "corpus_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="corpus_registry not available")
+
+    try:
+        stores = await registry.get_stores("aristotle:textbook")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"corpus access failed: {exc}")
+
+    conn = stores.connection_manager.write_conn
+
+    # 0. Verify the plan exists + capture its subject for the response.
+    cur = await conn.execute(
+        "SELECT subject FROM aristotle_learning_plan WHERE id = ?",
+        (plan_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"plan not found: {plan_id}")
+    subject = row[0] or ""
+
+    # Counters for the response summary.
+    concepts_deleted = 0
+    cascade_rows_deleted = 0
+
+    try:
+        # 1. aristotle_placement_event (plan_id column)
+        cur = await conn.execute(
+            "DELETE FROM aristotle_placement_event WHERE plan_id = ?",
+            (plan_id,),
+        )
+        cascade_rows_deleted += cur.rowcount
+        await cur.close()
+
+        # 2. aristotle_intake_session (plan_id column)
+        cur = await conn.execute(
+            "DELETE FROM aristotle_intake_session WHERE plan_id = ?",
+            (plan_id,),
+        )
+        cascade_rows_deleted += cur.rowcount
+        await cur.close()
+
+        # 3. For every concept belonging to this plan, delete the
+        #    concept-keyed child rows BEFORE the concept rows themselves.
+        cur = await conn.execute(
+            "SELECT id FROM aristotle_concept WHERE plan_id = ?",
+            (plan_id,),
+        )
+        concept_id_rows = await cur.fetchall()
+        await cur.close()
+        concept_ids = [r[0] for r in concept_id_rows] if concept_id_rows else []
+
+        if concept_ids:
+            # Build an IN (?, ?, ...) clause with the right number of
+            # placeholders. SQLite's parameter limit is 999 by default —
+            # a single plan with >999 concepts would be unusual (the
+            # plan_generator's LLM Step 6 typically produces 8-30), but
+            # chunk it just in case.
+            for chunk_start in range(0, len(concept_ids), 500):
+                chunk = concept_ids[chunk_start:chunk_start + 500]
+                placeholders = ",".join("?" * len(chunk))
+
+                cur = await conn.execute(
+                    f"DELETE FROM aristotle_mastery "
+                    f"WHERE concept_id IN ({placeholders})",
+                    tuple(chunk),
+                )
+                cascade_rows_deleted += cur.rowcount
+                await cur.close()
+
+                cur = await conn.execute(
+                    f"DELETE FROM aristotle_predict_event "
+                    f"WHERE concept_id IN ({placeholders})",
+                    tuple(chunk),
+                )
+                cascade_rows_deleted += cur.rowcount
+                await cur.close()
+
+                cur = await conn.execute(
+                    f"DELETE FROM aristotle_misconception_log "
+                    f"WHERE concept_id IN ({placeholders})",
+                    tuple(chunk),
+                )
+                cascade_rows_deleted += cur.rowcount
+                await cur.close()
+
+            # Now safe to delete the concept rows themselves.
+            for chunk_start in range(0, len(concept_ids), 500):
+                chunk = concept_ids[chunk_start:chunk_start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                cur = await conn.execute(
+                    f"DELETE FROM aristotle_concept "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(chunk),
+                )
+                concepts_deleted += cur.rowcount
+                await cur.close()
+
+        # 4. aristotle_plan_job (plan_id column — but DO NOT touch
+        #    aristotle_uploaded_material or vector store chunks; the
+        #    material may be shared or re-used by another plan).
+        cur = await conn.execute(
+            "DELETE FROM aristotle_plan_job WHERE plan_id = ?",
+            (plan_id,),
+        )
+        cascade_rows_deleted += cur.rowcount
+        await cur.close()
+
+        # 5. aristotle_learning_plan itself — last, after everything
+        #    that references it is gone.
+        cur = await conn.execute(
+            "DELETE FROM aristotle_learning_plan WHERE id = ?",
+            (plan_id,),
+        )
+        # rowcount here should be 1 (we verified existence above).
+        # Don't add it to cascade_rows_deleted — the response separates
+        # "concepts_deleted" from "cascade_rows_deleted" and the plan
+        # row itself is neither. The "deleted: true" flag implies it.
+        await cur.close()
+
+        await conn.commit()
+    except Exception as exc:
+        # Rollback everything we did so far — partial delete is worse
+        # than no delete (orphaned child rows, plan still exists).
+        try:
+            await conn.rollback()
+        except Exception:
+            pass  # rollback itself failed — nothing more we can do
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"plan delete failed mid-cascade, transaction rolled back: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    logger.info(
+        "plan_deleted plan_id=%s subject=%r concepts=%d cascade_rows=%d",
+        plan_id, subject, concepts_deleted, cascade_rows_deleted,
+    )
+
+    return {
+        "deleted": True,
+        "plan_id": plan_id,
+        "subject": subject,
+        "concepts_deleted": concepts_deleted,
+        "cascade_rows_deleted": cascade_rows_deleted,
+    }
+
+
 # ------------------------------------------------------------------
 # Dashboard route (Phase B — teacher view, ADR-001 §8)
 # ------------------------------------------------------------------
@@ -558,7 +763,8 @@ async def dashboard_route(request: Request):
             "  m.last_score, "
             "  COALESCE(m.repetitions, 0) AS repetitions, "
             "  m.next_review_at, "
-            "  m.updated_at "
+            "  m.updated_at, "
+            "  c.plan_id "
             "FROM aristotle_concept c "
             "LEFT JOIN aristotle_mastery m "
             "  ON c.id = m.concept_id AND m.student_id = ? "
@@ -579,7 +785,8 @@ async def dashboard_route(request: Request):
             "  m.last_score, "
             "  COALESCE(m.repetitions, 0) AS repetitions, "
             "  m.next_review_at, "
-            "  m.updated_at "
+            "  m.updated_at, "
+            "  c.plan_id "
             "FROM aristotle_concept c "
             "LEFT JOIN aristotle_mastery m "
             "  ON c.id = m.concept_id AND m.student_id = ? "
@@ -604,6 +811,10 @@ async def dashboard_route(request: Request):
         repetitions = r[4]
         next_review_at = r[5]
         updated_at = r[6]
+        # Task 20: 8th column is c.plan_id — included so the Teacher
+        # Dashboard can label each row with its subject without a
+        # second lookup. NULL for pre-Task-18 legacy concepts.
+        concept_plan_id = r[7] if len(r) > 7 else None
 
         if mastered:
             mastered_count += 1
@@ -650,6 +861,9 @@ async def dashboard_route(request: Request):
                 "next_review_at": next_review_at,
                 "is_due": is_due,
                 "updated_at": updated_at,
+                # Task 20: plan_id per concept row — lets the Teacher
+                # Dashboard label each row with its subject.
+                "plan_id": concept_plan_id,
                 "_sort_priority": sort_priority,
             }
         )
