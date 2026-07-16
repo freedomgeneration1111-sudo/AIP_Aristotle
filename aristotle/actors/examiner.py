@@ -19,9 +19,100 @@ ActorContext). The container is accessed via ctx.container (duck-typed).
 
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 from typing import Any
 
 from aip.foundation.protocols.actors import ActorContext, ActorResult
+
+
+# ---------------------------------------------------------------------------
+# Task 21 — shared helpers for resilient model calls
+# ---------------------------------------------------------------------------
+
+# How many times to retry a model call that returned error=True or empty
+# content (rate-limit / transient network blip). Mirrors the retry shape
+# already used in aristotle/actors/intake.py for the `beast`-slot call.
+_MAX_MODEL_RETRIES = 2
+
+
+def _model_call_failed(result: Any) -> bool:
+    """Canonical failure check — matches ModelSlotResolver's `primary_failed`.
+
+    A "failure" is: result.error truthy, OR content missing/whitespace-only.
+    The platform's ModelSlotResolver returns `{"error": True, "content": "",
+    "error_message": "..."}` on API failures (429, 5xx, network) instead of
+    raising — so callers MUST inspect the dict, not just catch exceptions.
+    """
+    if not isinstance(result, dict):
+        return True
+    if result.get("error"):
+        return True
+    content = result.get("content", "")
+    return not str(content).strip()
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip a leading/trailing ```json ... ``` fence if present.
+
+    The evaluation model sometimes wraps its JSON response in a markdown
+    code fence (```json\n{...}\n```). json.loads() fails on the raw fenced
+    text — this is a solvable input-cleaning problem, not a malformed
+    response. Language tag is optional (handles both ``` and ```json).
+    """
+    if not text:
+        return text
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
+    cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+    return cleaned.strip()
+
+
+async def _call_with_retry(
+    model_provider: Any,
+    *,
+    slot_name: str,
+    messages: list[dict],
+) -> tuple[Any, Exception | None]:
+    """Call model_provider.call() with up to _MAX_MODEL_RETRIES retries.
+
+    Same backoff shape as aristotle/actors/intake.py::run_intake_step's
+    `beast`-slot loop: sleep `1.0 * (attempt + 1)` seconds between attempts
+    (1s, then 2s). Returns the final result dict (which may still be a
+    failure) and the last exception (or None if no exception was raised).
+
+    The retry triggers on:
+      - raised exception (network error)
+      - result.error == True (API failure, e.g. 429)
+      - empty/whitespace content (OpenRouter free models sometimes return
+        200 with empty content on rate-limit)
+
+    If all retries are exhausted, the last result (or a synthesized
+    error dict if the last call raised) is returned so the caller can
+    decide how to handle it.
+    """
+    last_exc: Exception | None = None
+    last_result: Any = {"error": True, "content": "", "error_message": "no attempt made"}
+    for attempt in range(_MAX_MODEL_RETRIES + 1):
+        try:
+            result = await model_provider.call(
+                slot_name=slot_name, messages=messages,
+            )
+            last_result = result
+            if not _model_call_failed(result):
+                return result, None  # success
+        except Exception as exc:
+            last_exc = exc
+            last_result = {
+                "error": True,
+                "content": "",
+                "error_message": f"{type(exc).__name__}: {exc}",
+            }
+        # Brief delay before retry (1s, then 2s) — only if attempts remain.
+        if attempt < _MAX_MODEL_RETRIES:
+            await asyncio.sleep(1.0 * (attempt + 1))
+    return last_result, last_exc
 
 
 class ExaminerActor:
@@ -242,87 +333,129 @@ class ExaminerActor:
             f"(Set diagnosis to null when mastery_achieved is true.)"
         )
 
+        # Task 21 Fix 3: retry on failed/empty model calls BEFORE falling
+        # into the score=0.0 fallback. Without this, infrastructure flakiness
+        # (429 rate-limit, transient network blip) is indistinguishable from
+        # a genuinely-wrong answer — both fall into the parse_failed branch
+        # and score the student's answer as 0.0. The retry shape mirrors
+        # aristotle/actors/intake.py's `beast`-slot retry loop (max_retries=2,
+        # 1s then 2s backoff). Only after retries are exhausted does the
+        # call fall through to the score=0.0 fallback path.
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         try:
-            result = await model_provider.call(
-                slot_name="evaluation",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+            result, retry_exc = await _call_with_retry(
+                model_provider, slot_name="evaluation", messages=messages,
             )
-            evaluation_text = result.get("content", "")
-
-            # Parse the model's JSON response + re-package as a dict in
-            # ActorResult.data. This is the Phase B.5 migration away from
-            # error-as-payload: the caller (session coordinator) reads
-            # result.data, not result.error.
-            import json
-
-            try:
-                eval_data = json.loads(evaluation_text)
-                # Normalize: ensure all four fields exist. diagnosis may be
-                # null/absent when correct — normalize to None.
-                if not isinstance(eval_data, dict):
-                    raise ValueError("model response is not a JSON object")
-                normalized = {
-                    "score": float(eval_data.get("score", 0.0)),
-                    "mastery_achieved": bool(eval_data.get("mastery_achieved", False)),
-                    "feedback": str(eval_data.get("feedback", "")),
-                    "diagnosis": eval_data.get("diagnosis")
-                    if eval_data.get("diagnosis") is not None
-                    else None,
-                }
-                # If diagnosis is present, ensure it has the three expected
-                # keys (defensive — the model may omit one). Missing keys
-                # default to empty string so downstream consumers don't
-                # KeyError.
-                if isinstance(normalized["diagnosis"], dict):
-                    d = normalized["diagnosis"]
-                    normalized["diagnosis"] = {
-                        "misconception": str(d.get("misconception", "")),
-                        "why_wrong": str(d.get("why_wrong", "")),
-                        "corrective": str(d.get("corrective", "")),
-                    }
-                elif normalized["diagnosis"] is not None:
-                    # Model returned a non-dict, non-null diagnosis — normalize to None.
-                    normalized["diagnosis"] = None
-
-                logger.info(
-                    "examiner_evaluate_ok concept=%s score=%.2f mastered=%s has_diagnosis=%s",
-                    concept_id,
-                    normalized["score"],
-                    normalized["mastery_achieved"],
-                    normalized["diagnosis"] is not None,
-                )
-                return ActorResult(ok=True, data=normalized)
-            except (json.JSONDecodeError, ValueError, TypeError) as parse_exc:
-                # Model didn't return valid JSON. Return a fallback dict
-                # with score=0.0 + a diagnosis noting the parse failure.
-                # This keeps the session moving (the coordinator treats
-                # score=0.0 as "not mastered" and routes to hints/remediate).
-                logger.warning(
-                    "examiner_evaluate_parse_failed concept=%s error=%s raw=%s",
-                    concept_id,
-                    parse_exc,
-                    evaluation_text[:200],
-                )
-                return ActorResult(
-                    ok=True,
-                    data={
-                        "score": 0.0,
-                        "mastery_achieved": False,
-                        "feedback": "[parse error — model did not return valid JSON]",
-                        "diagnosis": None,
-                    },
-                )
         except Exception as exc:
+            # _call_with_retry catches exceptions internally, but defend
+            # against any unexpected raise from the helper itself.
             logger.warning(
                 "examiner_evaluate_failed concept=%s error=%s:%s",
-                concept_id,
-                type(exc).__name__,
-                exc,
+                concept_id, type(exc).__name__, exc,
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
+
+        # Task 21 Fix 3: if the call itself failed (after all retries),
+        # surface a failure rather than silently scoring the student 0.0.
+        # The caller (session coordinator) can retry the EVALUATE step or
+        # route to REMEDIATE without penalizing the learner for infra flakiness.
+        if _model_call_failed(result):
+            err_msg = (
+                result.get("error_message")
+                if isinstance(result, dict)
+                else "empty content"
+            ) or "empty content"
+            if retry_exc is not None:
+                err_msg = f"{err_msg} (last exc: {type(retry_exc).__name__}: {retry_exc})"
+            logger.warning(
+                "examiner_evaluate_model_failed concept=%s error=%s",
+                concept_id, err_msg,
+            )
+            return ActorResult(
+                ok=False,
+                error=f"model call failed or returned empty content: {err_msg}",
+            )
+
+        evaluation_text = result.get("content", "")
+
+        # Parse the model's JSON response + re-package as a dict in
+        # ActorResult.data. This is the Phase B.5 migration away from
+        # error-as-payload: the caller (session coordinator) reads
+        # result.data, not result.error.
+        #
+        # Task 21 Fix 1: strip a leading/trailing ```json ... ``` fence
+        # before parsing. The evaluation model sometimes wraps its JSON
+        # in a markdown code fence — that's a solvable input-cleaning
+        # problem, not a genuinely malformed response. The except branch
+        # below now only triggers for true malformed JSON.
+        try:
+            cleaned_text = _strip_json_fences(evaluation_text)
+            eval_data = json.loads(cleaned_text)
+            # Normalize: ensure all four fields exist. diagnosis may be
+            # null/absent when correct — normalize to None.
+            if not isinstance(eval_data, dict):
+                raise ValueError("model response is not a JSON object")
+            normalized = {
+                "score": float(eval_data.get("score", 0.0)),
+                "mastery_achieved": bool(eval_data.get("mastery_achieved", False)),
+                "feedback": str(eval_data.get("feedback", "")),
+                "diagnosis": eval_data.get("diagnosis")
+                if eval_data.get("diagnosis") is not None
+                else None,
+            }
+            # If diagnosis is present, ensure it has the three expected
+            # keys (defensive — the model may omit one). Missing keys
+            # default to empty string so downstream consumers don't
+            # KeyError.
+            if isinstance(normalized["diagnosis"], dict):
+                d = normalized["diagnosis"]
+                normalized["diagnosis"] = {
+                    "misconception": str(d.get("misconception", "")),
+                    "why_wrong": str(d.get("why_wrong", "")),
+                    "corrective": str(d.get("corrective", "")),
+                }
+            elif normalized["diagnosis"] is not None:
+                # Model returned a non-dict, non-null diagnosis — normalize to None.
+                normalized["diagnosis"] = None
+
+            logger.info(
+                "examiner_evaluate_ok concept=%s score=%.2f mastered=%s has_diagnosis=%s",
+                concept_id,
+                normalized["score"],
+                normalized["mastery_achieved"],
+                normalized["diagnosis"] is not None,
+            )
+            return ActorResult(ok=True, data=normalized)
+        except (json.JSONDecodeError, ValueError, TypeError) as parse_exc:
+            # Model didn't return valid JSON (even after fence-stripping).
+            # Return a fallback dict with score=0.0 + a diagnosis noting
+            # the parse failure. This keeps the session moving (the
+            # coordinator treats score=0.0 as "not mastered" and routes
+            # to hints/remediate).
+            #
+            # Note (Task 21 follow-up): differentiating the fallback
+            # message between "infra flakiness" and "genuinely wrong
+            # answer" would require touching session.py / the frontend
+            # — out of scope for this fix. The retry above already
+            # eliminates the infra-flakiness case from this branch.
+            logger.warning(
+                "examiner_evaluate_parse_failed concept=%s error=%s raw=%s",
+                concept_id,
+                parse_exc,
+                evaluation_text[:200],
+            )
+            return ActorResult(
+                ok=True,
+                data={
+                    "score": 0.0,
+                    "mastery_achieved": False,
+                    "feedback": "[parse error — model did not return valid JSON]",
+                    "diagnosis": None,
+                },
+            )
 
     async def generate_hint(
         self,
@@ -463,37 +596,68 @@ class ExaminerActor:
         if concept.get("content_primary"):
             user_prompt += f"Textbook passage:\n{concept['content_primary'][:500]}\n"
 
+        # Task 21 Fix 2: wrap the model call with the same retry-with-backoff
+        # pattern used in aristotle/actors/intake.py for the `beast`-slot
+        # call. max_retries=2, sleep 1.0 * (attempt + 1) seconds between
+        # attempts. Also: model_provider.call() does NOT raise on API
+        # failures (429, 5xx) — it returns {"error": True, "content": ""}.
+        # The previous code only caught raised exceptions, so a rate-limited
+        # call fell through to `question = result.get("content", "")` →
+        # empty string → logged as `examiner_probe_ok ... question_len=0`
+        # (success!) instead of a failure. Now we inspect result.error /
+        # empty content (matching ModelSlotResolver's `primary_failed`
+        # pattern) and return ok=False with a clear error message.
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         try:
-            result = await model_provider.call(
-                slot_name="evaluation",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            question = result.get("content", "")
-            logger.info(
-                "examiner_%s_ok concept=%s question_type=%s question_len=%d",
-                question_type,
-                concept_id,
-                question_type,
-                len(question),
-            )
-            # Phase B.5: use the data field, not error-as-payload.
-            # This migrates both quiz() AND probe() (which share this helper).
-            return ActorResult(
-                ok=True,
-                data={"question": question, "question_type": question_type},
+            result, retry_exc = await _call_with_retry(
+                model_provider, slot_name="evaluation", messages=messages,
             )
         except Exception as exc:
+            # _call_with_retry catches exceptions internally, but defend
+            # against any unexpected raise from the helper itself.
             logger.warning(
                 "examiner_%s_failed concept=%s error=%s:%s",
-                question_type,
-                concept_id,
-                type(exc).__name__,
-                exc,
+                question_type, concept_id, type(exc).__name__, exc,
             )
             return ActorResult(ok=False, error=f"model call failed: {exc}")
+
+        # Task 21 Fix 2: inspect the result for failure BEFORE logging
+        # success. This is the canonical pattern from ModelSlotResolver —
+        # `result.error` truthy OR content missing/whitespace-only.
+        if _model_call_failed(result):
+            err_msg = (
+                result.get("error_message")
+                if isinstance(result, dict)
+                else "empty content"
+            ) or "empty content"
+            if retry_exc is not None:
+                err_msg = f"{err_msg} (last exc: {type(retry_exc).__name__}: {retry_exc})"
+            logger.warning(
+                "examiner_%s_failed concept=%s error=%s",
+                question_type, concept_id, err_msg,
+            )
+            return ActorResult(
+                ok=False,
+                error=f"model call failed or returned empty content: {err_msg}",
+            )
+
+        question = result.get("content", "")
+        logger.info(
+            "examiner_%s_ok concept=%s question_type=%s question_len=%d",
+            question_type,
+            concept_id,
+            question_type,
+            len(question),
+        )
+        # Phase B.5: use the data field, not error-as-payload.
+        # This migrates both quiz() AND probe() (which share this helper).
+        return ActorResult(
+            ok=True,
+            data={"question": question, "question_type": question_type},
+        )
 
     async def _fetch_concept(self, ctx: ActorContext, concept_id: str) -> dict | None:
         """Fetch a concept from the aristotle_concept table."""

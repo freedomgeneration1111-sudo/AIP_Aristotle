@@ -176,9 +176,136 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   checks model availability before attempting a quiz (governance: "No silent
   model calls"). A future EXAMINER will return NEEDS_CONFIGURATION when
   asked to generate a question without a model.
+- **`model_provider.call()` does NOT raise on API failures (429, 5xx).**
+  It returns `{"error": True, "content": "", "error_message": "..."}`.
+  Callers MUST inspect `result.get("error")` and content emptiness —
+  catching only raised exceptions will treat rate-limited calls as
+  success-with-empty-content. Task 21 added `_model_call_failed()` +
+  `_call_with_retry()` helpers in `aristotle/actors/examiner.py` that
+  encode the canonical check (matches `ModelSlotResolver`'s
+  `primary_failed` pattern). Any new model-call site should use these
+  helpers, not hand-roll its own try/except.
+- **Evaluation model sometimes wraps its JSON in ```json fences.**
+  `json.loads()` fails on the raw fenced text. Task 21 added
+  `_strip_json_fences()` in `aristotle/actors/examiner.py`, applied
+  before `json.loads()` in `evaluate()`. Any new strict-JSON model-call
+  site should apply the same stripping.
+- **`/aristotle/session/step`'s `output` field only reads `data.prompt`.**
+  This is a confirmed bug (Task 21 investigation, NOT yet fixed): the API
+  computes `output = result.error or result.data.get("prompt", "") or ""`,
+  but `_step_teach()` returns `data.explanation`, `_step_probe()` and
+  `_step_quiz()` return `data.question`. TEACH/PROBE/QUIZ outputs are
+  silently dropped — only PREDICT (which uses `data.prompt`) reaches the
+  chat UI. See `docs/investigations/task-21-ask-py-teach-rendering.md`
+  for the full analysis and proposed minimal fix.
+- **COMPLETE-trigger idempotency guard only catches the post-completion
+  case, not the in-flight race.** Task 21 Fix 5 added a guard in
+  `aristotle/actors/intake.py::run_intake_step` that blocks re-trigger
+  after `session.state == COMPLETE and session.plan_id` (the legacy-
+  fallback path sets both). The in-flight race (second COMPLETE while
+  the first background pipeline is still running, before plan_id is set)
+  is NOT closed — closing it requires disambiguating
+  "PLAN_DRAFT focus, GENERATING_PLAN state" (legitimate first-time
+  COMPLETE) from "pipeline in-flight, GENERATING_PLAN state" (re-trigger),
+  which exceeds the one-line-guard scope. See the long comment at the
+  COMPLETE-trigger block in `aristotle/actors/intake.py` for the three
+  structural fixes that would close the gap.
 
 ## Last Cycle
-- **Task 20 — DELETE plan route + plan-scoped GUI pages + delete affordance** (this cycle):
+- **Task 21 — Tutoring session-quality fixes (examiner resilience + teach prompt length + intake idempotency)** (this cycle):
+  - **Fix 1 — Strip markdown JSON fences before parsing** (`aristotle/actors/examiner.py::evaluate()`):
+    the evaluation model sometimes wraps its JSON response in a ```json
+    fence. `json.loads()` failed on the raw fenced text, scoring the
+    student 0.0 for what was actually a valid response. Added
+    `_strip_json_fences()` helper (regex strip of leading/trailing
+    ```json or ``` fence, language tag optional) applied before
+    `json.loads()`. The existing `(JSONDecodeError, ValueError, TypeError)`
+    fallback path is unchanged — it now only triggers for genuinely
+    malformed responses. 3 new tests in `TestExaminerResilience` (fenced
+    ```json, bare ```, and genuinely-bad-JSON still falls back).
+  - **Fix 2 — `_generate_question()` must not log a failed call as success**
+    (`aristotle/actors/examiner.py::_generate_question()`, shared by
+    `probe()` and `quiz()`): `model_provider.call()` does NOT raise on
+    API failures like 429 — it returns `{"error": True, "content": ""}`.
+    The previous code only caught raised exceptions, so a rate-limited
+    call fell through to `question = result.get("content", "")` → empty
+    string → logged as `examiner_probe_ok ... question_len=0` (success!).
+    Added the canonical `_model_call_failed()` check (matches
+    `ModelSlotResolver`'s `primary_failed` pattern) + a retry-with-backoff
+    helper `_call_with_retry()` (max_retries=2, 1s then 2s sleep, same
+    shape as `aristotle/actors/intake.py`'s beast-slot retry loop). 3
+    new tests: error=True returns ok=False (not ok=True with empty
+    question), empty-content returns ok=False, retry-then-succeeds
+    verifies call count = 2.
+  - **Fix 3 — `evaluate()` retries on failed/empty call, doesn't score it as 0**
+    (`aristotle/actors/examiner.py::evaluate()`): same root cause as Fix 2,
+    different symptom. A rate-limited evaluation-slot call returned empty
+    content, indistinguishable from genuinely-malformed JSON — both fell
+    into the same score=0.0 fallback. Infrastructure flakiness was scoring
+    the student's answer as WRONG. Now: `_call_with_retry()` runs first;
+    only after retries are exhausted does the call fall through to the
+    score=0.0 path. 2 new tests: error=True retries (call count = 3) then
+    returns ok=False (NOT ok=True with score=0.0), and retry-then-succeeds
+    returns the actual model score (not 0.0).
+  - **Fix 4 — Teaching prompt: length ceiling + plain-language register**
+    (`aristotle/actors/socrates.py::_build_system_prompt()`): confirmed
+    via full-file grep — no length, brevity, or register constraint
+    anywhere in the file. The `full_worked_example` fading-mode
+    instruction said "Show every step — do not skip anything" with no
+    counterweight, producing ~5000-character single explanations in
+    production. Added a `LENGTH AND REGISTER` block to the base prompt
+    (applies across ALL fading modes): 2-4 short paragraphs maximum,
+    plain everyday English, short sentences. Softened the
+    `full_worked_example` branch to "Show every step, but keep each
+    step to 1-2 sentences — completeness of steps, not verbosity per
+    step." 3 new tests in `TestSocratesPromptLength` pin the string
+    presence so a future refactor can't silently drop the constraint.
+  - **Fix 5 — Guard the COMPLETE trigger against duplicate plan generation**
+    (`aristotle/actors/intake.py::run_intake_step`, ~line 1390):
+    implemented the must-have post-COMPLETE guard: if
+    `session.state == IntakeState.COMPLETE and session.plan_id`, return
+    the existing plan_id without re-launching `create_plan_job` /
+    `generate_plan_pipeline`. The legacy-fallback path (which sets
+    `session.state=COMPLETE` + `session.plan_id`) is preserved — a
+    genuine first-time successful completion is NOT blocked. 1 new test
+    `test_complete_trigger_idempotent_after_legacy_complete` verifies
+    the guard fires and the pipeline-launch functions are NOT called.
+    **Secondary gap (in-flight race) flagged back per Task 21 prompt**:
+    I attempted to also block re-trigger WHILE the first pipeline is
+    still running in the background (by persisting
+    `session.state = IntakeState.GENERATING_PLAN` and adding a guard
+    for that case). That approach was ambiguous and broke two existing
+    tests — `IntakeState.GENERATING_PLAN` is ALSO the state mapped from
+    `current_focus="PLAN_DRAFT"`, so the guard couldn't distinguish
+    "PLAN_DRAFT phase, first-time COMPLETE" (legitimate, should launch
+    pipeline) from "pipeline in-flight, re-trigger" (should NOT relaunch).
+    The clean fixes (new IntakeState value, new session boolean field,
+    or session-keyed task tracking) all exceed the "one-line guard" scope
+    the Task 21 prompt allows for this secondary gap. See the long
+    comment in `aristotle/actors/intake.py` at the COMPLETE-trigger
+    block for the full analysis. The must-have behavior (blocking
+    re-trigger AFTER completion) is implemented and tested.
+  - **Investigation item — TEACH-step rendering in `gui/pages/ask.py`**
+    (investigation-only, NO code changes per the Task 21 prompt):
+    **confirmed bug**. The `/aristotle/session/step` route in
+    `aristotle/api.py:237-262` computes its `output` field as
+    `result.error or result.data.get("prompt", "") or ""`. The
+    `data.get("prompt", "")` only reads the `prompt` key — but
+    `_step_teach()` returns `data={"explanation": ...}`,
+    `_step_probe()` returns `data={"question": ...}`, and
+    `_step_quiz()` returns `data={"question": ...}`. Only
+    `_step_predict()` uses `data.prompt`. So TEACH/PROBE/QUIZ outputs
+    are silently dropped by the API — `ask.py`'s `_step_tutoring`
+    faithfully renders the empty `output` string. Proposed minimal fix
+    (one expression in `session_step_route`, NOT implemented): fall
+    through `data.prompt or data.explanation or data.question or
+    data.feedback or ""`. Full report at
+    `docs/investigations/task-21-ask-py-teach-rendering.md`.
+  - **Test impact**: 225 passed / 1 skipped / 5 xfailed / 0 failures
+    (was 213/1/5/0 at Task 20 baseline; +12 new tests: 8 in
+    `TestExaminerResilience`, 3 in `TestSocratesPromptLength`, 1 in
+    `TestIntakeLLMDriven`). No existing tests modified or removed.
+- **Task 20 — DELETE plan route + plan-scoped GUI pages + delete affordance** (prior cycle):
   - **Backend**: new `DELETE /aristotle/plans/{plan_id}` route in
     `aristotle/api.py`. Explicit cascade (SQLite foreign keys are not
     enforced — no PRAGMA foreign_keys anywhere): placement_event →

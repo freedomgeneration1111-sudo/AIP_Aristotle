@@ -537,3 +537,161 @@ not silently re-mark as xfail.
   feat/multi-corpus.
 
 ---
+
+## ARISTOTLE-DEBT-012 — COMPLETE-trigger in-flight race (Task 21 Fix 5 secondary gap)
+
+**Status:** Active — flagged back from Task 21, not closed
+**Phase:** Phase D (intake → plan generation)
+**Filed:** 2026-07-16 (Task 21)
+
+**What was deferred:**
+
+Task 21 Fix 5 implemented the must-have idempotency guard for the
+COMPLETE-trigger block in `aristotle/actors/intake.py::run_intake_step`:
+if `session.state == IntakeState.COMPLETE and session.plan_id`, return
+the existing plan_id without re-launching `create_plan_job` /
+`generate_plan_pipeline`. This blocks the post-completion duplicate-plan
+bug observed in the dogfood session.
+
+The secondary gap (also called out in the Task 21 prompt) is NOT closed:
+if the first COMPLETE trigger takes the pipeline-start path (not the
+legacy fallback), the background pipeline is running but
+`session.plan_id` is NOT set (the pipeline hasn't finished yet). A
+second COMPLETE trigger would slip past guard #1 (no plan_id) and
+launch a DUPLICATE background pipeline.
+
+**Why deferred:**
+
+Closing the gap requires disambiguating two cases that are
+indistinguishable from `session.state` alone:
+  - "PLAN_DRAFT focus, GENERATING_PLAN state" — the legitimate
+    first-time COMPLETE (the model is in the plan-draft phase, about
+    to produce its first COMPLETE). The pipeline SHOULD launch.
+  - "Pipeline in-flight, GENERATING_PLAN state" — the first pipeline
+    started but hasn't finished yet. A re-trigger should NOT launch a
+    duplicate.
+
+`IntakeState.GENERATING_PLAN` is the state mapped from BOTH
+`current_focus="PLAN_DRAFT"` (see the `focus_to_state` dict in
+`run_intake_step`) AND a would-be "pipeline in-flight" marker. The
+existing tests (`test_llm_driven_complete_with_draft_plan_triggers_pipeline`
+and `test_full_intake_loop_with_upload_and_draft_plan`) pre-seed
+`state=GENERATING_PLAN` to simulate the first case — so a naive guard
+on `session.state == GENERATING_PLAN` would break them.
+
+The clean fixes (any one of):
+  1. A new `IntakeState` value (e.g. `PLAN_PIPELINE_RUNNING`) — schema
+     change, requires a migration + serializer update
+     (`intake_session_to_dict` / `intake_session_from_dict`).
+  2. A new boolean field on `IntakeSession` (e.g.
+     `plan_pipeline_started: bool`) — schema change, requires the same
+     serializer updates. The field is set to True right before
+     `supervised_task(...)` in the pipeline-start path, and the guard
+     checks it instead of `session.state`.
+  3. Track in-flight tasks by session_id (the container's
+     `_aristotle_plan_tasks` dict is keyed by `plan_job_id`, not
+     `session_id`) — structural change to the container.
+
+All three exceed the "one-line guard" scope the Task 21 prompt allows
+for this secondary gap.
+
+**Remediation trigger:**
+
+When the next dogfood session reports a duplicate plan from a
+re-confirmation message while the first pipeline is still running
+(< 2 minute window between first COMPLETE and pipeline completion),
+pick one of the three fixes above. Option 2 (new boolean field on
+IntakeSession) is the smallest-blast-radius choice — one new field,
+two serializer updates, one guard. The Task 21 code comment at the
+COMPLETE-trigger block in `aristotle/actors/intake.py` documents all
+three options in detail.
+
+**Related work:**
+- `aristotle/actors/intake.py::run_intake_step` (the COMPLETE-trigger block, ~line 1390)
+- `tests/test_aristotle_intake.py::test_llm_driven_complete_with_draft_plan_triggers_pipeline` (existing test that pre-seeds state=GENERATING_PLAN — would break a naive guard)
+- `tests/test_aristotle_intake.py::test_complete_trigger_idempotent_after_legacy_complete` (Task 21 new test — verifies the must-have guard)
+- `tests/test_aristotle_intake_e2e.py::test_full_intake_loop_with_upload_and_draft_plan` (existing E2E test that pre-seeds state=GENERATING_PLAN)
+
+---
+
+## ARISTOTLE-DEBT-013 — `/aristotle/session/step` output drops TEACH/PROBE/QUIZ (Task 21 investigation)
+
+**Status:** Active — confirmed bug, NOT yet fixed (Task 21 was investigation-only)
+**Phase:** Tutoring loop / API
+**Filed:** 2026-07-16 (Task 21)
+
+**What was deferred:**
+
+The `/aristotle/session/step` route in `aristotle/api.py:237-262`
+computes its `output` field as:
+
+```python
+"output": (
+    result.error
+    or (result.data.get("prompt", "") if isinstance(result.data, dict) else "")
+    or ""
+) if result.ok else "",
+```
+
+The `result.data.get("prompt", "")` only reads the `prompt` key. But:
+  - `_step_teach()` returns `data={"explanation": ..., "fading_mode": ...}`
+  - `_step_probe()` returns `data={"question": ..., "question_type": "probe"}`
+  - `_step_quiz()` returns `data={"question": ..., "question_type": "..."}`
+  - Only `_step_predict()` returns `data={"prompt": ...}`
+
+So TEACH/PROBE/QUIZ outputs are silently dropped — `output` is `""` for
+those steps. `ask.py`'s `_step_tutoring` reads `data.get("output", "")`
+and renders it; if it's empty, nothing is rendered. A learner using the
+chat UI today sees the PREDICT prompt, types a guess, and then nothing
+— the TEACH explanation is generated by the model (visible in backend
+logs), stored on `session.last_explanation`, but never reaches the
+chat. PROBE and QUIZ questions are similarly invisible.
+
+**Why deferred:**
+
+The Task 21 prompt explicitly scoped this as investigation-only ("do
+not change code for this one"). The full investigation report is at
+`docs/investigations/task-21-ask-py-teach-rendering.md`.
+
+**Remediation trigger:**
+
+Next tutoring-loop touch. The proposed minimal fix is one expression
+in `session_step_route`:
+
+```python
+"output": (
+    result.error
+    or (
+        result.data.get("prompt")
+        or result.data.get("explanation")
+        or result.data.get("question")
+        or result.data.get("feedback")
+        or ""
+    ) if isinstance(result.data, dict) else ""
+) if result.ok else "",
+```
+
+This is the boundary-layer translation: actors use semantically-named
+keys (`explanation` / `question` / `feedback`), the GUI reads a single
+`output` string. The translation belongs at the API boundary, not in
+the actors or `ask.py`. No actor changes, no session-coordinator
+changes, no `ask.py` changes — one expression in `aristotle/api.py`
+plus one regression test asserting that `POST /session/step` for a
+TEACH step returns `output` containing the explanation text.
+
+The fix does NOT address EVALUATE's `diagnosis` block (misconception /
+why_wrong / corrective) — those are separate fields on `data.diagnosis`,
+not on `data.feedback`. Surfacing the diagnosis in the chat is a
+separate design decision (do we want to show the learner the
+misconception directly, or only use it internally to drive REMEDIATE?).
+
+**Related work:**
+- `aristotle/api.py:237-262` (the buggy `session_step_route`)
+- `aristotle/session.py:949-980` (`_step_teach` — returns `data.explanation`)
+- `aristotle/session.py:983-1015` (`_step_probe` — returns `data.question`)
+- `aristotle/session.py:1018+` (`_step_quiz` — returns `data.question`)
+- `aristotle/session.py:496+` (`_step_predict` — the only one that uses `data.prompt`)
+- `AIP_Brain/gui/pages/ask.py:2079-2108` (`_step_tutoring` — reads `data.output`)
+- `docs/investigations/task-21-ask-py-teach-rendering.md` (full investigation report)
+
+---

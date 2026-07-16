@@ -1012,3 +1012,30 @@ NOT implemented in this task (flagged for follow-up):
   GUI task.
 - **ADR-004 status flip from "Proposed" to "Accepted"**: still Moses's
   call as DEFINER.
+
+---
+Task ID: 21
+Agent: Super Z (main)
+Task: Task 21 — Tutoring session-quality fixes (examiner resilience + teach prompt length + intake idempotency). Five surgical code fixes + one investigation-only item.
+
+Work Log:
+- Cloned AIP_Brain (feat/multi-corpus @ 5995397) + AIP_Aristotle (main @ 05a489a) to /home/z/my-project/repos/.
+- Read root AGENTS.md + aristotle/AGENTS.md + PLANNED_FEATURES.md + TECH_DEBT.md + STATUS.md per the CODING PROTOCOL.
+- Read aristotle/actors/{examiner,socrates,intake}.py, aristotle/session.py, aristotle/api.py, AIP_Brain/gui/pages/ask.py, AIP_Brain/src/aip/adapter/model_slot_resolver.py, and the existing test files (test_aristotle_actors.py, test_aristotle_tutoring.py, test_aristotle_intake.py) before any code change.
+- Captured baseline test run: 213 passed / 1 skipped / 5 xfailed / 0 failed (matches Task 20 record).
+- Fix 1 (examiner.py::evaluate): added _strip_json_fences() helper, applied before json.loads(). Existing (JSONDecodeError, ValueError, TypeError) fallback unchanged.
+- Fix 2 (examiner.py::_generate_question, shared by probe + quiz): added _model_call_failed() (canonical pattern from ModelSlotResolver.primary_failed) + _call_with_retry() helper (max_retries=2, 1s then 2s sleep — same shape as intake.py's beast-slot loop). Now returns ok=False on error=True / empty content instead of ok=True with empty question.
+- Fix 3 (examiner.py::evaluate): applied _call_with_retry() before the score=0.0 fallback. After retries exhausted, returns ok=False (NOT ok=True with score=0.0) so infra flakiness no longer scores the student's answer as wrong.
+- Fix 4 (socrates.py::_build_system_prompt): added a LENGTH AND REGISTER block to the base prompt (2-4 short paragraphs max, plain everyday English, short sentences — applies across ALL fading modes). Softened the full_worked_example branch to bound per-step verbosity ("keep each step to 1-2 sentences — completeness of steps, not verbosity per step"). Avoided the phrase "worked example" in the new base-prompt instruction so the existing test_teach_mastery_3_is_conceptual_only assertion still passes.
+- Fix 5 (intake.py::run_intake_step COMPLETE-trigger block): added the must-have post-COMPLETE idempotency guard — if session.state == COMPLETE and session.plan_id, return the existing plan_id without re-launching. ATTEMPTED to also close the in-flight race (second COMPLETE WHILE first pipeline is still running) by persisting session.state = GENERATING_PLAN + adding a guard for that case. That attempt was AMBIGUOUS and broke two existing tests (test_llm_driven_complete_with_draft_plan_triggers_pipeline + test_full_intake_loop_with_upload_and_draft_plan) because IntakeState.GENERATING_PLAN is also the state mapped from current_focus="PLAN_DRAFT" — disambiguating requires a schema change (new IntakeState value, new session boolean field, or session-keyed task tracking), which exceeds the "one-line guard" scope. Per the Task 21 prompt, FLAGGED BACK the in-flight race rather than guessing. Removed guard #2 + the session.state assignment + the in-flight test. Guard #1 (post-COMPLETE) is implemented and tested. Long comment at the COMPLETE-trigger block documents the analysis + the three structural fixes.
+- Investigation item (NO code changes per prompt): traced the TEACH-step rendering path. ask.py::_step_tutoring reads data.get("output") from /aristotle/session/step. The API computes output = result.error or result.data.get("prompt", "") or "". _step_teach returns data.explanation (no prompt key), _step_probe/_step_quiz return data.question (no prompt key), only _step_predict returns data.prompt. CONFIRMED BUG: TEACH/PROBE/QUIZ outputs are silently dropped — only PREDICT reaches the chat UI. Proposed minimal fix (one expression in session_step_route, NOT implemented): fall through data.prompt or data.explanation or data.question or data.feedback or "". Full report at docs/investigations/task-21-ask-py-teach-rendering.md.
+- Wrote 12 new tests: 8 in TestExaminerResilience (fence-strip + error/empty + retry-then-succeed), 3 in TestSocratesPromptLength (string-presence pinning), 1 in TestIntakeLLMDriven (post-COMPLETE idempotency guard). All use monkeypatch to neutralize asyncio.sleep during retry tests.
+- Final test run: 225 passed / 1 skipped / 5 xfailed / 0 failed (was 213/1/5/0; +12 new tests, no regressions).
+- Updated aristotle/AGENTS.md (Last Cycle + Known Gotchas sections), PLANNED_FEATURES.md (Change Log), TECH_DEBT.md (two new entries: ARISTOTLE-DEBT-012 in-flight race + ARISTOTLE-DEBT-013 session/step output bug), worklog.md (this entry). Committed alongside code per the CODING PROTOCOL.
+
+Stage Summary:
+- All 5 fixes implemented (Fix 5 must-have only; in-flight race flagged back per prompt).
+- 12 new tests, all passing. No regressions.
+- Investigation item reported in writing (docs/investigations/task-21-ask-py-teach-rendering.md). Confirmed bug, minimal fix proposed but NOT implemented per prompt.
+- Two new TECH_DEBT entries filed for the flagged-back gaps (DEBT-012 + DEBT-013).
+- Ready for DEFINER review + dogfood re-test.

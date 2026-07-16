@@ -576,6 +576,108 @@ class TestIntakeLLMDriven:
         )
 
     @pytest.mark.asyncio
+    async def test_complete_trigger_idempotent_after_legacy_complete(self, monkeypatch):
+        """Task 21 Fix 5 (must-have): a second COMPLETE trigger after the
+        legacy-fallback path completed returns the existing plan_id WITHOUT
+        re-launching create_plan_job / generate_plan_pipeline.
+
+        Reproduces the dogfood-session duplicate-plan bug: a re-confirmation
+        message ~20 minutes after the first COMPLETE fired a SECOND
+        background pipeline for the same session+material, producing a
+        22-concept plan that was never used.
+
+        Setup: pre-seed session.state=COMPLETE + session.plan_id (the
+        state the legacy-fallback path leaves behind). Mock create_plan_job
+        + generate_plan_pipeline to assert they are NOT called.
+        """
+        draft_plan = [
+            {"topic": "Newton's First Law", "subtopic": "inertia",
+             "bloom_target": 2, "content_primary": "objects resist changes in motion",
+             "prerequisite_concept_id": None},
+        ]
+        complete_response = json.dumps({
+            "response": "Your plan is confirmed. Let's begin!",
+            "next_focus": "COMPLETE",
+            "extracted": {
+                "subject": "physics", "prior_knowledge": "basic",
+                "goals": "personal interest", "schedule_minutes": 30,
+            },
+            "draft_plan": draft_plan,
+        })
+        fake = _FakeModelProvider(responses={"beast": complete_response})
+        conn = _FakeConn()
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+
+        # Pre-seed: the first call already completed via legacy fallback.
+        existing_plan_id = "plan_abc_111"
+        session = IntakeSession(
+            state=IntakeState.COMPLETE,
+            current_focus="PLAN_DRAFT",
+            subject="physics",
+            goals="personal interest",
+            schedule_minutes=30,
+            draft_plan=draft_plan,
+            plan_id=existing_plan_id,
+        )
+
+        # Spy on the pipeline-launch functions — they MUST NOT be called.
+        pipeline_calls = {"create_plan_job": 0, "generate_plan_pipeline": 0}
+
+        async def _fake_create_plan_job(*args, **kwargs):
+            pipeline_calls["create_plan_job"] += 1
+            return "should_not_be_called"
+
+        async def _fake_generate_plan_pipeline(*args, **kwargs):
+            pipeline_calls["generate_plan_pipeline"] += 1
+            return None
+
+        monkeypatch.setattr(
+            "aristotle.actors.intake.create_plan_job", _fake_create_plan_job,
+            raising=False,
+        )
+        # The intake module imports create_plan_job / generate_plan_pipeline
+        # lazily inside the COMPLETE-trigger block (function-local import),
+        # so monkeypatching the source module is the right target. We patch
+        # aristotle.actors.plan_generator directly.
+        import aristotle.actors.plan_generator as plan_gen_mod
+        monkeypatch.setattr(plan_gen_mod, "create_plan_job", _fake_create_plan_job)
+        monkeypatch.setattr(
+            plan_gen_mod, "generate_plan_pipeline", _fake_generate_plan_pipeline,
+        )
+
+        result = await run_intake_step(session, "looks good", ctx)
+
+        # Guard #1 fired — returns the existing plan_id, state=COMPLETE.
+        assert result["state"] == "COMPLETE", (
+            f"Second COMPLETE should return state=COMPLETE (guard #1), "
+            f"got {result['state']}"
+        )
+        assert result.get("plan_id") == existing_plan_id, (
+            f"Second COMPLETE should return the existing plan_id "
+            f"({existing_plan_id}), got {result.get('plan_id')}"
+        )
+        # The pipeline-launch functions were NOT called.
+        assert pipeline_calls["create_plan_job"] == 0, (
+            "Second COMPLETE must NOT re-launch create_plan_job — guard #1 "
+            "should short-circuit before the pipeline-start path"
+        )
+        assert pipeline_calls["generate_plan_pipeline"] == 0, (
+            "Second COMPLETE must NOT re-launch generate_plan_pipeline"
+        )
+
+    # NOTE on the in-flight race (Task 21 Fix 5, secondary gap): a test
+    # for "second COMPLETE trigger WHILE the first pipeline is still
+    # running in the background" was attempted but could not be expressed
+    # without disambiguating "PLAN_DRAFT focus, GENERATING_PLAN state"
+    # (legitimate first-time COMPLETE) from "pipeline in-flight,
+    # GENERATING_PLAN state" (re-trigger). See the long comment in
+    # aristotle/actors/intake.py at the COMPLETE-trigger block for the
+    # full analysis and the three structural fixes that would close the
+    # gap (new IntakeState value / new session boolean / session-keyed
+    # task tracking). Per the Task 21 prompt, this is flagged back rather
+    # than guessed at — closing it exceeds the "one-line guard" scope.
+
+    @pytest.mark.asyncio
     async def test_llm_driven_invalid_json_falls_back_gracefully(self):
         """If the model returns non-JSON, the raw text is shown (not a crash)."""
         fake = _FakeModelProvider(

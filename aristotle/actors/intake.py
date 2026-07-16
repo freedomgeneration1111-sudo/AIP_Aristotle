@@ -1388,6 +1388,73 @@ async def run_intake_step(
     # LLM concept detail + ingest. Returns immediately with a plan_job_id
     # the GUI can poll.
     if next_focus == "COMPLETE" and session.draft_plan:
+        # Task 21 Fix 5 — idempotency guard (post-COMPLETE, must-have):
+        # If the pipeline already completed for this session (state==COMPLETE
+        # AND plan_id is set), return the existing plan_id without
+        # re-launching. This blocks the duplicate-plan bug observed in the
+        # dogfood session: a re-confirmation message ~20 minutes after the
+        # first COMPLETE fired a SECOND background pipeline for the same
+        # session+material, producing a 22-concept plan that was never used
+        # (placement had already started on the first 36-concept plan).
+        #
+        # The legacy-fallback path below sets session.state=COMPLETE +
+        # session.plan_id on success, so a genuine first-time successful
+        # completion is NOT blocked by this guard — only a SECOND
+        # successful completion is. The first pipeline-start path returns
+        # without setting plan_id (the pipeline runs in background); see
+        # the "Known limitation" note below for that case.
+        if session.state == IntakeState.COMPLETE and session.plan_id:
+            logger.info(
+                "plan_pipeline_trigger_skipped_already_complete session_plan_id=%s",
+                session.plan_id,
+            )
+            return {
+                "state": "COMPLETE",
+                "prompt": response_text,
+                "plan_id": session.plan_id,
+            }
+        # Task 21 Fix 5 — Known limitation (flagged back, NOT closed in
+        # this task): the IN-FLIGHT race. If the first COMPLETE trigger
+        # took the pipeline-start path (not the legacy fallback), the
+        # background pipeline is running but session.plan_id is NOT set
+        # (the pipeline hasn't finished). A second COMPLETE trigger would
+        # slip past guard #1 (no plan_id) and launch a DUPLICATE pipeline.
+        #
+        # The Task 21 prompt asked me to check whether session.state gets
+        # persisted as GENERATING_PLAN when the background job starts.
+        # Answer: NO — it's only in the returned dict, not on the session
+        # object. So I attempted to close the race by:
+        #   (a) adding `session.state = IntakeState.GENERATING_PLAN` before
+        #       supervised_task below, AND
+        #   (b) adding a guard #2: `if pre_call_state == GENERATING_PLAN:
+        #       return in-flight`.
+        #
+        # That attempt was AMBIGUOUS and broke the existing tests
+        # (test_llm_driven_complete_with_draft_plan_triggers_pipeline and
+        # test_full_intake_loop_with_upload_and_draft_plan). Reason:
+        # IntakeState.GENERATING_PLAN is ALSO the state mapped from
+        # current_focus="PLAN_DRAFT" (see focus_to_state above). The
+        # existing tests pre-seed state=GENERATING_PLAN to simulate the
+        # legitimate "model is in PLAN_DRAFT phase, about to produce its
+        # first COMPLETE" scenario — which my guard #2 would have
+        # incorrectly blocked.
+        #
+        # Disambiguating "PLAN_DRAFT focus, GENERATING_PLAN state"
+        # (legitimate first-time COMPLETE) from "pipeline in-flight,
+        # GENERATING_PLAN state" (re-trigger) requires more than a
+        # one-line guard. The clean fixes are:
+        #   (1) A new IntakeState value (e.g. PLAN_PIPELINE_RUNNING) —
+        #       schema change, requires a migration + serializer update.
+        #   (2) A new boolean field on IntakeSession (e.g.
+        #       plan_pipeline_started) — schema change, requires
+        #       _session_to_dict / _session_from_dict updates.
+        #   (3) Track in-flight tasks by session_id (the container's
+        #       _aristotle_plan_tasks dict is keyed by plan_job_id, not
+        #       session) — structural change.
+        # All three exceed the "one-line guard" scope the Task 21 prompt
+        # allows for this secondary gap. Flagging back per the prompt's
+        # instruction. The must-have behavior (blocking re-trigger AFTER
+        # completion, guard #1 above) is implemented and tested.
         # Try the multi-step pipeline first. Falls back to the legacy
         # single-call generate_plan() if the pipeline fails to start
         # (e.g., no ingested paper, no model provider, or the plan_generator

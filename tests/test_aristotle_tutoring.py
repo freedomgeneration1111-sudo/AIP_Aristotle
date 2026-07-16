@@ -585,6 +585,416 @@ class TestExaminerMethods:
 
 
 # --------------------------------------------------------------------------
+# Task 21 — examiner resilience tests (fence-strip + error/empty + retry)
+# --------------------------------------------------------------------------
+
+
+class _FakeSequenceModelProvider:
+    """Fake ModelProvider that returns responses in sequence per slot.
+
+    For testing retry logic: each slot has a list of responses; calls
+    return them in order. Each response is either a string (treated as
+    successful content) or a dict (returned as-is, can include error=True).
+    """
+
+    def __init__(self, responses_by_slot: dict[str, list]):
+        self._responses_by_slot = responses_by_slot
+        self.calls: list[tuple[str, list[dict]]] = []
+        self._call_idx_by_slot: dict[str, int] = {}
+
+    async def call(self, slot_name: str, messages: list[dict], **kwargs) -> dict:
+        self.calls.append((slot_name, messages))
+        idx = self._call_idx_by_slot.get(slot_name, 0)
+        responses = self._responses_by_slot.get(slot_name, [])
+        if idx >= len(responses):
+            return {
+                "error": True,
+                "content": "",
+                "error_message": "no more canned responses",
+            }
+        response = responses[idx]
+        self._call_idx_by_slot[slot_name] = idx + 1
+        if isinstance(response, str):
+            return {
+                "content": response,
+                "model": "fake-model",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+                "latency_ms": 5,
+            }
+        # dict — return as-is (allows error=True)
+        return response
+
+
+class TestExaminerResilience:
+    """Task 21: examiner resilience — JSON-fence stripping, error/empty
+    call detection, and retry-with-backoff.
+
+    These tests pin the Task 21 fixes:
+      - Fix 1: evaluate() strips ```json fences before parsing
+      - Fix 2: _generate_question() detects error=True / empty content
+        and retries (shared by probe() and quiz())
+      - Fix 3: evaluate() detects error=True / empty content, retries
+        before falling into the score=0.0 fallback
+    """
+
+    @pytest.mark.asyncio
+    async def test_evaluate_strips_json_fences(self, monkeypatch):
+        """Fix 1: evaluate() parses a ```json-fenced response correctly.
+
+        Reproduces the production bug: the evaluation model wraps its JSON
+        in a markdown code fence, json.loads() fails on the raw text, and
+        the student is scored 0.0. After the fix, the fence is stripped
+        and the JSON parses into the normalized dict.
+        """
+        # Avoid actually sleeping during retry tests (we won't trigger a
+        # retry here, but patch defensively in case the test evolves).
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        # Model wraps its JSON in a ```json fence — exactly what the
+        # production log showed (examiner_evaluate_parse_failed raw=```json...).
+        fenced_response = (
+            "```json\n"
+            + json.dumps({
+                "score": 0.85,
+                "mastery_achieved": True,
+                "feedback": "Solid — you connected inertia to resistance to change.",
+                "diagnosis": None,
+            })
+            + "\n```"
+        )
+        fake = _FakeModelProvider(responses={"evaluation": fenced_response})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "objects resist changes in motion", "What is inertia?"
+        )
+        assert result.ok, f"fenced JSON should parse; error={result.error}"
+        assert result.data is not None
+        assert result.data["score"] == 0.85
+        assert result.data["mastery_achieved"] is True
+        # The fence was stripped — the parse_failed fallback did NOT trigger
+        assert result.data["feedback"] != "[parse error — model did not return valid JSON]"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_strips_bare_triple_backtick_fences(self, monkeypatch):
+        """Fix 1: evaluate() also handles bare ``` fences (no `json` language tag)."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        fenced_response = (
+            "```\n"
+            + json.dumps({
+                "score": 0.5,
+                "mastery_achieved": False,
+                "feedback": "Partial.",
+                "diagnosis": {
+                    "misconception": "x",
+                    "why_wrong": "y",
+                    "corrective": "z",
+                },
+            })
+            + "\n```"
+        )
+        fake = _FakeModelProvider(responses={"evaluation": fenced_response})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "a guess", "What is inertia?"
+        )
+        assert result.ok
+        assert result.data["score"] == 0.5
+        assert result.data["diagnosis"] is not None
+        assert result.data["diagnosis"]["corrective"] == "z"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_genuinely_bad_json_still_falls_back(self, monkeypatch):
+        """Fix 1: genuinely malformed JSON (not just fenced) still hits the
+        score=0.0 fallback. The fence-stripping doesn't paper over real
+        parse failures."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        # Not JSON at all, not fenced — a plain-text model output.
+        fake = _FakeModelProvider(responses={"evaluation": "I think the answer is correct."})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "a guess", "What is inertia?"
+        )
+        # The existing fallback path: ok=True with score=0.0 (so the session
+        # keeps moving — coordinator treats score=0.0 as "not mastered").
+        assert result.ok
+        assert result.data["score"] == 0.0
+        assert result.data["mastery_achieved"] is False
+        assert "parse error" in result.data["feedback"]
+
+    @pytest.mark.asyncio
+    async def test_probe_with_error_response_returns_failure(self, monkeypatch):
+        """Fix 2: probe() detects error=True and returns ok=False.
+
+        Before the fix, model_provider.call() returning
+        {"error": True, "content": ""} (e.g. 429 rate-limit) fell through
+        to `question = result.get("content", "")` → empty string → logged
+        as `examiner_probe_ok ... question_len=0` (success!). Now it
+        returns ok=False with a clear error.
+        """
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        # Always returns error — simulates persistent rate-limit.
+        fake = _FakeSequenceModelProvider(
+            responses_by_slot={
+                "evaluation": [
+                    {"error": True, "content": "", "error_message": "429 rate limit"},
+                    {"error": True, "content": "", "error_message": "429 rate limit"},
+                    {"error": True, "content": "", "error_message": "429 rate limit"},
+                ],
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.probe(ctx, "c1")
+        assert not result.ok, (
+            "probe() should return ok=False when the model call returns error=True"
+        )
+        assert "model call failed" in result.error
+        # Retries: max_retries=2 means up to 3 total attempts (1 + 2 retries).
+        assert len(fake.calls) == 3, (
+            f"probe() should retry up to 2 times (3 total calls); got {len(fake.calls)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_quiz_with_empty_content_returns_failure(self, monkeypatch):
+        """Fix 2: quiz() detects empty content (no error key, but content is
+        whitespace-only) and returns ok=False. This is the OpenRouter free-tier
+        pattern: 200 OK with empty content on rate-limit."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        fake = _FakeSequenceModelProvider(
+            responses_by_slot={
+                "evaluation": [
+                    {"content": "   ", "model": "fake", "usage": {}, "latency_ms": 1},
+                    {"content": "", "model": "fake", "usage": {}, "latency_ms": 1},
+                    {"content": "\n\t", "model": "fake", "usage": {}, "latency_ms": 1},
+                ],
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.quiz(ctx, "c1")
+        assert not result.ok, (
+            "quiz() should return ok=False when the model returns empty content"
+        )
+        assert "empty content" in result.error
+
+    @pytest.mark.asyncio
+    async def test_probe_retries_then_succeeds(self, monkeypatch):
+        """Fix 2: probe() retries on error, then succeeds when the model recovers.
+
+        First call: error=True (transient 429). Second call: success.
+        Verify the retry happened (call count = 2) and the success path
+        returned the question.
+        """
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        fake = _FakeSequenceModelProvider(
+            responses_by_slot={
+                "evaluation": [
+                    {"error": True, "content": "", "error_message": "429"},
+                    "What does inertia mean in your own words?",
+                ],
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.probe(ctx, "c1")
+        assert result.ok, f"probe() should succeed after retry; error={result.error}"
+        assert result.data is not None
+        assert "inertia" in result.data["question"].lower()
+        assert len(fake.calls) == 2, (
+            f"probe() should have called the model twice (1 fail + 1 success); "
+            f"got {len(fake.calls)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_evaluate_with_error_response_retries_then_fails(self, monkeypatch):
+        """Fix 3: evaluate() retries on error=True before returning ok=False.
+
+        Before the fix, an error response from the evaluation slot was
+        indistinguishable from genuinely-malformed JSON — both fell into
+        the score=0.0 fallback. The fix distinguishes them: an error
+        response triggers a retry (up to 2), and only after retries are
+        exhausted does it return ok=False (NOT ok=True with score=0.0).
+
+        This test verifies the retry happens (call count = 3) and the
+        final result is ok=False (not the score=0.0 fallback).
+        """
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        fake = _FakeSequenceModelProvider(
+            responses_by_slot={
+                "evaluation": [
+                    {"error": True, "content": "", "error_message": "429 rate limit"},
+                    {"error": True, "content": "", "error_message": "429 rate limit"},
+                    {"error": True, "content": "", "error_message": "429 rate limit"},
+                ],
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "objects resist changes in motion", "What is inertia?"
+        )
+        # Fix 3: ok=False (not the score=0.0 fallback) when the call failed.
+        assert not result.ok, (
+            "evaluate() should return ok=False when the model call returns "
+            "error=True after retries — NOT ok=True with score=0.0"
+        )
+        assert "model call failed" in result.error
+        # Verify retries happened: max_retries=2 → 3 total calls.
+        assert len(fake.calls) == 3, (
+            f"evaluate() should retry up to 2 times (3 total calls); "
+            f"got {len(fake.calls)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_evaluate_retries_then_succeeds(self, monkeypatch):
+        """Fix 3: evaluate() retries on error, then succeeds with valid JSON.
+
+        First call: error=True (transient 429). Second call: valid JSON.
+        Verify the retry happened (call count = 2) and the success path
+        returned the parsed score (NOT score=0.0).
+        """
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        good_json = json.dumps({
+            "score": 0.9,
+            "mastery_achieved": True,
+            "feedback": "Excellent.",
+            "diagnosis": None,
+        })
+        fake = _FakeSequenceModelProvider(
+            responses_by_slot={
+                "evaluation": [
+                    {"error": True, "content": "", "error_message": "429"},
+                    good_json,
+                ],
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "objects resist changes in motion", "What is inertia?"
+        )
+        assert result.ok, f"evaluate() should succeed after retry; error={result.error}"
+        assert result.data["score"] == 0.9, (
+            "evaluate() should return the actual model score, not the 0.0 fallback"
+        )
+        assert result.data["mastery_achieved"] is True
+        assert len(fake.calls) == 2
+
+
+# --------------------------------------------------------------------------
+# Task 21 — SOCRATES prompt length + register (Fix 4)
+# --------------------------------------------------------------------------
+
+
+class TestSocratesPromptLength:
+    """Task 21 Fix 4: SOCRATES._build_system_prompt includes an explicit
+    length ceiling + plain-language register instruction.
+
+    Without it, the `full_worked_example` fading mode's "Show every step"
+    instruction produced ~5000-character single explanations in production.
+    We can't unit-test LLM output length, but we can pin the prompt string
+    so a future refactor can't silently drop the constraint.
+    """
+
+    def test_base_prompt_contains_length_instruction(self):
+        """The base prompt (applies to all fading modes) carries an explicit
+        length ceiling: 2-4 short paragraphs maximum."""
+        socrates = SocratesActor()
+        prompt = socrates._build_system_prompt(mastery_level=0)
+        assert "LENGTH AND REGISTER" in prompt, (
+            "Base prompt must include the LENGTH AND REGISTER section header"
+        )
+        assert "2 to 4 short paragraphs" in prompt, (
+            "Base prompt must specify the 2-4 paragraph ceiling"
+        )
+        assert "plain, everyday English" in prompt, (
+            "Base prompt must specify plain-language register "
+            "(many learners study in a second language)"
+        )
+        assert "short sentences" in prompt, (
+            "Base prompt must prefer short sentences over long ones"
+        )
+
+    def test_length_instruction_applies_across_all_fading_modes(self):
+        """The length instruction is in the base prompt, so it appears in
+        every fading mode (level 0, 2, and 3+)."""
+        socrates = SocratesActor()
+        for level in [0, 1, 2, 3, 5]:
+            prompt = socrates._build_system_prompt(mastery_level=level)
+            assert "LENGTH AND REGISTER" in prompt, (
+                f"Length instruction must appear at mastery_level={level}"
+            )
+
+    def test_full_worked_example_has_per_step_verbosity_bound(self):
+        """The full_worked_example branch softens 'Show every step — do not
+        skip anything' to bound per-step verbosity. Production bug: without
+        the bound, the model produced ~5000-char single explanations."""
+        socrates = SocratesActor()
+        prompt = socrates._build_system_prompt(mastery_level=0)
+        assert "full worked example" in prompt.lower()
+        # The new bound: each step kept to 1-2 sentences.
+        assert "1-2 sentences" in prompt or "1 to 2 sentences" in prompt, (
+            "full_worked_example branch must bound per-step verbosity "
+            "(1-2 sentences per step), not just say 'show every step'"
+        )
+        # The completeness-of-steps instruction is preserved.
+        assert "completeness of steps" in prompt.lower(), (
+            "The 'completeness of steps' instruction must be preserved — "
+            "we bound per-step verbosity, not the number of steps shown"
+        )
+
+
+# --------------------------------------------------------------------------
 # EXAMINER generate_hint tests (Phase B.5 HINT ladder)
 # --------------------------------------------------------------------------
 

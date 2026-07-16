@@ -317,29 +317,60 @@ class SocratesActor:
         presentation mode to use (full example / partial faded / conceptual
         only). This keeps the fading deterministic — exact instruction for
         each level, no ambiguity about which mode applies.
+
+        Task 21 Fix 4 (length ceiling + plain-language register): the base
+        prompt now carries an explicit length + register constraint that
+        applies across ALL fading modes. Without it, the `full_worked_example`
+        mode's "Show every step — do not skip anything" instruction had no
+        counterweight and produced ~5000-character single explanations in
+        production. The fading-mode branches were also softened so
+        "completeness of steps" doesn't bleed into "verbosity per step".
         """
         base = (
             "You are Aristotle — a patient, exact tutor. You explain concepts "
             "clearly, with examples. You speak in one voice: warm but precise. "
             "The learner trusts you because you never rush past confusion."
         )
+        # Task 21 Fix 4: explicit length + register constraint, applied
+        # across ALL fading modes. The plain-language framing is important
+        # — many learners are studying in a second language, so plain
+        # everyday English + short sentences is required, not optional.
+        # This is a real, testable constraint: a unit test asserts the
+        # string presence so a future refactor can't silently drop it.
+        base += (
+            "\n\nLENGTH AND REGISTER: Keep explanations short — 2 to 4 short "
+            "paragraphs maximum, even when the concept is complex. Use plain, "
+            "everyday English; many learners are studying in a second "
+            "language. Prefer short sentences over long ones. Do not pad. "
+            "Do not repeat yourself. When walking through multiple steps, "
+            "keep each step to one or two sentences — completeness of steps, "
+            "not verbosity per step."
+        )
         if retry:
             base += (
                 "\n\nThis is a re-teaching. The learner struggled with your "
                 "first explanation. Try a different angle — simpler words, a "
                 "concrete example, an analogy. Address the specific gap noted "
-                "in the struggle pattern."
+                "in the struggle pattern. Keep the length ceiling above — a "
+                "re-teaching is not a longer explanation, it is a different one."
             )
 
         # Phase B.5: mastery-adaptive fading instruction.
+        # Task 21 Fix 4: the `full_worked_example` branch was softened from
+        # "Show every step — do not skip anything" (no counterweight →
+        # ~5000-char explanations in production) to "Show every step, but
+        # keep each step to 1-2 sentences". The completeness-of-steps
+        # instruction is preserved; only the per-step verbosity is bounded.
         fading_mode = self._fading_mode_for_level(mastery_level)
         if fading_mode == "full_worked_example":
             base += (
                 "\n\nFADING MODE: full worked example. The learner is new to "
                 "this concept. Walk through a complete step-by-step example "
-                "showing exactly how this concept applies. Show every step — "
-                "do not skip anything. The learner needs to see the full "
-                "reasoning path before they can attempt it themselves."
+                "showing exactly how this concept applies. Show every step, "
+                "but keep each step to 1-2 sentences — completeness of steps, "
+                "not verbosity per step. The learner needs to see the full "
+                "reasoning path before they can attempt it themselves, but a "
+                "wall of text per step is harder to follow, not easier."
             )
         elif fading_mode == "partial_faded_example":
             base += (
