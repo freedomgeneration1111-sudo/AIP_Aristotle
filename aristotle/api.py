@@ -240,6 +240,28 @@ async def session_step_route(request: Request):
 
     Request body: {"session": <SessionContext dict>, "student_input": "..."}
     Returns: {"session": <updated SessionContext>, "output": "...", "ok": true}
+
+    Task 22 Fix 1: the `output` field now reads the right data key per step
+    type. Previously it only read `result.data["prompt"]`, which is the key
+    `_step_predict()` uses — but `_step_teach()` returns `data.explanation`,
+    `_step_probe()`/`_step_quiz()` return `data.question`, and
+    `_step_evaluate()` returns `data.feedback`. Every step except PREDICT was
+    silently dropped from the chat UI. The fallback chain below (prompt →
+    explanation → question → feedback → "") mirrors the per-step mapping
+    documented in the Task 21 investigation report
+    (`docs/investigations/task-21-ask-py-teach-rendering.md`). Order matters
+    for clarity (matches the tutoring state-machine order: PREDICT, TEACH,
+    PROBE/QUIZ, EVALUATE) but not correctness — a given step's `result.data`
+    only ever populates one of these four keys.
+
+    Task 22 Fix 2: when `not result.ok`, return a short, honest,
+    non-alarming student-facing message instead of an empty string. After
+    Task 21 Fix 3, `evaluate()` legitimately returns `ok=False` on an
+    exhausted-retry infra failure (429 rate-limit) — without this fix, the
+    student's screen went blank instead of showing a "try again" message.
+    The raw `result.error` is still carried in the separate `"error"` key
+    for debugging/logging purposes; it is NOT exposed to the student in
+    `output`.
     """
     container = _get_container(request)
     body = await request.json()
@@ -250,13 +272,35 @@ async def session_step_route(request: Request):
     ctx = _make_ctx(container)
 
     result = await run_session_step(ctx, session, student_input)
+    if result.ok:
+        data = result.data if isinstance(result.data, dict) else {}
+        # Task 22 Fix 1: read the right key per step type. See the docstring
+        # for the per-step mapping. Keep the fallback chain exactly this
+        # shape (don't collapse into something cleverer) so it stays
+        # obviously traceable to which step produced which key.
+        output = (
+            data.get("prompt")
+            or data.get("explanation")
+            or data.get("question")
+            or data.get("feedback")
+            or ""
+        )
+    else:
+        # Task 22 Fix 2: don't blank the screen on infra failure. The raw
+        # error is in the separate "error" key for logs — `output` carries
+        # a student-facing message. Wording is deliberately neutral: never
+        # blames the student, never exposes the raw error (which may contain
+        # provider/429/stack details), and invites a retry. Same shape as
+        # the "I had trouble thinking just now" message used in
+        # aristotle/actors/intake.py's beast-slot retry-exhausted path so
+        # the learner sees a consistent voice across both surfaces.
+        output = (
+            "I had trouble with that just now — could you send your "
+            "answer again?"
+        )
     return {
         "session": _session_to_dict(session),
-        "output": (
-            result.error
-            or (result.data.get("prompt", "") if isinstance(result.data, dict) else "")
-            or ""
-        ) if result.ok else "",
+        "output": output,
         "ok": result.ok,
         "error": result.error if not result.ok else None,
     }

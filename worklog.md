@@ -1039,3 +1039,34 @@ Stage Summary:
 - Investigation item reported in writing (docs/investigations/task-21-ask-py-teach-rendering.md). Confirmed bug, minimal fix proposed but NOT implemented per prompt.
 - Two new TECH_DEBT entries filed for the flagged-back gaps (DEBT-012 + DEBT-013).
 - Ready for DEFINER review + dogfood re-test.
+
+---
+Task ID: 22
+Agent: Super Z (main)
+Task: Task 22 — Fix /session/step output field (TEACH/PROBE/QUIZ outputs were silently dropped). Two fixes in aristotle/api.py::session_step_route + a contract fix in aristotle/session.py::_step_evaluate.
+
+Work Log:
+- Pulled both repos. AIP_Aristotle already at Task 21 commit 8179a58; AIP_Brain at 5995397. No new upstream changes.
+- Re-read aristotle/AGENTS.md (Last Cycle + Known Gotchas), PLANNED_FEATURES.md, TECH_DEBT.md (DEBT-013 entry), STATUS.md, and the Task 21 investigation report at docs/investigations/task-21-ask-py-teach-rendering.md.
+- Read the current aristotle/api.py::session_step_route (lines 237-262) — confirmed the bug is exactly as described: output = result.error or result.data.get("prompt", "") or "". Only reads the prompt key.
+- Read aristotle/session.py::_step_teach (949-980), _step_probe (983-1015), _step_quiz (1018+), _step_evaluate (1085-1288) to verify the per-step data key mapping. Confirmed: teach → data.explanation, probe/quiz → data.question, evaluate → data.feedback (via examiner.evaluate), predict → data.prompt.
+- Read the existing route test pattern in tests/test_aristotle_routes.py (the _make_request + _make_container helpers, direct route-call pattern — no FastAPI TestClient lifespan needed) and the TestSessionCoordinator pattern in tests/test_aristotle_tutoring.py (container with model_provider + corpus_registry + extensions.registry).
+- Captured baseline test run: 225 passed / 1 skipped / 5 xfailed / 0 failed (matches Task 21 final state).
+- Fix 1 (api.py::session_step_route): replaced the output computation with the fallback chain `data.get("prompt") or data.get("explanation") or data.get("question") or data.get("feedback") or ""`. Order matches the tutoring state-machine order for traceability. Added a docstring explaining the per-step mapping and pointing to the Task 21 investigation report.
+- Fix 2 (api.py::session_step_route): when `not result.ok`, return a student-facing message ("I had trouble with that just now — could you send your answer again?") instead of "". The raw result.error is still in the separate "error" key for logs. Wording matches the intake.py beast-slot retry-exhausted message for consistent voice.
+- Wrote 5 new integration-level tests in tests/test_aristotle_routes.py: test_session_step_teach_output_contains_explanation, test_session_step_probe_output_contains_question, test_session_step_evaluate_output_contains_feedback, test_session_step_predict_output_still_works (regression), test_session_step_infra_failure_returns_student_message. Used _make_request + _make_container + a new _make_session_container helper (adds extensions.registry) + _FakeModelProvider with error_slots support for the infra-failure case. Patched asyncio.sleep to neutralize retry delays.
+- First test run: 4/5 passed, EVALUATE test failed. Root cause: _step_evaluate re-wrapped its return as ActorResult(ok=True, error=session.last_evaluation) — the legacy error-as-payload pattern from pre-Phase-B.5. This left data=None, so the API couldn't read data.feedback even after Fix 1. The task's per-step mapping explicitly says evaluate → data.feedback, so this is a producer/consumer contract gap, not a deviation from the task spec.
+- Contract fix (session.py::_step_evaluate): changed the return to ActorResult(ok=True, error=session.last_evaluation, data=eval_data if eval_data is not None else {}). Keeps error= for backward compat (legacy consumers that still read result.error), adds data= as the canonical channel the API reads. Added a long comment explaining the pre-existing inconsistency and the fix.
+- Re-ran the 5 new tests: all pass. Re-ran the full suite: 230 passed / 1 skipped / 5 xfailed / 0 failed (+5 new tests, no regressions). Verified all 16 TestSessionCoordinator tests still pass — they read session.last_diagnosis / session.last_score (set BEFORE the return statement), not result.data, so the return-shape change is backward-compatible.
+- Updated aristotle/AGENTS.md: new Last Cycle entry for Task 22, updated the Known Gotcha about /session/step output (was "bug: only reads data.prompt" → now "fixed: reads the right key per step, with guidance for adding new steps"), added a new Known Gotcha about _step_evaluate returning data= (contract fix).
+- Updated PLANNED_FEATURES.md Change Log with the Task 22 entry.
+- Updated TECH_DEBT.md: marked ARISTOTLE-DEBT-013 as Resolved with a pointer to the Task 22 fix, the contract fix in _step_evaluate, the 5 new tests, and a note about what's still NOT surfaced (EVALUATE's diagnosis block — separate design decision).
+- Appended this worklog entry.
+
+Stage Summary:
+- Both fixes implemented exactly as specified (Fix 1: fallback chain reading prompt/explanation/question/feedback; Fix 2: student-facing message on ok=False).
+- One contract fix in session.py::_step_evaluate (pass data= through instead of re-wrapping with only error=) — discovered while writing the EVALUATE regression test, required to make Fix 1 work for the EVALUATE case as the task's per-step mapping specifies. Flagged in the task report and documented in AGENTS.md + TECH_DEBT.md.
+- 5 new integration-level tests hitting /session/step directly (TEACH, PROBE, EVALUATE, PREDICT regression, ok=False infra failure). These are the regression tests that should have existed already.
+- 230 passed / 1 skipped / 5 xfailed / 0 failures (was 225/1/5/0; +5 new tests, no regressions).
+- ARISTOTLE-DEBT-013 resolved. ARISTOTLE-DEBT-012 (in-flight COMPLETE race) intentionally NOT touched — deferred per Task 22 scope boundaries, needs a real design decision during the canonical-corpus/shared-material work.
+- Nothing uncertain to flag back. The contract fix in _step_evaluate was a discovery, not a guess — it's the minimal change needed to make the task's specified per-step mapping work for EVALUATE, and it's backward-compatible (all 16 TestSessionCoordinator tests pass unchanged).

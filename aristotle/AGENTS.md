@@ -190,14 +190,27 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   `_strip_json_fences()` in `aristotle/actors/examiner.py`, applied
   before `json.loads()` in `evaluate()`. Any new strict-JSON model-call
   site should apply the same stripping.
-- **`/aristotle/session/step`'s `output` field only reads `data.prompt`.**
-  This is a confirmed bug (Task 21 investigation, NOT yet fixed): the API
-  computes `output = result.error or result.data.get("prompt", "") or ""`,
-  but `_step_teach()` returns `data.explanation`, `_step_probe()` and
-  `_step_quiz()` return `data.question`. TEACH/PROBE/QUIZ outputs are
-  silently dropped — only PREDICT (which uses `data.prompt`) reaches the
-  chat UI. See `docs/investigations/task-21-ask-py-teach-rendering.md`
-  for the full analysis and proposed minimal fix.
+- **`/aristotle/session/step`'s `output` field reads the right key per step.**
+  Task 22 Fix 1: `output = data.get("prompt") or data.get("explanation")
+  or data.get("question") or data.get("feedback") or ""`. Before Task 22,
+  the API only read `data.prompt` — so TEACH/PROBE/QUIZ/EVALUATE outputs
+  were silently dropped (only PREDICT reached the chat UI). The Task 21
+  investigation report at `docs/investigations/task-21-ask-py-teach-rendering.md`
+  flagged this; Task 22 fixed it. If you add a new tutoring step whose
+  actor returns a differently-named key, you MUST extend the fallback
+  chain in `aristotle/api.py::session_step_route` to read it — otherwise
+  the new step's output will be silently dropped, same bug class.
+- **`_step_evaluate` returns `data=eval_data` (Task 22 contract fix).**
+  Before Task 22, `_step_evaluate` re-wrapped its return as
+  `ActorResult(ok=True, error=session.last_evaluation)` — the legacy
+  error-as-payload pattern — leaving `data=None`. This blocked the API
+  from reading `data.feedback`. Task 22 changed it to pass
+  `data=eval_data` through (keeping `error=` for backward compat). If
+  you're writing a new `_step_*` function, follow the pattern of
+  `_step_teach` / `_step_probe` / `_step_quiz` / `_step_evaluate`:
+  return the actor's `ActorResult` directly (or re-wrap with `data=`
+  populated), never re-wrap with only `error=` — that's the pre-B.5
+  pattern the platform is migrating away from.
 - **COMPLETE-trigger idempotency guard only catches the post-completion
   case, not the in-flight race.** Task 21 Fix 5 added a guard in
   `aristotle/actors/intake.py::run_intake_step` that blocks re-trigger
@@ -212,7 +225,61 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   structural fixes that would close the gap.
 
 ## Last Cycle
-- **Task 21 — Tutoring session-quality fixes (examiner resilience + teach prompt length + intake idempotency)** (this cycle):
+- **Task 22 — Fix /session/step output field (TEACH/PROBE/QUIZ outputs were silently dropped)** (this cycle):
+  - **Fix 1** (`aristotle/api.py::session_step_route`): the `output` field
+    was computed as `result.error or result.data.get("prompt", "") or ""`,
+    which only ever read the `prompt` key. But `_step_teach()` returns
+    `data={"explanation": ...}`, `_step_probe()`/`_step_quiz()` return
+    `data={"question": ...}`, `_step_evaluate()` returns
+    `data={"feedback": ...}` — only `_step_predict()` uses `data.prompt`.
+    Every step except PREDICT was silently dropped from the chat UI. The
+    fix: `output = data.get("prompt") or data.get("explanation") or
+    data.get("question") or data.get("feedback") or ""`. Order matches
+    the tutoring state-machine order (PREDICT, TEACH, PROBE/QUIZ,
+    EVALUATE) for traceability — a given step only populates one key, so
+    there's no collision risk.
+  - **Fix 1 contract fix** (`aristotle/session.py::_step_evaluate`):
+    while writing the EVALUATE regression test, discovered that
+    `_step_evaluate` re-wrapped its return as
+    `ActorResult(ok=True, error=session.last_evaluation)` — the legacy
+    error-as-payload pattern from pre-Phase-B.5. This put the JSON
+    string in `error` and left `data=None`, so the API couldn't read
+    `data.feedback` even after Fix 1. Changed to
+    `ActorResult(ok=True, error=session.last_evaluation, data=eval_data)`
+    — keeps `error=` for backward compat (legacy consumers that still
+    read `result.error`), adds `data=` as the canonical channel the API
+    reads. This is exactly the kind of producer/consumer contract gap
+    the CODING PROTOCOL calls out ("the bug is always in the gap").
+  - **Fix 2** (`aristotle/api.py::session_step_route`): when
+    `not result.ok`, the `output` field was `""` — the student's screen
+    went blank. After Task 21 Fix 3, `evaluate()` legitimately returns
+    `ok=False` on an exhausted-retry infra failure (429 rate-limit), so
+    this case now happens in production. Fix: return a short, honest,
+    non-alarming student-facing message ("I had trouble with that just
+    now — could you send your answer again?") instead of `""`. The raw
+    `result.error` is still carried in the separate `"error"` key for
+    debugging/logging — never exposed to the student in `output`. Same
+    voice as `aristotle/actors/intake.py`'s beast-slot retry-exhausted
+    message so the learner sees consistent wording across both surfaces.
+  - **Tests**: 5 new integration-level tests in
+    `tests/test_aristotle_routes.py` hitting `/session/step` directly
+    via the route function (pattern follows the existing
+    `_make_request` + `_make_container` helpers — no FastAPI TestClient
+    lifespan needed). TEACH, PROBE, EVALUATE, PREDICT (regression), and
+    ok=False (infra failure) cases. These are the regression tests that
+    should have existed already — the whole reason the bug shipped
+    unnoticed at Task 21 is that no test exercised the actual API
+    response shape for anything but PREDICT.
+  - **Test impact**: 230 passed / 1 skipped / 5 xfailed / 0 failures
+    (was 225/1/5/0 at Task 21 baseline; +5 new tests, no regressions.
+    All 16 TestSessionCoordinator tests still pass — the
+    `_step_evaluate` return-shape change is backward-compatible because
+    existing tests read `session.last_diagnosis` / `session.last_score`
+    which are set BEFORE the return statement, not `result.data`).
+  - **ARISTOTLE-DEBT-013 resolved**: the Task 21 investigation item
+    that flagged this bug is now fixed. Updated TECH_DEBT.md to mark
+    it Resolved with a pointer to this commit.
+- **Task 21 — Tutoring session-quality fixes (examiner resilience + teach prompt length + intake idempotency)** (prior cycle):
   - **Fix 1 — Strip markdown JSON fences before parsing** (`aristotle/actors/examiner.py::evaluate()`):
     the evaluation model sometimes wraps its JSON response in a ```json
     fence. `json.loads()` failed on the raw fenced text, scoring the

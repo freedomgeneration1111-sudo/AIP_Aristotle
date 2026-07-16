@@ -1285,7 +1285,30 @@ async def _step_evaluate(
         session.state.value,
         session.last_diagnosis is not None,
     )
-    return ActorResult(ok=True, error=session.last_evaluation)
+    # Task 22 Fix 1 (contract fix in the session coordinator): pass
+    # `data=eval_data` through so the API's `output` field can read
+    # `data.feedback` (the learner-facing message). Previously this
+    # returned `ActorResult(ok=True, error=session.last_evaluation)` —
+    # the legacy error-as-payload pattern from pre-Phase-B.5 — which put
+    # the JSON string in `error` and left `data=None`. The API then
+    # couldn't read `data.feedback`, so EVALUATE's feedback was silently
+    # dropped from the chat UI (same bug as TEACH/PROBE/QUIZ, different
+    # root cause: the coordinator re-wrapped the actor's result instead
+    # of passing it through).
+    #
+    # We keep `error=session.last_evaluation` for backward compat with
+    # any consumer that still reads result.error (e.g. the legacy
+    # _session_to_dict serialization that includes last_evaluation).
+    # The new `data=eval_data` is the canonical channel — the API reads
+    # it preferentially. eval_data is the parsed dict from
+    # examiner.evaluate(); when the model returned non-JSON (legacy
+    # fallback path above), eval_data is None and we pass an empty dict
+    # so the API's `isinstance(result.data, dict)` check still holds.
+    return ActorResult(
+        ok=True,
+        error=session.last_evaluation,  # backward compat (legacy JSON string)
+        data=eval_data if eval_data is not None else {},
+    )
 
 
 async def _step_hint(
