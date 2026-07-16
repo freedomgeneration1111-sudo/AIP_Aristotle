@@ -1070,3 +1070,37 @@ Stage Summary:
 - 230 passed / 1 skipped / 5 xfailed / 0 failures (was 225/1/5/0; +5 new tests, no regressions).
 - ARISTOTLE-DEBT-013 resolved. ARISTOTLE-DEBT-012 (in-flight COMPLETE race) intentionally NOT touched — deferred per Task 22 scope boundaries, needs a real design decision during the canonical-corpus/shared-material work.
 - Nothing uncertain to flag back. The contract fix in _step_evaluate was a discovery, not a guess — it's the minimal change needed to make the task's specified per-step mapping work for EVALUATE, and it's backward-compatible (all 16 TestSessionCoordinator tests pass unchanged).
+
+---
+Task ID: 23
+Agent: Super Z (main)
+Task: Task 23 — Decline-to-answer gate + mastery-scoring integrity + audit trail. Four fixes: (1) decline-to-answer gate inside examiner.evaluate(), (2) derive mastery_achieved in code from score, (3) new M010 migration adding student_answer column to aristotle_placement_event + INSERT update in run_placer_step, (4) read-only audit script + targeted reset script in scripts/.
+
+Work Log:
+- Pulled AIP_Aristotle (already at Task 22 commit c161ddb). Read AGENTS.md, PLANNED_FEATURES.md, TECH_DEBT.md, STATUS.md, the M004 migration (for schema + format), examiner.py evaluate() (post-Task-21 state), intake.py run_placer_step (the INSERT site + the mastery upsert), and the existing CLI pattern (HTTP-client, not direct DB).
+- Verified the live DB schema: aristotle_placement_event has exactly the 6 columns the task says (no student_answer yet), aristotle_mastery has the mastered column the audit script will filter on. DB path is aristotle/textbook.db (resolved via importlib.resources on the aristotle package, same as the ExtensionHost).
+- Captured baseline test run: 230 passed / 1 skipped / 5 xfailed / 0 failed (matches Task 22 final state). Had to reinstall aip + aristotle into the venv python first (the venv had lost the editable installs).
+- Fix 1 (examiner.py): added _DECLINE_PATTERNS (tight frozenset — "no", "i don't know", "idk", "teach me about it", "no. teach me about it", etc.) + _is_decline_to_answer() helper (normalizes: strip whitespace, lowercase, strip trailing punctuation; plus a 40-char-ceiling "teach me" substring check for short variants). At the top of evaluate(), BEFORE any model call, the gate fires. If decline: return ok=True with score=0.0, mastery_achieved=False, gentle feedback ("No problem — let's move on to teaching this one."), diagnosis=None. No model call, no LLM token burned.
+- Fix 2 (examiner.py::evaluate): replaced bool(eval_data.get("mastery_achieved", False)) with parsed_score >= mastery_threshold. The model's self-reported boolean is now ignored. Added a long comment explaining why (the live failure mode: model self-reported mastery_achieved=true on refusal-style answers).
+- Fix 3: created M010_placement_event_answer_text.sql (ALTER TABLE aristotle_placement_event ADD COLUMN student_answer TEXT — nullable, no default, follows the M009 ALTER TABLE pattern). Updated the INSERT in run_placer_step to include student_answer in both the column list and the params tuple (params[5] = student_input).
+- Fix 4: created scripts/audit_placement_mastery.py (read-only — takes plan_id, joins aristotle_mastery mastered=1 against aristotle_placement_event on plan_id+concept_id, prints concept_id/score/assessed_at/student_answer, handles NULL student_answer with <NULL — pre-M010> marker, handles mastery rows with no placement event with <no placement event — set by tutoring session> marker). Created scripts/reset_mastery_for_concepts.py (REQUIRES explicit concept_id list — never a blanket plan-wide reset; has --dry-run + interactive TTY confirmation + --from-file option). Both resolve the DB path via importlib.resources (same pattern as the ExtensionHost), with a fallback to the source-tree path for non-pip-installed checkouts.
+- Verified both scripts run: --help output works, audit script's --db-path override works, reset script's --dry-run works. Generated a synthetic DB to capture sample output for the task report — the audit table clearly shows the corrupted row pattern (score=0.0 + mastered=1 + student_answer="no. teach me about it.").
+- Wrote 10 new tests: 4 in TestExaminerDeclineGate (decline phrases skip model call — 12 phrases tested; genuine "no, it binds non-covalently" answer is NOT gated — the regression test that matters most; long "teach me" question is NOT gated — 40-char ceiling; decline feedback is gentle not grading), 4 in TestExaminerMasteryDerivation (inconsistent low-score/high-mastery overridden; inconsistent high-score/low-mastery overridden; consistent response passes through; custom mastery_threshold from config is respected), 1 placer audit-trail test (verifies the INSERT includes student_answer column + the raw text in params[5]), 1 M010 migration test (verifies column exists + nullable + round-trips text via the real ExtensionHost lifespan). All 10 pass.
+- Final test run: 240 passed / 1 skipped / 5 xfailed / 0 failed (was 230/1/5/0; +10 new tests, no regressions). Verified CLI tests + import boundary tests still pass (the scripts/ dir is standalone Python, not part of the aristotle package, so no boundary impact).
+- Updated aristotle/AGENTS.md (Last Cycle entry + 4 new Known Gotchas: decline-gate, mastery-derivation, placement_event.student_answer column, audit+reset scripts). Updated PLANNED_FEATURES.md Change Log. Appended this worklog entry.
+
+Stage Summary:
+- All 4 fixes implemented exactly as specified.
+- 10 new tests, all passing. No regressions.
+- Audit script sample output (synthetic DB, 3 mastered rows — 1 legit, 1 corrupted, 1 pre-M010):
+    concept_id  mastery_last_score  mastery_reps  placement_score  assessed_at           student_answer
+    pharma_000  0.9                 3             0.9              2026-07-15T08:21:09  they bind ligands on the cell surface
+    pharma_001  0.0                 3             0.0              2026-07-15T08:25:00  no. teach me about it.
+    pharma_005  0.85                3             0.85             2026-07-15T08:30:00  <NULL — pre-M010>
+  The corrupted row (pharma_001: score=0.0 but mastered=1, student_answer="no. teach me about it.") is immediately visible — Moses feeds that concept_id to reset_mastery_for_concepts.py --dry-run to confirm, then re-runs without --dry-run to delete.
+- Reset script sample output (--dry-run, targeting the corrupted concept):
+    # Before-state (what would be deleted):
+    concept_id              mastered  repetitions  last_score  updated_at
+    pharmacognosy_001_ige_igg  1         3            0.0         2026-07-15T08:25:00
+    # DRY RUN — would delete 1 mastery row(s). Re-run without --dry-run to actually delete.
+- Nothing uncertain to flag back. The decline-pattern list is intentionally tight (the task said "favor false negatives over false positives" — I left out "nope", "nah", "nothing", "idts" because each could plausibly appear in a real content answer). If Moses finds a decline phrase in the live transcripts that isn't covered, adding it to _DECLINE_PATTERNS is a one-line change with a clear test pattern to follow.

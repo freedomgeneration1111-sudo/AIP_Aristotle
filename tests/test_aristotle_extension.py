@@ -384,6 +384,87 @@ async def test_aristotle_m009_creates_student_scoping_schema(host: ExtensionHost
     _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
 )
 @pytest.mark.asyncio
+async def test_aristotle_m010_adds_placement_event_student_answer(host: ExtensionHost, container):
+    """M010_placement_event_answer_text.sql adds the student_answer column
+    to aristotle_placement_event (Task 23 Fix 3).
+
+    The column is nullable (no default) so:
+      - Old rows written before M010 ship with NULL (correct — we don't
+        know what they typed).
+      - New rows written after M010 ship with the raw student_input text.
+
+    The column is the audit-trail foundation: without it, there's no way
+    to retroactively distinguish a corrupted mastery row (model
+    self-reported mastery_achieved=true on a "no, teach me about it"
+    refusal) from a legitimately-scored one.
+    """
+    await host.start()
+    assert host.state("aristotle") in (
+        ExtensionState.REGISTERED,
+        ExtensionState.MOUNTED,
+    ), (
+        f"ARISTOTLE should reach REGISTERED or MOUNTED; failures="
+        f"{[f.to_dict() for f in host.failures('aristotle')]}"
+    )
+
+    stores = await container.corpus_registry.get_stores("aristotle:textbook")
+
+    # The student_answer column must exist on aristotle_placement_event.
+    assert await _column_exists(stores, "aristotle_placement_event", "student_answer"), (
+        "M010 should add the student_answer column to aristotle_placement_event"
+    )
+
+    # The column is nullable — verify by inserting a row with NULL.
+    # (This also confirms the column accepts TEXT values, which is what
+    # run_placer_step writes.)
+    conn = stores.connection_manager.write_conn
+    await conn.execute(
+        "INSERT INTO aristotle_placement_event "
+        "(plan_id, concept_id, score, mastery_achieved, assessed_at, student_answer) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("test-plan-m010", "test-concept", 0.5, 0, "2026-07-16T00:00:00", None),
+    )
+    await conn.commit()
+
+    # Read it back — student_answer should be NULL.
+    cur = await conn.execute(
+        "SELECT student_answer FROM aristotle_placement_event "
+        "WHERE plan_id = ? AND concept_id = ?",
+        ("test-plan-m010", "test-concept"),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None, "INSERT should have persisted the row"
+    assert row[0] is None, (
+        f"student_answer should be NULL when not provided; got {row[0]!r}"
+    )
+
+    # Also verify a non-NULL insert works (the normal path post-M010).
+    await conn.execute(
+        "INSERT INTO aristotle_placement_event "
+        "(plan_id, concept_id, score, mastery_achieved, assessed_at, student_answer) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("test-plan-m010", "test-concept-2", 0.9, 1, "2026-07-16T00:00:01",
+         "no. teach me about it."),
+    )
+    await conn.commit()
+    cur = await conn.execute(
+        "SELECT student_answer FROM aristotle_placement_event "
+        "WHERE plan_id = ? AND concept_id = ?",
+        ("test-plan-m010", "test-concept-2"),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row[0] == "no. teach me about it.", (
+        f"student_answer should round-trip the raw text; got {row[0]!r}"
+    )
+
+
+@pytest.mark.skipif(
+    _ARISTOTLE_PKG_ROOT is None, reason="aristotle package not installed"
+)
+@pytest.mark.asyncio
 async def test_aristotle_registers_actors(host: ExtensionHost):
     """All three actors are registered via hooks.py::on_load."""
     await host.start()

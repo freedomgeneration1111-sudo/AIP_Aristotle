@@ -1553,6 +1553,76 @@ class TestPlacerStep:
         assert len(insert_calls) == 1
 
     @pytest.mark.asyncio
+    async def test_placer_step_phase2_writes_student_answer_audit_trail(self):
+        """Task 23 Fix 3: the INSERT into aristotle_placement_event includes
+        the raw student_answer text in the new student_answer column (M010).
+
+        Before M010, the placement_event only stored plan_id, concept_id,
+        score, mastery_achieved, assessed_at — there was no way to
+        retroactively distinguish a corrupted mastery row (model
+        self-reported mastery_achieved=true on a refusal) from a
+        legitimately-scored one. This test pins that the raw answer text
+        is now captured for the audit trail.
+        """
+        from aristotle.actors.intake import PlacerSession, run_placer_step
+
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+        # A distinctive answer string we can search for in the INSERT params.
+        audit_answer = "objects resist changes in motion — audit trail test"
+        result = await run_placer_step(session, audit_answer, ctx)
+        assert result["concepts_placed"] == 1
+
+        # Find the placement_event INSERT + verify:
+        #   1. The SQL includes the student_answer column
+        #   2. The params tuple includes the raw student_input
+        insert_calls = [
+            (sql, params)
+            for sql, params in conn._executed
+            if "INSERT INTO aristotle_placement_event" in sql
+        ]
+        assert len(insert_calls) == 1, (
+            f"expected exactly 1 placement_event INSERT; got {len(insert_calls)}"
+        )
+        sql, params = insert_calls[0]
+        # The SQL must name the student_answer column (M010 schema).
+        assert "student_answer" in sql, (
+            f"placement_event INSERT must include the student_answer column "
+            f"(M010 schema); SQL was: {sql}"
+        )
+        # The params tuple must include the raw student_input.
+        # Order per the INSERT: (plan_id, concept_id, score, mastery_achieved,
+        # assessed_at, student_answer) → student_answer is params[5].
+        assert len(params) == 6, (
+            f"expected 6 params (plan_id, concept_id, score, mastery_achieved, "
+            f"assessed_at, student_answer); got {len(params)}: {params}"
+        )
+        assert params[5] == audit_answer, (
+            f"student_answer param (params[5]) must be the raw student_input "
+            f"({audit_answer!r}); got {params[5]!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_placer_step_phase2_mastered_upserts_mastery(self):
         """Phase 2: when mastery_achieved, upserts aristotle_mastery (repetitions=3)."""
         from aristotle.actors.intake import PlacerSession, run_placer_step

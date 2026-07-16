@@ -932,6 +932,327 @@ class TestExaminerResilience:
 
 
 # --------------------------------------------------------------------------
+# Task 23 — decline-to-answer gate + mastery-scoring integrity
+# --------------------------------------------------------------------------
+
+
+class TestExaminerDeclineGate:
+    """Task 23 Fix 1: examiner.evaluate() gates on decline-to-answer phrases
+    BEFORE calling the model. A live placement run showed the tutor walking
+    through 7 concepts while the student answered "no. teach me about it."
+    to every single one — and the system kept advancing to a NEW concept
+    each time instead of teaching any of them. Root cause: the free-tier
+    model mishandled the refusal-style non-content answer and self-reported
+    mastery_achieved=true. The gate lives INSIDE evaluate() so every caller
+    (placement, quiz-check, any future caller) gets it for free.
+    """
+
+    @pytest.mark.asyncio
+    async def test_decline_phrases_skip_model_call(self, monkeypatch):
+        """Each string in _DECLINE_PATTERNS returns mastery_achieved=False
+        WITHOUT calling the model. The fake model is wired but should
+        receive zero calls."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        from aristotle.actors.examiner import _DECLINE_PATTERNS
+
+        # Use a few representative decline phrases (not the whole set —
+        # the test would be slow + brittle). Cover: bare "no", "idk",
+        # "teach me about it", "no. teach me about it" (the exact phrase
+        # from the production transcript).
+        test_phrases = [
+            "no",
+            "idk",
+            "i don't know",
+            "teach me",
+            "teach me about it",
+            "no. teach me about it",
+            "no, teach me about it",
+            "just teach me",
+            "pass",
+            "skip",
+            "No. Teach me about it.",  # mixed case + trailing period
+            "  teach me  ",  # leading/trailing whitespace
+        ]
+        for phrase in test_phrases:
+            fake = _FakeModelProvider(
+                responses={"evaluation": json.dumps({"score": 1.0, "mastery_achieved": True, "feedback": "should not be called", "diagnosis": None})}
+            )
+            conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+            ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+            examiner = ExaminerActor()
+            result = await examiner.evaluate(
+                ctx, "c1", phrase, "What is inertia?"
+            )
+            assert result.ok, (
+                f"decline phrase {phrase!r} should return ok=True (not a failure)"
+            )
+            assert result.data["mastery_achieved"] is False, (
+                f"decline phrase {phrase!r} must return mastery_achieved=False — "
+                f"the student explicitly declined, so don't grade"
+            )
+            assert result.data["score"] == 0.0, (
+                f"decline phrase {phrase!r} must return score=0.0"
+            )
+            assert len(fake.calls) == 0, (
+                f"decline phrase {phrase!r} must NOT call the model — "
+                f"the gate should short-circuit before the model call. "
+                f"Got {len(fake.calls)} call(s)."
+            )
+
+    @pytest.mark.asyncio
+    async def test_genuine_answer_starting_with_no_is_not_gated(self, monkeypatch):
+        """REGRESSION TEST (the one that matters most): a genuine content
+        answer that happens to start with "no" (e.g. "no, it binds
+        non-covalently to the receptor") must NOT trigger the gate — it
+        must reach the model and be graded normally.
+
+        This is the false-positive case the gate is designed to avoid.
+        If this test fails, the gate is too loose and is silently
+        dropping real answers.
+        """
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        # Model returns a real grade for a real answer.
+        eval_json = json.dumps({
+            "score": 0.85,
+            "mastery_achieved": True,
+            "feedback": "Yes — non-covalent binding is correct.",
+            "diagnosis": None,
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        # The answer starts with "no" but is clearly a content attempt.
+        result = await examiner.evaluate(
+            ctx, "c1",
+            "no, it binds non-covalently to the receptor",
+            "How does the ligand bind?",
+        )
+        assert result.ok, f"genuine answer should reach the model; error={result.error}"
+        assert result.data["score"] == 0.85, (
+            "genuine answer should be graded by the model, not gated"
+        )
+        assert len(fake.calls) == 1, (
+            "genuine answer MUST reach the model — the gate must not fire "
+            "on a real content answer that happens to start with 'no'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_long_teach_me_question_is_not_gated(self, monkeypatch):
+        """A long message that includes 'teach me' (e.g. a real question
+        like "Can you teach me more about how the receptor binds? I think
+        it's covalent") is NOT a pure decline — it's a content attempt
+        with a question. The 40-char ceiling on the 'teach me' substring
+        check ensures this reaches the model."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        eval_json = json.dumps({
+            "score": 0.4,
+            "mastery_achieved": False,
+            "feedback": "Partial — you mentioned covalent, but it's non-covalent.",
+            "diagnosis": {
+                "misconception": "thought it was covalent",
+                "why_wrong": "it's non-covalent",
+                "corrective": "non-covalent binding",
+            },
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        long_question = (
+            "Can you teach me more about how the receptor binds? I think it's covalent"
+        )
+        result = await examiner.evaluate(
+            ctx, "c1", long_question, "How does the ligand bind?",
+        )
+        assert result.ok
+        assert len(fake.calls) == 1, (
+            "long question containing 'teach me' must reach the model — "
+            "the 40-char ceiling prevents the substring match from gating "
+            "real questions"
+        )
+        assert result.data["score"] == 0.4
+
+    @pytest.mark.asyncio
+    async def test_decline_feedback_is_gentle_not_grading(self, monkeypatch):
+        """The feedback string on a decline is gentle ("No problem — let's
+        move on to teaching this one."), NOT a grading judgment. The
+        student explicitly declined, so the message should not imply the
+        answer was wrong."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        fake = _FakeModelProvider()
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "no. teach me about it.", "What is inertia?"
+        )
+        assert result.ok
+        feedback = result.data["feedback"]
+        # Gentle: does NOT contain grading words like "wrong", "incorrect",
+        # "not quite". DOES contain a "let's move on" signal.
+        assert "wrong" not in feedback.lower()
+        assert "incorrect" not in feedback.lower()
+        assert "not quite" not in feedback.lower()
+        assert "no problem" in feedback.lower() or "let's move on" in feedback.lower(), (
+            f"decline feedback should be gentle, not a grading judgment; got: {feedback!r}"
+        )
+
+
+class TestExaminerMasteryDerivation:
+    """Task 23 Fix 2: evaluate() derives mastery_achieved IN CODE from
+    score >= mastery_threshold, ignoring the model's self-reported boolean.
+
+    A live placement run showed the model self-reporting
+    mastery_achieved=true on refusal-style non-content answers. Even with
+    Fix 1's gate, we can't trust the model's boolean — it could return an
+    internally inconsistent response (score=0.3 + mastery_achieved=true).
+    The code now overrides with the deterministic threshold check.
+    """
+
+    @pytest.mark.asyncio
+    async def test_inconsistent_low_score_high_mastery_overridden(self, monkeypatch):
+        """Model returns score=0.3 + mastery_achieved=true (inconsistent).
+        Code must override mastery_achieved to False (0.3 < 0.7 threshold)."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        eval_json = json.dumps({
+            "score": 0.3,
+            "mastery_achieved": True,  # inconsistent with score
+            "feedback": "should be overridden",
+            "diagnosis": None,
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "a guess", "What is inertia?"
+        )
+        assert result.ok
+        assert result.data["score"] == 0.3
+        assert result.data["mastery_achieved"] is False, (
+            "mastery_achieved must be DERIVED from score (0.3 < 0.7), "
+            "not trusted from the model's self-report (which said True)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_inconsistent_high_score_low_mastery_overridden(self, monkeypatch):
+        """Model returns score=0.9 + mastery_achieved=false (inconsistent).
+        Code must override mastery_achieved to True (0.9 >= 0.7 threshold)."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        eval_json = json.dumps({
+            "score": 0.9,
+            "mastery_achieved": False,  # inconsistent with score
+            "feedback": "should be overridden",
+            "diagnosis": None,
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "objects resist changes in motion", "What is inertia?"
+        )
+        assert result.ok
+        assert result.data["score"] == 0.9
+        assert result.data["mastery_achieved"] is True, (
+            "mastery_achieved must be DERIVED from score (0.9 >= 0.7), "
+            "not trusted from the model's self-report (which said False)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_consistent_response_passes_through(self, monkeypatch):
+        """When the model's score + mastery_achieved are consistent, the
+        derived value matches the model's report. Regression check that
+        Fix 2 didn't break the happy path."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        eval_json = json.dumps({
+            "score": 0.8,
+            "mastery_achieved": True,  # consistent
+            "feedback": "Good.",
+            "diagnosis": None,
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "objects resist changes in motion", "What is inertia?"
+        )
+        assert result.ok
+        assert result.data["score"] == 0.8
+        assert result.data["mastery_achieved"] is True
+
+    @pytest.mark.asyncio
+    async def test_mastery_threshold_from_config(self, monkeypatch):
+        """The derived mastery_achieved uses the config's mastery_threshold
+        (default 0.7). Verify a custom threshold is respected."""
+        async def _no_sleep(_seconds):
+            pass
+        monkeypatch.setattr(
+            "aristotle.actors.examiner.asyncio.sleep", _no_sleep
+        )
+
+        eval_json = json.dumps({
+            "score": 0.6,
+            "mastery_achieved": False,
+            "feedback": "ok",
+            "diagnosis": None,
+        })
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        # Custom config with mastery_threshold=0.5
+        config = type("C", (), {"mastery_threshold": 0.5})()
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn), config=config)
+        examiner = ExaminerActor()
+        result = await examiner.evaluate(
+            ctx, "c1", "a guess", "What is inertia?"
+        )
+        assert result.ok
+        assert result.data["score"] == 0.6
+        # 0.6 >= 0.5 (custom threshold) → True, even though the model said False
+        assert result.data["mastery_achieved"] is True, (
+            "derived mastery should use the config's mastery_threshold (0.5), "
+            "so score=0.6 → mastery_achieved=True"
+        )
+
+
+# --------------------------------------------------------------------------
 # Task 21 — SOCRATES prompt length + register (Fix 4)
 # --------------------------------------------------------------------------
 

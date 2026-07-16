@@ -69,6 +69,84 @@ def _strip_json_fences(text: str) -> str:
     return cleaned.strip()
 
 
+# ---------------------------------------------------------------------------
+# Task 23 Fix 1 — decline-to-answer gate
+# ---------------------------------------------------------------------------
+#
+# A live placement run showed the tutor walking through 7 different concepts
+# while the student answered "no. teach me about it." to every single one —
+# and the system kept advancing to a NEW concept each time instead of
+# teaching any of them. Root cause: run_placer_step sends whatever the
+# student typed straight to examiner.evaluate(), which sends it to the
+# grading model. The free-tier model mishandled the refusal-style non-content
+# answer and self-reported mastery_achieved=true, so run_placer_step wrote
+# a permanent aristotle_mastery row (repetitions=3, mastered=1) and advanced.
+#
+# Fix 1 lives INSIDE evaluate() (not in run_placer_step or session.py) so
+# every caller gets the gate for free — placement, the quiz-check path, and
+# any future caller. The gate runs BEFORE any model call, so a decline
+# doesn't burn an LLM token and can't be mis-graded.
+#
+# The pattern list is intentionally TIGHT — favor false negatives over false
+# positives. A genuine content answer that happens to start with "no" (e.g.
+# "no, it binds non-covalently to the receptor") must NOT trigger the gate.
+# If you're not confident a pattern is unambiguous, leave it out.
+
+_DECLINE_PATTERNS = frozenset({
+    "no",
+    "i don't know",
+    "i dont know",
+    "idk",
+    "not sure",
+    "skip",
+    "pass",
+    "teach me",
+    "teach me about it",
+    "teach me about that",
+    "just teach me",
+    "i don't know, teach me",
+    "i dont know, teach me",
+    "no, teach me",
+    "no, teach me about it",
+    "no. teach me about it",
+    "no. teach me",
+})
+
+
+def _is_decline_to_answer(text: str) -> bool:
+    """Return True if the student's answer is an explicit decline, not a
+    content attempt.
+
+    Normalizes (strip whitespace, lowercase, strip trailing punctuation)
+    then checks against _DECLINE_PATTERNS. Also catches short variants
+    that clearly contain the "teach me" signal without being a real
+    content attempt — but only when the text is short (< 40 chars), so
+    a long answer that happens to include "teach me" (e.g. "Can you
+    teach me more about how the receptor binds? I think it's covalent")
+    is NOT caught — that's a real content attempt with a question, and
+    the model should grade it.
+
+    Designed to favor false negatives over false positives: when in
+    doubt, send the answer to the model. The model can grade a genuine
+    "I don't know" as score=0.0 safely; the danger is the reverse
+    (gate-firing on a real answer and skipping the model).
+    """
+    if not text:
+        return False
+    normalized = text.strip().lower().rstrip(".!?;,:")
+    if not normalized:
+        return False
+    if normalized in _DECLINE_PATTERNS:
+        return True
+    # Catch short "teach me" variants that clearly contain the decline
+    # signal without being a real content attempt. The 40-char ceiling
+    # is deliberate — a longer message that includes "teach me" is
+    # almost certainly a real question, not a pure decline.
+    if "teach me" in normalized and len(normalized) < 40:
+        return True
+    return False
+
+
 async def _call_with_retry(
     model_provider: Any,
     *,
@@ -292,6 +370,44 @@ class ExaminerActor:
 
         mastery_threshold = getattr(config, "mastery_threshold", 0.7) if config else 0.7
 
+        # Task 23 Fix 1 — decline-to-answer gate. Before calling the model,
+        # check whether the student explicitly declined to answer ("no",
+        # "i don't know", "teach me about it", etc.). If so, skip the model
+        # call entirely and return score=0.0, mastery_achieved=False with a
+        # gentle feedback string. This is NOT a grading judgment — it's a
+        # "the student didn't attempt, so don't grade" signal.
+        #
+        # Why this lives HERE (inside evaluate()) and not in the callers
+        # (run_placer_step, session.py's quiz-check path): every caller
+        # gets the gate for free, and there's no risk of a future caller
+        # forgetting to add it. The downstream code already handles
+        # mastery_achieved=False correctly (placement advances to the next
+        # concept without writing a mastery row; the quiz-check path routes
+        # to HINT_1/REMEDIATE), so no caller changes are needed.
+        #
+        # The gate is intentionally tight (see _is_decline_to_answer's
+        # docstring) — false negatives are safe (the model grades a genuine
+        # "I don't know" as 0.0), false positives are dangerous (gate fires
+        # on a real answer and skips the model). The regression test that
+        # matters most: a genuine content answer beginning with "no" (e.g.
+        # "no, it binds non-covalently") must NOT trigger the gate.
+        if _is_decline_to_answer(student_answer):
+            logger.info(
+                "examiner_evaluate_declined concept=%s — student declined to answer, skipping model call",
+                concept_id,
+            )
+            return ActorResult(
+                ok=True,
+                data={
+                    "score": 0.0,
+                    "mastery_achieved": False,
+                    "feedback": (
+                        "No problem — let's move on to teaching this one."
+                    ),
+                    "diagnosis": None,
+                },
+            )
+
         # Phase B.5: the prompt now requests a diagnosis block when the
         # answer is wrong. Exact field names + structure — no ambiguity.
         system_prompt = (
@@ -398,9 +514,28 @@ class ExaminerActor:
             # null/absent when correct — normalize to None.
             if not isinstance(eval_data, dict):
                 raise ValueError("model response is not a JSON object")
+            # Task 23 Fix 2 — derive mastery_achieved IN CODE from the
+            # parsed score, ignoring whatever boolean the model put in
+            # its own JSON. The model's self-report is not verified and
+            # can be internally inconsistent (e.g. score=0.3 +
+            # mastery_achieved=true) — this was the live failure mode in
+            # the placement session that motivated this task: the model
+            # self-reported mastery_achieved=true on refusal-style
+            # non-content answers, and run_placer_step wrote a permanent
+            # aristotle_mastery row (repetitions=3, mastered=1) for
+            # concepts the student explicitly said they didn't know.
+            #
+            # Deriving in code closes the gap: the model's score is still
+            # trusted (it's a continuous value the model is good at), but
+            # the boolean threshold check is deterministic. If the model
+            # returns score=0.9 + mastery_achieved=false, the code
+            # overrides to mastery_achieved=true. If it returns score=0.3
+            # + mastery_achieved=true, the code overrides to false. The
+            # model's mastery_achieved field is effectively ignored.
+            parsed_score = float(eval_data.get("score", 0.0))
             normalized = {
-                "score": float(eval_data.get("score", 0.0)),
-                "mastery_achieved": bool(eval_data.get("mastery_achieved", False)),
+                "score": parsed_score,
+                "mastery_achieved": parsed_score >= mastery_threshold,
                 "feedback": str(eval_data.get("feedback", "")),
                 "diagnosis": eval_data.get("diagnosis")
                 if eval_data.get("diagnosis") is not None

@@ -1913,16 +1913,26 @@ async def run_placer_step(
                 stores = await registry.get_stores("aristotle:textbook")
                 conn = stores.connection_manager.write_conn
                 now = datetime.now(timezone.utc).isoformat()
+                # Task 23 Fix 3 — include the raw student_answer text in
+                # the placement_event row. M010 added the student_answer
+                # column for audit-trail purposes: without it, there's no
+                # way to retroactively distinguish a corrupted mastery row
+                # (model self-reported mastery_achieved=true on a refusal)
+                # from a legitimately-scored one. The column is nullable,
+                # so old DBs that pre-date M010 would tolerate a NULL here
+                # — but the migration runner applies M010 before this code
+                # path runs, so the column always exists in practice.
                 await conn.execute(
                     "INSERT INTO aristotle_placement_event "
-                    "(plan_id, concept_id, score, mastery_achieved, assessed_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "(plan_id, concept_id, score, mastery_achieved, assessed_at, student_answer) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         session.plan_id,
                         concept_id,
                         score,
                         1 if mastery_achieved else 0,
                         now,
+                        student_input,
                     ),
                 )
                 await conn.commit()

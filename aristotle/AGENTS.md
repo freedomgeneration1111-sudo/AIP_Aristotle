@@ -211,6 +211,50 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   return the actor's `ActorResult` directly (or re-wrap with `data=`
   populated), never re-wrap with only `error=` — that's the pre-B.5
   pattern the platform is migrating away from.
+- **`examiner.evaluate()` gates on decline-to-answer phrases (Task 23 Fix 1).**
+  Before any model call, `evaluate()` checks `_is_decline_to_answer(student_answer)`.
+  If the student explicitly declined ("no", "idk", "teach me about it",
+  "no. teach me about it", etc.), the model call is skipped entirely
+  and the method returns `score=0.0, mastery_achieved=False` with a
+  gentle feedback string. This lives INSIDE `evaluate()` so every caller
+  (placement, quiz-check, any future caller) gets it for free — no
+  caller-side changes needed. The pattern list (`_DECLINE_PATTERNS` in
+  `examiner.py`) is intentionally TIGHT: false negatives are safe (the
+  model grades a genuine "I don't know" as 0.0), false positives are
+  dangerous (gate fires on a real answer and skips the model). If you
+  add a new decline phrase, make sure it's unambiguous — "no" alone is
+  in the list, but "nope" or "nah" are NOT (a learner might type "nope,
+  it's covalent" as a real answer). The regression test
+  `test_genuine_answer_starting_with_no_is_not_gated` pins the
+  false-positive case.
+- **`examiner.evaluate()` derives `mastery_achieved` in code (Task 23 Fix 2).**
+  The model's self-reported `mastery_achieved` boolean is IGNORED —
+  only its `score` (a continuous value) is trusted. The code computes
+  `mastery_achieved = parsed_score >= mastery_threshold`. This closes
+  the gap where a model could return an internally inconsistent
+  response (e.g. `score=0.3, mastery_achieved=true`) and have it pass
+  through unverified. The model's `mastery_achieved` field is still in
+  the JSON schema (for backward compat with any consumer that reads
+  the raw response), but `evaluate()`'s returned `data["mastery_achieved"]`
+  is always the code-derived value.
+- **`aristotle_placement_event.student_answer` column (Task 23 Fix 3, M010).**
+  The migration added a nullable `student_answer TEXT` column to
+  `aristotle_placement_event`. `run_placer_step` now writes the raw
+  student_input text there. Old rows (pre-M010) have NULL. This is the
+  audit-trail foundation — without it, there's no way to retroactively
+  distinguish a corrupted mastery row from a legitimately-scored one.
+  The `scripts/audit_placement_mastery.py` script joins mastery rows
+  against placement events on (plan_id, concept_id) and shows the
+  student_answer text so Moses can eyeball which concept_ids look
+  corrupted (e.g. `mastered=1` + `student_answer="no. teach me about it."`).
+- **Audit + reset scripts live in `scripts/` (Task 23 Fix 4).**
+  `scripts/audit_placement_mastery.py` (read-only) and
+  `scripts/reset_mastery_for_concepts.py` (targeted delete, requires
+  explicit concept_id list — NEVER a blanket plan-wide reset). Both
+  resolve the DB path via `importlib.resources` (same pattern as the
+  ExtensionHost). The reset script has `--dry-run` + interactive TTY
+  confirmation. Use the audit script first to identify corrupted rows,
+  then feed the explicit concept_id list to the reset script.
 - **COMPLETE-trigger idempotency guard only catches the post-completion
   case, not the in-flight race.** Task 21 Fix 5 added a guard in
   `aristotle/actors/intake.py::run_intake_step` that blocks re-trigger
@@ -225,7 +269,72 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   structural fixes that would close the gap.
 
 ## Last Cycle
-- **Task 22 — Fix /session/step output field (TEACH/PROBE/QUIZ outputs were silently dropped)** (this cycle):
+- **Task 23 — Decline-to-answer gate + mastery-scoring integrity + audit trail** (this cycle):
+  - **Fix 1 — Decline-to-answer gate inside `evaluate()`**
+    (`aristotle/actors/examiner.py`): added `_DECLINE_PATTERNS` (tight
+    frozenset: "no", "i don't know", "idk", "teach me about it",
+    "no. teach me about it", etc.) + `_is_decline_to_answer()` helper.
+    At the top of `evaluate()`, BEFORE any model call, the gate checks
+    the normalized student_answer. If it matches: skip the model call
+    entirely, return `score=0.0, mastery_achieved=False` with a gentle
+    "No problem — let's move on to teaching this one." feedback. The
+    gate lives INSIDE `evaluate()` (not in `run_placer_step` or
+    `session.py`) so every caller gets it for free. The pattern list is
+    intentionally tight — favors false negatives over false positives.
+    A genuine content answer beginning with "no" (e.g. "no, it binds
+    non-covalently") is NOT gated (regression test pins this). A long
+    message containing "teach me" (e.g. a real question) is NOT gated
+    (40-char ceiling on the substring match). 4 new tests in
+    `TestExaminerDeclineGate`.
+  - **Fix 2 — Derive `mastery_achieved` in code, don't trust the model**
+    (`aristotle/actors/examiner.py::evaluate()`): replaced
+    `bool(eval_data.get("mastery_achieved", False))` with
+    `parsed_score >= mastery_threshold`. The model's self-reported
+    boolean is now ignored — only its `score` (a continuous value the
+    model is good at) is trusted. This closes the gap where a model
+    could return an internally inconsistent response (e.g.
+    `score=0.3, mastery_achieved=true`) and have it pass through
+    unverified — which was the live failure mode in the placement
+    session. 4 new tests in `TestExaminerMasteryDerivation` (inconsistent
+    low-score/high-mastery overridden, inconsistent high-score/low-
+    mastery overridden, consistent response passes through, custom
+    mastery_threshold from config is respected).
+  - **Fix 3 — Store raw answer in `aristotle_placement_event`**
+    (new migration `M010_placement_event_answer_text.sql` + INSERT
+    update in `aristotle/actors/intake.py::run_placer_step`): the
+    migration adds a nullable `student_answer TEXT` column to
+    `aristotle_placement_event`. The INSERT in `run_placer_step` now
+    includes the raw `student_input` in that column. Old rows (written
+    before M010) have NULL — correct, since the old answers were never
+    captured. New rows have the raw text. This is the audit-trail
+    foundation: without it, there's no way to retroactively distinguish
+    a corrupted mastery row from a legitimately-scored one. 1 new
+    migration test `test_aristotle_m010_adds_placement_event_student_answer`
+    (verifies column exists + nullable + round-trips text) + 1 new
+    placer test `test_placer_step_phase2_writes_student_answer_audit_trail`
+    (verifies the INSERT includes the student_answer column + the raw
+    text in the params tuple).
+  - **Fix 4 — Read-only audit + targeted reset scripts**
+    (`scripts/audit_placement_mastery.py` + `scripts/reset_mastery_for_concepts.py`):
+    two standalone Python scripts that use `sqlite3` directly against
+    the `aristotle:textbook` corpus DB (resolved via `importlib.resources`,
+    same pattern as the ExtensionHost). The audit script takes a
+    `plan_id` and prints every `aristotle_mastery` row with `mastered=1`
+    joined against its originating `aristotle_placement_event` row,
+    showing concept_id, score, assessed_at, and the raw student_answer
+    (or `<NULL — pre-M010>` for rows that predate the migration, or
+    `<no placement event — set by tutoring session>` for mastery rows
+    set outside placement). The reset script takes a `plan_id` + an
+    EXPLICIT list of `concept_id`s and deletes those specific
+    `aristotle_mastery` rows — it will NEVER do a blanket plan-wide
+    reset. Has `--dry-run` (print what would be deleted) + interactive
+    confirmation when run from a TTY. Sample output format documented
+    in the task report.
+  - **Test impact**: 240 passed / 1 skipped / 5 xfailed / 0 failures
+    (was 230/1/5/0 at Task 22 baseline; +10 new tests: 4 in
+    `TestExaminerDeclineGate`, 4 in `TestExaminerMasteryDerivation`, 1
+    placer audit-trail test, 1 M010 migration test). No regressions.
+- **Task 22 — Fix /session/step output field (TEACH/PROBE/QUIZ outputs were silently dropped)** (prior cycle):
   - **Fix 1** (`aristotle/api.py::session_step_route`): the `output` field
     was computed as `result.error or result.data.get("prompt", "") or ""`,
     which only ever read the `prompt` key. But `_step_teach()` returns

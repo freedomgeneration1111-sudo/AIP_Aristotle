@@ -1,0 +1,27 @@
+-- M010_placement_event_answer_text.sql — audit trail for placement scoring (Task 23 Fix 3).
+--
+-- Adds a student_answer column to aristotle_placement_event so the raw
+-- text the student typed during placement is captured alongside the
+-- score. Without this, there is no way to retroactively distinguish a
+-- corrupted mastery row (e.g. the model self-reported mastery_achieved=true
+-- on a "no, teach me about it" refusal) from a legitimately-scored one.
+--
+-- This is purely additive — no existing column is modified or dropped,
+-- no existing rows are touched. Old rows will have NULL in student_answer
+-- (which is the correct "we don't know what they typed" signal). New
+-- rows written after this migration ships will have the raw answer text.
+--
+-- SQLite does not support IF NOT EXISTS for ADD COLUMN. Re-running M010
+-- on a DB that already has the column would raise "duplicate column name"
+-- but this cannot happen in normal operation: the migration runner
+-- (extensions/loaders/migration_loader.py) tracks applied migrations by
+-- name in extension_applied_migrations and skips ones already recorded
+-- BEFORE executing any of their SQL.
+--
+-- IMPORTANT: the migration runner splits on semicolon naively (same as
+-- the core runner — src/aip/adapter/extensions/loaders/migration_loader.py:151).
+-- Comments must NOT contain semicolons or the split breaks mid-comment
+-- and SQLite parses comment text as SQL. This file keeps all semicolons
+-- out of comments and uses them only as SQL statement terminators.
+
+ALTER TABLE aristotle_placement_event ADD COLUMN student_answer TEXT;
