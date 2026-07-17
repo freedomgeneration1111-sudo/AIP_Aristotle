@@ -1155,3 +1155,26 @@ Stage Summary:
 - Weave-back wording decision: already handled by _step_curiosity's existing full_response append ("\n\nWant to keep exploring this, or shall we continue where we left off?"). Rendered as-is, no flag-back needed.
 - Duplicate-send investigation: the screenshot's duplicate message is explained by the bug itself (no visible response → reasonable retry). However, ask.py's _on_aristotle_send has NO disable-while-pending guard — both Send button and Enter key call asyncio.create_task(_on_aristotle_send()) with no guard against concurrent sends. NOT a one-line obviously-safe fix. Flagged back, not fixed.
 - AIP_Brain commit needed for Fix 2 (ask.py change). AIP_Aristotle commit needed for Fix 1 (api.py + tests + docs).
+
+---
+Task ID: 26
+Agent: Super Z (main)
+Task: Task 26 — Early-exit on repeated declines + probe-question tone + CHAT over-matching. Three fixes from a full dogfood session.
+
+Work Log:
+- Pulled AIP_Aristotle (already at Task 25 commit e2022f6). Read AGENTS.md, PLANNED_FEATURES.md, intake.py (run_placer_step Phase 2 branch + _finalize_placement), examiner.py (probe system prompt), session.py (_classify_student_input CHAT check).
+- _finalize_placement compatibility verified BEFORE implementing Fix 1: the function reads concept_ids_json from the PLAN (not session.concepts_to_assess), builds mastered_ids as a SET from session.results (no positional indexing), iterates the plan's full concept list to find the first NOT in mastered_ids. A partial results list (2 of 7 sampled) works correctly: un-sampled concepts are simply not in mastered_ids, so the first one becomes the starting concept. No flag-back needed.
+- Captured baseline: 254 passed / 1 skipped / 5 xfailed / 0 failed (matches Task 25 final state).
+- Fix 1 (intake.py::run_placer_step Phase 2): added early-exit check after session.results.append + before session.current_idx += 1. If len(results) >= 2 and last two both have score < 0.3, call _finalize_placement immediately + return COMPLETE. Threshold 0.3 rationale: Task 23's decline gate produces 0.0; genuine low-effort wrong answers score 0.1-0.2; < 0.3 catches both.
+- Fix 2 (examiner.py::probe system prompt): added LENGTH AND REGISTER block — "Keep it to 1-2 sentences. Plain, everyday English — no flowery opening ('my dear learner', 'fascinating substances', 'let us delve into'), just ask the question directly."
+- Fix 3 (session.py::_classify_student_input): split social_words into exact_only_words = {"no", "yes"} (exact match only, with optional trailing comma/period) + prefix_ok_words (the rest, keeping existing prefix-match behavior). "no idea", "no clue", "yes but I'm not sure" now classify as ANSWER (not CHAT). Bare "no", "no.", "yes", "yes." still classify as CHAT.
+- Wrote 9 new tests: 2 in TestPlacerStepEarlyExit (early-exit after 2 consecutive low scores; no early-exit on alternating scores), 1 in TestExaminerMethods (probe system prompt presence check), 6 in test_curiosity_path.py (no idea/no clue not CHAT; bare no/yes still CHAT; yes but not sure not CHAT; other social words still prefix match).
+- One test failure during development: test_no_early_exit_on_alternating_scores used "i don't know" as student_input for turn 1, but Task 23's decline gate in examiner.evaluate() catches "i don't know" and returns score=0.0 WITHOUT calling the model — which skewed the fake model's score cycling. Fixed by using wrong content answers ("it's about friction", "it's about gravity") that reach the model and get scored normally.
+- Final test run: 263 passed / 1 skipped / 5 xfailed / 0 failures (was 254/1/5/0; +9 new tests, no regressions).
+- Updated aristotle/AGENTS.md (Last Cycle + 3 new Known Gotchas: early-exit, probe constraint, CHAT exact-match). Updated PLANNED_FEATURES.md Change Log. Appended this worklog entry.
+
+Stage Summary:
+- All 3 fixes implemented exactly as specified.
+- 9 new tests, all passing. No regressions.
+- _finalize_placement compatibility verified before shipping: reads the plan's concept_ids_json (not session.concepts_to_assess), builds mastered_ids as a SET (no positional indexing), finds the first non-mastered concept. Partial results work correctly. No flag-back needed.
+- Nothing else uncertain to flag back.

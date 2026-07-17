@@ -2065,6 +2065,50 @@ async def run_placer_step(
                         exc,
                     )
 
+        # Task 26 Fix 1 — early-exit on repeated low scores. If the last
+        # two evaluated concepts both scored below 0.3, stop sampling —
+        # the student is clearly struggling across different concepts and
+        # continuing to probe more of them isn't useful. Call
+        # _finalize_placement immediately (same call used when
+        # current_idx reaches len(concepts_to_assess) naturally).
+        #
+        # Threshold rationale: Task 23's decline gate produces score=0.0
+        # for an explicit decline ("no", "idk", "teach me about it"). A
+        # genuine low-effort wrong attempt typically scores 0.1-0.2. So
+        # < 0.3 catches both declines AND genuine wrong answers — two in
+        # a row is a strong signal the student needs teaching, not more
+        # probing. _finalize_placement is compatible with partial results:
+        # it reads the plan's full concept_ids_json and finds the first
+        # concept NOT in the mastered set — un-sampled concepts are
+        # simply not in the mastered set, so the first un-assessed one
+        # becomes the starting concept. Verified by reading the function
+        # (no positional indexing into session.results, no count-based
+        # assumptions).
+        _LOW_SCORE_THRESHOLD = 0.3
+        if len(session.results) >= 2:
+            last_two = session.results[-2:]
+            if (
+                last_two[0].get("score", 0.0) < _LOW_SCORE_THRESHOLD
+                and last_two[1].get("score", 0.0) < _LOW_SCORE_THRESHOLD
+            ):
+                logger.info(
+                    "placer_early_exit reason=consecutive_low_scores "
+                    "concepts_placed=%d last_two_scores=%.2f,%.2f",
+                    len(session.results),
+                    last_two[0].get("score", 0.0),
+                    last_two[1].get("score", 0.0),
+                )
+                next_concept_id = await _finalize_placement(session, ctx)
+                session.state = "COMPLETE"
+                return {
+                    "state": "COMPLETE",
+                    "concepts_placed": len(session.results),
+                    "concepts_known": sum(
+                        1 for r in session.results if r.get("mastery_achieved")
+                    ),
+                    "next_concept_id": next_concept_id,
+                }
+
         # Advance to the next concept.
         session.current_idx += 1
         session.question_generated = False

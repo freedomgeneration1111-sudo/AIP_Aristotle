@@ -296,6 +296,31 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   If you add a new placement-Phase-2 branch that returns a different
   field, you MUST also add it to the `placer_step_route` response dict —
   otherwise it'll be silently dropped (same bug class Task 25 fixed).
+- **Placement early-exits on 2 consecutive low scores (Task 26 Fix 1).**
+  `run_placer_step` checks the last 2 entries in `session.results` after
+  each Phase 2 evaluate. If both have `score < 0.3`, it calls
+  `_finalize_placement` immediately — sampling stops, even if fewer than
+  `n=7` concepts have been probed. This prevents the "6 consecutive
+  declines across 6 different concepts" pattern. `_finalize_placement`
+  handles partial results correctly (reads the plan's full concept list,
+  finds the first non-mastered concept — un-sampled concepts are simply
+  not in the mastered set). If you change the threshold or the streak
+  count, update the tests in `TestPlacerStepEarlyExit`.
+- **`examiner.probe()` has a length/register constraint (Task 26 Fix 2).**
+  The probe system prompt includes a `LENGTH AND REGISTER` block: 1-2
+  sentences, plain everyday English, no flowery openings. Same spirit as
+  Task 21 Fix 4 for `socrates.py`. If you remove or weaken it, the
+  presence test `test_probe_system_prompt_has_length_register_constraint`
+  will fail.
+- **CHAT classifier requires exact match for "no" and "yes" (Task 26 Fix 3).**
+  `"no"` and `"yes"` are carved out of the general prefix-matching loop
+  in `_classify_student_input` — they require an exact match (with
+  optional trailing comma/period). This prevents "no idea", "no clue",
+  "yes but I'm not sure" from matching CHAT (they're substantive content
+  / decline phrasings). The rest of `social_words` (ok, thanks, sure,
+  etc.) keep the existing prefix-match behavior. If you add a new
+  `social_word` with a similar collision risk, add it to the
+  `exact_only_words` set, not the `prefix_ok_words` tuple.
 - **COMPLETE-trigger idempotency guard only catches the post-completion
   case, not the in-flight race.** Task 21 Fix 5 added a guard in
   `aristotle/actors/intake.py::run_intake_step` that blocks re-trigger
@@ -310,7 +335,56 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   structural fixes that would close the gap.
 
 ## Last Cycle
-- **Task 25 — Surface curiosity answers through the placement route and frontend** (this cycle):
+- **Task 26 — Early-exit on repeated declines + probe-question tone + CHAT over-matching** (this cycle):
+  - **Fix 1 — Early-exit placement on repeated low scores**
+    (`aristotle/actors/intake.py::run_placer_step`, Phase 2 branch):
+    after appending to `session.results`, checks the last 2 entries. If
+    both have `score < 0.3`, calls `_finalize_placement` immediately
+    instead of advancing to the next sampled concept. Stops the live
+    bug where 6 consecutive "i don't know" / "idk" / "no idea" answers
+    across 6 different concepts kept sampling more. Threshold rationale:
+    Task 23's decline gate produces score=0.0; a genuine low-effort wrong
+    attempt scores 0.1-0.2; so < 0.3 catches both. `_finalize_placement`
+    compatibility verified: it reads the plan's full `concept_ids_json`
+    and finds the first concept NOT in the mastered set — no positional
+    indexing into `session.results`, no count-based assumptions. A
+    partial results list (2 of 7 sampled) works correctly: un-sampled
+    concepts are simply not in the mastered set, so the first un-assessed
+    one becomes the starting concept. 2 new tests in `TestPlacerStepEarlyExit`.
+  - **Fix 2 — Length/register constraint for `examiner.probe()`**
+    (`aristotle/actors/examiner.py::probe()` system prompt): added a
+    `LENGTH AND REGISTER` block — "Keep it to 1-2 sentences. Plain,
+    everyday English — no flowery opening ('my dear learner',
+    'fascinating substances', 'let us delve into'), just ask the question
+    directly." Same spirit as Task 21 Fix 4 for `socrates.py`, adapted
+    for a much shorter interaction (a probe is one question, not an
+    explanation). 1 new test asserting the system prompt string contains
+    the constraint (presence check — LLM output length can't be tested
+    deterministically).
+  - **Fix 3 — Tighten CHAT classifier's "no"/"yes" matching**
+    (`aristotle/session.py::_classify_student_input`): carved "no" and
+    "yes" out of the general prefix-matching loop and require exact match
+    only (`lower == "no"`, `lower == "yes"`, with optional trailing
+    comma/period). The rest of `social_words` (ok, thanks, sure, etc.)
+    keep the existing prefix-match behavior — they don't have the same
+    collision risk. Fixes: "no idea", "no clue", "yes but I'm not sure"
+    no longer match CHAT (they're substantive content / decline
+    phrasings, not bare acknowledgments). Bare "no", "no.", "yes", "yes."
+    still classify as CHAT (regression — legitimate case preserved).
+    6 new tests in `test_curiosity_path.py`.
+  - **Test impact**: 263 passed / 1 skipped / 5 xfailed / 0 failures
+    (was 254/1/5/0 at Task 25 baseline; +9 new tests: 2 early-exit,
+    1 probe prompt, 6 CHAT classifier). No regressions.
+  - **`_finalize_placement` compatibility**: verified before shipping.
+    The function reads `concept_ids_json` from the PLAN (not from
+    `session.concepts_to_assess`), builds a `mastered_ids` SET from
+    `session.results` (set membership, no positional indexing), and
+    iterates the plan's full concept list to find the first NOT in
+    `mastered_ids`. A partial `results` list (e.g., 2 of 7 sampled
+    concepts) works correctly: un-sampled concepts are simply not in
+    `mastered_ids`, so the first one becomes the starting concept.
+    No flag-back needed.
+- **Task 25 — Surface curiosity answers through the placement route and frontend** (prior cycle):
   - **Fix 1 — `placer_step_route` passes `response` + `intent_class` through**
     (`aristotle/api.py::placer_step_route`): the route's HTTP response
     dict previously built from only `state`, `question`, `concepts_placed`,

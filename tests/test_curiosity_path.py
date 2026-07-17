@@ -171,6 +171,77 @@ def test_classify_existing_behavior_preserved():
 
 
 # ---------------------------------------------------------------------------
+# Task 26 Fix 3 — tighten CHAT classifier's "no"/"yes" matching
+# ---------------------------------------------------------------------------
+
+
+def test_classify_no_idea_is_not_chat():
+    """Task 26 Fix 3: 'no idea' must NOT classify as CHAT.
+
+    Before the fix, 'no' was in social_words with prefix matching, so
+    'no idea' matched lower.startswith('no ') → CHAT. But 'no idea' is
+    a realistic decline phrasing, not a bare acknowledgment — it should
+    reach the decline gate (Task 23) via the ANSWER path, or be classified
+    as substantive content.
+    """
+    assert _classify_student_input("no idea") != "CHAT", (
+        "'no idea' must NOT classify as CHAT — it's a decline phrasing, "
+        "not a bare acknowledgment"
+    )
+
+
+def test_classify_no_clue_is_not_chat():
+    """Task 26 Fix 3: 'no clue' must NOT classify as CHAT (same as 'no idea')."""
+    assert _classify_student_input("no clue") != "CHAT", (
+        "'no clue' must NOT classify as CHAT — it's a decline phrasing"
+    )
+
+
+def test_classify_bare_no_still_chat():
+    """Task 26 Fix 3 regression: bare 'no' must STILL classify as CHAT.
+
+    The fix carves 'no' out of the prefix-matching loop and requires an
+    EXACT match. Bare 'no' (the legitimate social-acknowledgment case)
+    must still be CHAT — don't break it.
+    """
+    assert _classify_student_input("no") == "CHAT"
+    assert _classify_student_input("no.") == "CHAT"
+    assert _classify_student_input("no,") == "CHAT"
+
+
+def test_classify_bare_yes_still_chat():
+    """Task 26 Fix 3 regression: bare 'yes' must STILL classify as CHAT.
+    Same carve-out as 'no' — exact match only, but bare 'yes' still works."""
+    assert _classify_student_input("yes") == "CHAT"
+    assert _classify_student_input("yes.") == "CHAT"
+
+
+def test_classify_yes_but_im_not_sure_is_not_chat():
+    """Task 26 Fix 3: 'yes but I'm not sure' must NOT classify as CHAT.
+
+    This is a qualified answer (substantive content), not a bare
+    acknowledgment. Before the fix, it matched lower.startswith('yes ') → CHAT.
+    """
+    assert _classify_student_input("yes but I'm not sure") != "CHAT", (
+        "'yes but I'm not sure' must NOT classify as CHAT — it's a "
+        "qualified answer, not a bare acknowledgment"
+    )
+
+
+def test_classify_other_social_words_still_prefix_match():
+    """Task 26 Fix 3 regression: the rest of social_words (ok, thanks, sure,
+    etc.) keep the existing prefix-match behavior. Only 'no' and 'yes' are
+    carved out for exact-match-only."""
+    # These should all still be CHAT (prefix match).
+    assert _classify_student_input("ok") == "CHAT"
+    assert _classify_student_input("ok, got it") == "CHAT"
+    assert _classify_student_input("thanks") == "CHAT"
+    assert _classify_student_input("sure") == "CHAT"
+    assert _classify_student_input("got it") == "CHAT"
+    assert _classify_student_input("understood") == "CHAT"
+
+
+# ---------------------------------------------------------------------------
 # Test 6: _step_curiosity returns intent_class + weave-back
 # ---------------------------------------------------------------------------
 

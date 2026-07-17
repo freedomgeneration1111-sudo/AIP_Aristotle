@@ -362,14 +362,22 @@ def _classify_student_input(text: str) -> str:
     # CHAT signals — short social acknowledgments
     word_count = len(stripped.split())
     if word_count <= 4:
-        social_words = (
+        # Task 26 Fix 3: "no" and "yes" are carved out of the general
+        # prefix-matching loop because they have a high collision risk
+        # with substantive content. "no idea", "no clue", "yes but I'm
+        # not sure" are real content (declines or qualified answers),
+        # not bare acknowledgments — but the old prefix match
+        # (lower.startswith("no ")) caught them all as CHAT. Require an
+        # EXACT match for these two specifically; the rest of social_words
+        # (ok, thanks, sure, etc.) keep the existing prefix-match behavior
+        # because they don't have the same collision risk.
+        exact_only_words = {"no", "yes"}
+        prefix_ok_words = (
             "ok",
             "okay",
             "cool",
             "thanks",
             "got it",
-            "yes",
-            "no",
             "sure",
             "right",
             "hmm",
@@ -378,9 +386,16 @@ def _classify_student_input(text: str) -> str:
             "makes sense",
             "understood",
         )
+        # Exact match for "no" / "yes" (with optional trailing comma/period,
+        # which the lower.strip().rstrip(".,") handles — but we already
+        # only stripped the whole input, so check both bare and
+        # comma-suffixed forms).
+        if lower in exact_only_words or lower.rstrip(",.") in exact_only_words:
+            return "CHAT"
+        # Prefix match for the rest (existing behavior).
         if any(
             lower == s or lower.startswith(s + " ") or lower.startswith(s + ",")
-            for s in social_words
+            for s in prefix_ok_words
         ):
             return "CHAT"
 

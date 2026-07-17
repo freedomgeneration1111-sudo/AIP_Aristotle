@@ -1811,6 +1811,185 @@ class TestPlacerStep:
 
 
 # ---------------------------------------------------------------------------
+# Task 26 Fix 1 — early-exit placement on repeated low scores
+# ---------------------------------------------------------------------------
+
+
+class TestPlacerStepEarlyExit:
+    """Task 26 Fix 1: run_placer_step early-exits when the last two evaluated
+    concepts both score below 0.3. Stops sampling further concepts and calls
+    _finalize_placement immediately — the student is clearly struggling
+    across different concepts and continuing to probe more isn't useful.
+
+    Threshold rationale: Task 23's decline gate produces score=0.0 for an
+    explicit decline. A genuine low-effort wrong attempt scores 0.1-0.2.
+    So < 0.3 catches both. Two in a row is the trigger.
+    """
+
+    @pytest.mark.asyncio
+    async def test_early_exit_after_two_consecutive_low_scores(self):
+        """Two consecutive low scores (< 0.3) → finalize after the second,
+        not after all 7 sampled concepts. _finalize_placement is called
+        with a partial results list (2 entries, not 7).
+        """
+        # Low score for both concepts — triggers early-exit.
+        eval_json = json.dumps(
+            {
+                "score": 0.0,
+                "mastery_achieved": False,
+                "feedback": "Not quite.",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(responses={"evaluation": eval_json})
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2", "c3", "c4", "c5", "c6", "c7"]',)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        # Turn 1: first low score.
+        result1 = await run_placer_step(session, "i don't know", ctx)
+        assert result1["state"] == "PROBING"  # only 1 low score so far, no early exit
+        assert len(session.results) == 1
+
+        # Turn 2: second consecutive low score → early exit.
+        # Need to set question_generated=True again (the placer resets it
+        # after each turn to generate the next probe). In the real flow,
+        # the next probe is generated automatically at the end of turn 1.
+        # Simulate that by setting question_generated=True + a current_question.
+        session.question_generated = True
+        session.current_question = "What is F=ma?"
+        result2 = await run_placer_step(session, "no idea", ctx)
+
+        assert result2["state"] == "COMPLETE", (
+            "Two consecutive low scores should trigger early exit → COMPLETE"
+        )
+        assert len(session.results) == 2, (
+            f"Only 2 concepts should have been assessed (early exit), "
+            f"not all 7; got {len(session.results)}"
+        )
+        # _finalize_placement found the first non-mastered concept (c1).
+        assert result2["next_concept_id"] == "c1"
+
+    @pytest.mark.asyncio
+    async def test_no_early_exit_on_alternating_scores(self):
+        """Alternating good/bad scores do NOT trigger early exit — only
+        CONSECUTIVE low scores do. A good answer after a bad one resets
+        the streak."""
+        # We'll cycle: low (0.0), high (0.9), low (0.0), high (0.9)...
+        # The early-exit should never fire because no two consecutive
+        # scores are both < 0.3.
+        scores = [0.0, 0.9, 0.0, 0.9]
+
+        class _CyclingFakeModel:
+            def __init__(self):
+                self.calls = []
+                self._idx = 0
+
+            async def call(self, slot_name, messages, **kwargs):
+                self.calls.append((slot_name, messages))
+                if slot_name == "evaluation" and "Evaluate the learner's answer" in messages[0]["content"]:
+                    # Return the next score in the cycle for evaluate calls.
+                    score = scores[self._idx % len(scores)]
+                    self._idx += 1
+                    return {
+                        "content": json.dumps({
+                            "score": score,
+                            "mastery_achieved": score >= 0.7,
+                            "feedback": "ok",
+                            "diagnosis": None,
+                        }),
+                        "model": "fake",
+                        "usage": {},
+                        "latency_ms": 1,
+                    }
+                # probe calls return a question
+                return {
+                    "content": "What is this concept?",
+                    "model": "fake",
+                    "usage": {},
+                    "latency_ms": 1,
+                }
+
+        fake = _CyclingFakeModel()
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2", "c3", "c4"]',)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2", "c3", "c4"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        # Turn 1: low (0.0) — no early exit (only 1 low score).
+        # Use a wrong content answer (not a decline phrase — Task 23's
+        # decline gate would short-circuit and not reach the model, which
+        # would skew the fake model's score cycling).
+        result1 = await run_placer_step(session, "it's about friction", ctx)
+        assert result1["state"] == "PROBING", (
+            "First low score should NOT trigger early exit"
+        )
+        assert len(session.results) == 1
+
+        # Turn 2: high (0.9) — no early exit (streak broken).
+        session.question_generated = True
+        session.current_question = "What is F=ma?"
+        result2 = await run_placer_step(session, "force equals mass times acceleration", ctx)
+        assert result2["state"] == "PROBING", (
+            "A high score after a low one should NOT trigger early exit"
+        )
+        assert len(session.results) == 2
+
+        # Turn 3: low (0.0) again — no early exit (previous was high).
+        session.question_generated = True
+        session.current_question = "What is the third law?"
+        result3 = await run_placer_step(session, "it's about gravity", ctx)
+        assert result3["state"] == "PROBING", (
+            "A low score after a high one should NOT trigger early exit — "
+            "only CONSECUTIVE low scores trigger it"
+        )
+        assert len(session.results) == 3
+
+
+# ---------------------------------------------------------------------------
 # Task 24 Fix 3 — intent classification wired into placement
 # ---------------------------------------------------------------------------
 

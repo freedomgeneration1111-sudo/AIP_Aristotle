@@ -489,6 +489,43 @@ class TestExaminerMethods:
         assert "force" in result.data["question"].lower()
 
     @pytest.mark.asyncio
+    async def test_probe_system_prompt_has_length_register_constraint(self):
+        """Task 26 Fix 2: probe()'s system prompt includes a length/register
+        constraint (same spirit as Task 21 Fix 4 for socrates.py, adapted
+        for a much shorter interaction — a probe is one question, not an
+        explanation).
+
+        We can't unit-test LLM output length deterministically, so we
+        assert the system prompt STRING itself contains the constraint.
+        This catches someone accidentally removing it later.
+        """
+        fake = _FakeModelProvider(
+            responses={"evaluation": "What is inertia in your own words?"}
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        examiner = ExaminerActor()
+        result = await examiner.probe(ctx, "c1")
+        assert result.ok
+        assert len(fake.calls) == 1
+        assert fake.calls[0][0] == "evaluation"
+        system_msg = fake.calls[0][1][0]["content"]
+        # The constraint must mention length (1-2 sentences) + plain
+        # English + no flowery opening.
+        assert "1-2 sentences" in system_msg, (
+            f"probe system prompt must include the 1-2 sentence length constraint; "
+            f"got: {system_msg!r}"
+        )
+        assert "plain" in system_msg.lower() and "everyday english" in system_msg.lower(), (
+            f"probe system prompt must specify plain everyday English register; "
+            f"got: {system_msg!r}"
+        )
+        assert "flowery" in system_msg.lower(), (
+            f"probe system prompt must explicitly forbid flowery openings; "
+            f"got: {system_msg!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_evaluate_returns_json(self):
         """evaluate() returns ok=True with data dict (Phase B.5: data, not error-as-payload)."""
         eval_json = json.dumps(
