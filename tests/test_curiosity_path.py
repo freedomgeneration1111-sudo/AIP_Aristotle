@@ -54,6 +54,123 @@ def test_classify_chat():
 
 
 # ---------------------------------------------------------------------------
+# Task 24 Fix 2 — sentence-level matching + new patterns
+# ---------------------------------------------------------------------------
+
+
+def test_classify_real_screenshot_input_give_me_rundown():
+    """Task 24 Fix 2: the EXACT input from the live placement screenshot
+    must classify as QUESTION (not ANSWER).
+
+    'give me a rundown on our learning plan' — a direct-request question.
+    Before Task 24, 'give me' was not in question_starters, so this fell
+    through to ANSWER and was sent to examiner.evaluate() to be graded
+    as a content answer — the live bug.
+    """
+    assert _classify_student_input("give me a rundown on our learning plan") == "QUESTION"
+
+
+def test_classify_real_screenshot_input_second_session_oriented():
+    """Task 24 Fix 2: the EXACT input from the live placement screenshot
+    must classify as QUESTION or TANGENT (not ANSWER).
+
+    'this is my second session. i want to be oriented in what we are
+    learning next' — the question-like part ('i want to be oriented...')
+    is in the SECOND clause, not the first. Before Task 24's sentence-level
+    matching, the whole-string startswith check missed it and this fell
+    through to ANSWER.
+
+    Either QUESTION or TANGENT is acceptable — both route to curiosity
+    handling. What matters is it's NOT ANSWER.
+    """
+    result = _classify_student_input(
+        "this is my second session. i want to be oriented in what we are learning next"
+    )
+    assert result in ("QUESTION", "TANGENT"), (
+        f"real screenshot input must classify as QUESTION or TANGENT (not ANSWER); "
+        f"got {result!r}"
+    )
+
+
+def test_classify_regression_give_up_is_answer():
+    """Task 24 Fix 2 REGRESSION TEST: a genuine content answer that
+    happens to contain a similar word ('give up? no, resins are...') must
+    still classify as ANSWER.
+
+    The clause split should help here: 'give up' is its own clause (after
+    the '?' split), but 'give up' does NOT start with 'give me' (the only
+    'give' question_starter). The 'no, resins are...' clause doesn't
+    match any trigger either. So the whole input classifies as ANSWER
+    and reaches examiner.evaluate() normally.
+
+    If this test fails, the new patterns are too loose and are catching
+    real content answers.
+    """
+    result = _classify_student_input(
+        "give up? no, resins are sticky plant secretions used for protection"
+    )
+    assert result == "ANSWER", (
+        f"genuine content answer containing 'give up?' must classify as ANSWER; "
+        f"got {result!r}"
+    )
+
+
+def test_classify_new_question_starters():
+    """Task 24 Fix 2: each new question_starter pattern classifies as QUESTION."""
+    new_starters = [
+        "show me the concept map",
+        "walk me through how SM-2 works",
+        "orient me on the plan structure",
+        "remind me what we covered last session",
+        "help me understand the difference between IgE and IgG",
+    ]
+    for text in new_starters:
+        result = _classify_student_input(text)
+        assert result == "QUESTION", (
+            f"{text!r} should classify as QUESTION (new question_starter); got {result!r}"
+        )
+
+
+def test_classify_new_tangent_markers():
+    """Task 24 Fix 2: each new tangent_marker pattern classifies as TANGENT."""
+    new_markers = [
+        "i want to switch topics",
+        "i'd like to review something else",
+        "i wanted to ask about the exam",
+    ]
+    for text in new_markers:
+        result = _classify_student_input(text)
+        assert result == "TANGENT", (
+            f"{text!r} should classify as TANGENT (new tangent_marker); got {result!r}"
+        )
+
+
+def test_classify_clause_level_matching_catches_mid_sentence_triggers():
+    """Task 24 Fix 2: a trigger phrase in the second clause (after a period)
+    is caught — not just triggers at the very start of the whole input."""
+    # 'i want to' in the second clause → TANGENT
+    assert _classify_student_input(
+        "ok great. i want to review the plan again"
+    ) == "TANGENT"
+    # 'what' in the second clause → QUESTION
+    assert _classify_student_input(
+        "sounds good. what comes next?"
+    ) == "QUESTION"
+
+
+def test_classify_existing_behavior_preserved():
+    """Task 24 Fix 2 regression: the existing whole-string checks still work.
+    The clause-level matching is ADDITIVE — it doesn't replace the existing
+    behavior, just extends it."""
+    # These all worked before Task 24 and must still work after.
+    assert _classify_student_input("The acceleration is 9.8 m/s") == "ANSWER"
+    assert _classify_student_input("What is Newton's second law?") == "QUESTION"
+    assert _classify_student_input("How does gravity work") == "QUESTION"
+    assert _classify_student_input("But what about relativity") == "TANGENT"
+    assert _classify_student_input("Got it") == "CHAT"
+
+
+# ---------------------------------------------------------------------------
 # Test 6: _step_curiosity returns intent_class + weave-back
 # ---------------------------------------------------------------------------
 

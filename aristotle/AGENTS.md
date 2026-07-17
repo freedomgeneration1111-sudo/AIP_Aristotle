@@ -255,6 +255,36 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   ExtensionHost). The reset script has `--dry-run` + interactive TTY
   confirmation. Use the audit script first to identify corrupted rows,
   then feed the explicit concept_id list to the reset script.
+- **Placement now classifies student input before grading (Task 24 Fix 3).**
+  `run_placer_step`'s Phase 2 branch calls `_classify_student_input`
+  BEFORE `examiner.evaluate()`. QUESTION/TANGENT inputs route to
+  `_step_curiosity` (answer the question, don't advance, same probe
+  stays pending). CHAT inputs route to `_step_chat` (acknowledge, don't
+  advance). Only ANSWER inputs fall through to `examiner.evaluate()`.
+  This fixes the live bug where a student asking "give me a rundown on
+  our learning plan" during placement had their question graded as a
+  content answer and the placer advanced to the next concept, ignoring
+  the question entirely. The existing `SessionContext` call path in
+  `run_session_step` already had this classification (ADR-002 Amendment
+  A1) — Task 24 just wired the same system into placement.
+- **`_classify_student_input` does sentence-level pattern matching (Task 24 Fix 2).**
+  The input is split into clauses on `.`, `!`, `?`, newline, and each
+  trigger phrase is checked against the START of EACH clause — not just
+  the start of the whole input. This catches real-world inputs like
+  "this is my second session. i want to be oriented in what we are
+  learning next" where the question-like part is in the second clause.
+  If you add a new trigger phrase, check it against the false-positive
+  risk: a real content answer shouldn't start a clause with it. The
+  regression test `test_classify_regression_give_up_is_answer` pins the
+  false-positive case.
+- **`_step_curiosity`/`_log_curiosity_event` take explicit `concept_id`/`session_id` (Task 24 Fix 1).**
+  Both functions now accept keyword-only `concept_id` + `session_id` args
+  (default `None`, falling back to `session.concept_id` /
+  `_derive_session_id(session)`). This lets them be called from placement
+  (which uses `PlacerSession` — no `concept_id` or `student_id` field).
+  If you're calling these from a new context that doesn't have a
+  `SessionContext`, pass both explicitly. The existing `SessionContext`
+  call path needed zero changes.
 - **COMPLETE-trigger idempotency guard only catches the post-completion
   case, not the in-flight race.** Task 21 Fix 5 added a guard in
   `aristotle/actors/intake.py::run_intake_step` that blocks re-trigger
@@ -269,7 +299,60 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   structural fixes that would close the gap.
 
 ## Last Cycle
-- **Task 23 — Decline-to-answer gate + mastery-scoring integrity + audit trail** (this cycle):
+- **Task 24 — Wire intent classification into placement (fixes the off-topic-question screenshot)** (this cycle):
+  - **Fix 1 — Make `_step_curiosity` and `_log_curiosity_event` session-agnostic**
+    (`aristotle/session.py`): both functions now take explicit `concept_id`
+    + `session_id` keyword args (defaulting to `None`, falling back to
+    `session.concept_id` / `_derive_session_id(session)` for backward compat
+    with the existing `SessionContext` call path). This lets them be called
+    from placement, which uses `PlacerSession` (no `concept_id` or
+    `student_id` field). Also made `_step_chat`'s log line defensive
+    (`getattr(session, "concept_id", None)`) so it tolerates a `PlacerSession`.
+    The existing call site in `run_session_step`'s dispatcher needed ZERO
+    changes — the new args are keyword-only with `None` defaults. All 7
+    existing curiosity tests pass unchanged.
+  - **Fix 2 — Sentence-level pattern matching + new patterns in
+    `_classify_student_input`** (`aristotle/session.py`): the input is now
+    split into clauses on `.`, `!`, `?`, newline, and each trigger phrase
+    is checked against the START of EACH clause — not just the start of
+    the whole input. This catches real-world inputs like "this is my
+    second session. i want to be oriented in what we are learning next"
+    where the question-like part is in the second clause. Added new
+    `question_starters`: "give me", "show me", "walk me through",
+    "orient me", "remind me", "help me understand". Added new
+    `tangent_markers`: "i want to", "i'd like to", "i wanted to". The
+    existing whole-string `endswith("?")` check is preserved as-is
+    (additive, not replacement). "let's see" was considered and
+    deliberately left out (too likely to be a genuine tentative answer).
+    7 new tests including the 2 EXACT screenshot inputs as literal test
+    cases + a regression test confirming "give up? no, resins are..."
+    still classifies as `ANSWER`.
+  - **Fix 3 — Wire classification into `run_placer_step`**
+    (`aristotle/actors/intake.py`): in the Phase 2 branch (where
+    `question_generated=True` and `student_input` is non-empty), the
+    input is now classified BEFORE being sent to `examiner.evaluate()`.
+    `QUESTION`/`TANGENT` → `_step_curiosity` (answer the question, don't
+    advance, same probe stays pending). `CHAT` → `_step_chat` (acknowledge,
+    don't advance). `ANSWER` → existing `examiner.evaluate()` path,
+    unchanged. The placer passes `concept_id` + a placement-derived
+    `session_id` (`"placer:{plan_id}:{concept_id}"`) to `_step_curiosity`
+    so the curiosity event log row is written correctly. 5 new tests:
+    QUESTION input doesn't advance or call evaluate; TANGENT input same;
+    ANSWER input still reaches evaluate (regression); CHAT input same;
+    question-then-answer sequence verifies non-advancing behavior leaves
+    the session ready for the next real answer.
+  - **Test impact**: 252 passed / 1 skipped / 5 xfailed / 0 failures
+    (was 240/1/5/0 at Task 23 baseline; +12 new tests: 7 in
+    `test_curiosity_path.py` for Fix 2, 5 in `test_aristotle_intake.py`
+    `TestPlacerStepIntentClassification` for Fix 3). No regressions.
+  - **Flagged back**: the task spec said "`_step_chat()` needs no changes
+    — it doesn't touch any `SessionContext`-specific fields". This is
+    slightly incorrect — `_step_chat` reads `session.concept_id` in a
+    log line (line 443). Made it defensive with `getattr(session,
+    "concept_id", None)` so it tolerates a `PlacerSession` without
+    `AttributeError`. This is the minimal change; no behavior change for
+    `SessionContext` callers.
+- **Task 23 — Decline-to-answer gate + mastery-scoring integrity + audit trail** (prior cycle):
   - **Fix 1 — Decline-to-answer gate inside `evaluate()`**
     (`aristotle/actors/examiner.py`): added `_DECLINE_PATTERNS` (tight
     frozenset: "no", "i don't know", "idk", "teach me about it",

@@ -258,9 +258,44 @@ def _classify_student_input(text: str) -> str:
 
     v1: heuristic/keyword-based (ADR-002 Amendment A1 §v1 note).
     v2: LLM-based classifier (future ADR-002 TODO item).
+
+    Task 24 Fix 2: pattern matching is now sentence-level, not just
+    whole-string. The input is split into clauses on `.`, `!`, `?`, and
+    newlines, and each trigger phrase is checked against the START of
+    EACH clause — not just the start of the whole input. This catches
+    real-world inputs like "this is my second session. i want to be
+    oriented in what we are learning next" where the question-like part
+    ("i want to be oriented...") is in the second clause, not the first.
+
+    The existing whole-string `endswith("?")` check is preserved as-is
+    (additive — don't remove or restructure existing checks, just extend
+    how they're applied). New patterns added:
+      - question_starters: "give me", "show me", "walk me through",
+        "orient me", "remind me", "help me understand"
+      - tangent_markers: "i want to", "i'd like to", "i wanted to"
+
+    Favor false negatives over false positives (same principle as Task 23's
+    decline gate). "let's see" was considered and deliberately left out —
+    too likely to be the start of a genuine tentative answer.
     """
     stripped = text.strip()
     lower = stripped.lower()
+
+    # Task 24 Fix 2: split into clauses for sentence-level matching.
+    # Each clause is checked independently against the trigger phrases.
+    # The whole input is also checked (as the "zeroth clause") so the
+    # existing whole-string startswith behavior is preserved.
+    import re as _re
+
+    # Split on sentence-ending punctuation + newlines. Keep it simple —
+    # we're not doing NLP here, just giving the pattern matcher a fair
+    # chance to see clause-internal triggers.
+    clauses = [lower]
+    clauses.extend(
+        c.strip().lower()
+        for c in _re.split(r"[.!?\n]", lower)
+        if c.strip()
+    )
 
     # QUESTION signals
     if stripped.endswith("?"):
@@ -281,8 +316,19 @@ def _classify_student_input(text: str) -> str:
         "define ",
         "what's",
         "how's",
+        # Task 24 Fix 2: new question starters — direct-request phrasings
+        # that are clearly questions/instructions, not content answers.
+        # Each was checked against the false-positive risk: a real content
+        # answer is unlikely to start a clause with any of these.
+        "give me",
+        "show me",
+        "walk me through",
+        "orient me",
+        "remind me",
+        "help me understand",
     )
-    if any(lower.startswith(s) for s in question_starters):
+    # Task 24 Fix 2: check each clause, not just the whole input.
+    if any(clause.startswith(s) for clause in clauses for s in question_starters):
         return "QUESTION"
 
     # TANGENT signals
@@ -298,8 +344,19 @@ def _classify_student_input(text: str) -> str:
         "i was thinking",
         "speaking of",
         "that reminds me",
+        # Task 24 Fix 2: new tangent markers — learner-stance phrasings
+        # that signal a redirect away from the current concept. Checked
+        # against false-positive risk: "i want to" could start a real
+        # answer ("i want to say it's covalent"), but the clause-split
+        # means the rest of the clause would need to NOT match any
+        # question_starter for this to fire — and the curiosity path is
+        # the safer fallback (answers + doesn't grade) when uncertain.
+        "i want to",
+        "i'd like to",
+        "i wanted to",
     )
-    if any(lower.startswith(m) for m in tangent_markers):
+    # Task 24 Fix 2: check each clause, not just the whole input.
+    if any(clause.startswith(m) for clause in clauses for m in tangent_markers):
         return "TANGENT"
 
     # CHAT signals — short social acknowledgments
@@ -335,12 +392,23 @@ async def _step_curiosity(
     session: SessionContext,
     student_input: str,
     intent_class: str,
+    *,
+    concept_id: str | None = None,
+    session_id: str | None = None,
 ) -> ActorResult:
     """Handle QUESTION and TANGENT intents (ADR-002 Amendment A1).
 
     Answers the student's question using the beast model slot (same slot
     as SOCRATES.teach — conversational explanation). Does NOT advance
     session phase. Logs curiosity event. Appends a soft weave-back offer.
+
+    Task 24 Fix 1: takes explicit `concept_id` + `session_id` keyword args
+    so it can be called from placement (which uses PlacerSession, not
+    SessionContext — PlacerSession has no `concept_id` or `student_id`
+    field, so `_derive_session_id(session)` would AttributeError). When
+    either is None (the default), falls back to the SessionContext-derived
+    value for backward compat with the existing call path. Existing tests
+    that don't pass these args continue to work unchanged.
     """
     logger = ctx.logger
     container: Any = ctx.container
@@ -351,9 +419,15 @@ async def _step_curiosity(
             ok=False, error="NEEDS_CONFIGURATION: model_provider not available"
         )
 
+    # Task 24 Fix 1: prefer the explicit concept_id; fall back to
+    # session.concept_id for backward compat with SessionContext callers.
+    effective_concept_id = concept_id
+    if effective_concept_id is None:
+        effective_concept_id = getattr(session, "concept_id", None)
+
     concept_context = ""
-    if session.concept_id:
-        concept_context = f"The student is studying: {session.concept_id}. "
+    if effective_concept_id:
+        concept_context = f"The student is studying: {effective_concept_id}. "
 
     system_prompt = (
         "You are Aristotle — a patient, exact tutor. A student has asked "
@@ -384,11 +458,21 @@ async def _step_curiosity(
     full_response = response_text + weave_back
 
     # Log curiosity event (best-effort — never raises).
-    await _log_curiosity_event(ctx, session, student_input, intent_class)
+    # Task 24 Fix 1: pass the explicit concept_id + session_id through.
+    # When session_id is None, _log_curiosity_event falls back to
+    # _derive_session_id(session) — which works for SessionContext but
+    # would AttributeError (caught by its try/except) for PlacerSession.
+    # Placement callers should pass session_id explicitly to avoid the
+    # failed-then-warned internal derivation.
+    await _log_curiosity_event(
+        ctx, session, student_input, intent_class,
+        concept_id=effective_concept_id,
+        session_id=session_id,
+    )
 
     logger.info(
         "curiosity_path concept=%s intent=%s response_len=%d",
-        session.concept_id,
+        effective_concept_id,
         intent_class,
         len(full_response),
     )
@@ -440,7 +524,9 @@ async def _step_chat(
         return ActorResult(ok=False, error=f"model call failed: {exc}")
 
     logger.info(
-        "chat_path concept=%s response_len=%d", session.concept_id, len(response_text)
+        "chat_path concept=%s response_len=%d",
+        getattr(session, "concept_id", None),
+        len(response_text),
     )
 
     return ActorResult(
@@ -455,11 +541,22 @@ async def _log_curiosity_event(
     session: SessionContext,
     student_input: str,
     intent_class: str,
+    *,
+    concept_id: str | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Log curiosity event to aristotle_misconception_log (best-effort).
 
     Uses the intent_class column added by M006. Does NOT update
     last_score — curiosity cannot fail a concept.
+
+    Task 24 Fix 1: takes explicit `concept_id` + `session_id` keyword args
+    so it can be called from placement (which uses PlacerSession, not
+    SessionContext — PlacerSession has no `concept_id` or `student_id`
+    field, so `_derive_session_id(session)` would AttributeError). When
+    either is None (the default), falls back to the SessionContext-derived
+    value for backward compat with the existing call path. Existing tests
+    that don't pass these args continue to work unchanged.
     """
     logger = ctx.logger
     container: Any = ctx.container
@@ -467,17 +564,25 @@ async def _log_curiosity_event(
     if registry is None:
         return
 
+    # Task 24 Fix 1: prefer explicit params; fall back to session-derived
+    # values for backward compat with SessionContext callers.
+    effective_concept_id = concept_id
+    if effective_concept_id is None:
+        effective_concept_id = getattr(session, "concept_id", None)
+    effective_session_id = session_id
+    if effective_session_id is None:
+        effective_session_id = _derive_session_id(session)
+
     try:
         stores = await registry.get_stores("aristotle:textbook")
         conn = stores.connection_manager.write_conn
-        session_id = _derive_session_id(session)
         await conn.execute(
             "INSERT INTO aristotle_misconception_log "
             "(session_id, concept_id, misconception_text, corrective_text, intent_class) "
             "VALUES (?, ?, ?, ?, ?)",
             (
-                session_id,
-                session.concept_id,
+                effective_session_id,
+                effective_concept_id,
                 student_input,
                 "",  # no corrective text for curiosity events
                 intent_class,
@@ -487,7 +592,7 @@ async def _log_curiosity_event(
     except Exception as exc:
         logger.warning(
             "curiosity_log_failed concept=%s error=%s:%s",
-            session.concept_id,
+            effective_concept_id,
             type(exc).__name__,
             exc,
         )

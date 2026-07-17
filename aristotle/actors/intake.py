@@ -1877,6 +1877,93 @@ async def run_placer_step(
             }
     else:
         # Phase 2: evaluate the learner's answer.
+        #
+        # Task 24 Fix 3: before sending student_input to examiner.evaluate()
+        # (which grades it as a content answer), classify it using the
+        # existing _classify_student_input system (ADR-002 Amendment A1).
+        # If the student asked a QUESTION, raised a TANGENT, or sent CHAT,
+        # route to _step_curiosity / _step_chat instead — answer the
+        # question or acknowledge the chat WITHOUT advancing session state
+        # or grading anything. The same probe question stays pending
+        # afterward, exactly like the regular session loop leaves
+        # SessionState unchanged.
+        #
+        # This fixes the live bug where a student asking "give me a rundown
+        # on our learning plan" during placement had their question sent
+        # to examiner.evaluate() as a content answer, graded, and then the
+        # placer advanced to the next concept — ignoring the question
+        # entirely and skipping the concept the student was being probed on.
+        from aristotle.session import (
+            _classify_student_input,
+            _step_chat,
+            _step_curiosity,
+        )
+
+        intent_class = _classify_student_input(student_input)
+        if intent_class in ("QUESTION", "TANGENT"):
+            # Answer the question / address the tangent. Do NOT advance
+            # current_idx, do NOT append to results, do NOT change
+            # question_generated or current_question — the same probe
+            # question must still be pending afterward.
+            #
+            # Task 24 Fix 3: pass concept_id + session_id explicitly so
+            # _step_curiosity + _log_curiosity_event work with a
+            # PlacerSession (which has no concept_id or student_id field).
+            # The placer_session_id is derived from plan_id + concept_id
+            # so multiple placement curiosity events are distinguishable.
+            placer_session_id = f"placer:{session.plan_id}:{concept_id}"
+            curiosity_result = await _step_curiosity(
+                ctx,
+                session,  # PlacerSession — _step_curiosity tolerates it via Fix 1
+                student_input,
+                intent_class,
+                concept_id=concept_id,
+                session_id=placer_session_id,
+            )
+
+            # Return without advancing. The response text is in
+            # curiosity_result.data["response"] (or curiosity_result.error
+            # for backward compat). Match the existing placer return shape
+            # so the API/GUI can render it.
+            response_text = ""
+            if curiosity_result.ok:
+                if curiosity_result.data and isinstance(curiosity_result.data, dict):
+                    response_text = curiosity_result.data.get("response", "")
+                else:
+                    response_text = curiosity_result.error or ""
+            else:
+                response_text = (
+                    "I had trouble with that just now — could you say that again?"
+                )
+            return {
+                "state": "PROBING",
+                "question": session.current_question,
+                "response": response_text,
+                "intent_class": intent_class,
+                "concepts_placed": len(session.results),
+            }
+        elif intent_class == "CHAT":
+            # Acknowledge the chat. Same non-advancing behavior.
+            chat_result = await _step_chat(ctx, session, student_input)
+            response_text = ""
+            if chat_result.ok:
+                if chat_result.data and isinstance(chat_result.data, dict):
+                    response_text = chat_result.data.get("response", "")
+                else:
+                    response_text = chat_result.error or ""
+            else:
+                response_text = (
+                    "I had trouble with that just now — could you say that again?"
+                )
+            return {
+                "state": "PROBING",
+                "question": session.current_question,
+                "response": response_text,
+                "intent_class": "CHAT",
+                "concepts_placed": len(session.results),
+            }
+        # else: ANSWER — fall through to the existing examiner.evaluate() path.
+
         eval_result = await examiner.evaluate(
             ctx,
             concept_id,

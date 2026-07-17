@@ -20,9 +20,11 @@ from aristotle.actors.intake import (
     IntakeActor,
     IntakeSession,
     IntakeState,
+    PlacerSession,
     _detect_intake_intent,
     check_intake_triggers,
     run_intake_step,
+    run_placer_step,
     intake_session_to_dict,
 )
 
@@ -1806,6 +1808,300 @@ class TestPlacerStep:
         result = await run_placer_step(session, "", ctx)
         assert result["state"] == "COMPLETE"
         assert result["next_concept_id"] == "c1"
+
+
+# ---------------------------------------------------------------------------
+# Task 24 Fix 3 — intent classification wired into placement
+# ---------------------------------------------------------------------------
+
+
+class TestPlacerStepIntentClassification:
+    """Task 24 Fix 3: run_placer_step classifies student_input BEFORE
+    sending it to examiner.evaluate(). QUESTION/TANGENT inputs route to
+    _step_curiosity (answer the question, don't advance), CHAT inputs
+    route to _step_chat (acknowledge, don't advance), ANSWER inputs fall
+    through to the existing examiner.evaluate() path.
+
+    Fixes the live bug where a student asking "give me a rundown on our
+    learning plan" during placement had their question sent to
+    examiner.evaluate() as a content answer, graded, and then the placer
+    advanced to the next concept — ignoring the question entirely.
+    """
+
+    @pytest.mark.asyncio
+    async def test_question_input_does_not_advance_or_call_evaluate(self):
+        """The exact screenshot input 'give me a rundown on our learning plan'
+        during Phase 2 must:
+          - NOT call examiner.evaluate() (the evaluation slot is never hit)
+          - NOT advance session.current_idx
+          - NOT append to session.results
+          - keep question_generated=True (same probe still pending)
+          - return a response (the curiosity answer)
+        """
+        # beast slot = curiosity answer; evaluation slot = would-be grade
+        # (must NOT be called).
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Here's a quick rundown of your learning plan...",
+                "evaluation": "SHOULD NOT BE CALLED",
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        result = await run_placer_step(
+            session, "give me a rundown on our learning plan", ctx
+        )
+
+        # The placer stayed in PROBING — no advancement.
+        assert result["state"] == "PROBING"
+        assert result.get("intent_class") == "QUESTION"
+        assert result.get("response"), (
+            "curiosity response must be non-empty — the student's question "
+            "must be answered, not ignored"
+        )
+        # The same probe question is still pending.
+        assert result["question"] == "What is inertia?"
+        assert session.question_generated is True
+        assert session.current_question == "What is inertia?"
+        # current_idx unchanged — no advancement.
+        assert session.current_idx == 0
+        # results unchanged — no placement event written.
+        assert len(session.results) == 0
+        # examiner.evaluate() was NOT called — the evaluation slot was
+        # never hit. The beast slot WAS hit (curiosity answer).
+        eval_calls = [c for c in fake.calls if c[0] == "evaluation"]
+        beast_calls = [c for c in fake.calls if c[0] == "beast"]
+        assert len(eval_calls) == 0, (
+            f"examiner.evaluate() must NOT be called for a QUESTION input; "
+            f"evaluation slot was called {len(eval_calls)} time(s)"
+        )
+        assert len(beast_calls) == 1, (
+            f"_step_curiosity should call the beast slot once; "
+            f"got {len(beast_calls)} call(s)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tangent_input_does_not_advance_or_call_evaluate(self):
+        """The exact screenshot input 'this is my second session. i want
+        to be oriented in what we are learning next' during Phase 2 must
+        route to curiosity handling (QUESTION or TANGENT), not evaluate."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Welcome back! Let me orient you...",
+                "evaluation": "SHOULD NOT BE CALLED",
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        result = await run_placer_step(
+            session,
+            "this is my second session. i want to be oriented in what we are learning next",
+            ctx,
+        )
+
+        assert result["state"] == "PROBING"
+        assert result.get("intent_class") in ("QUESTION", "TANGENT")
+        assert result.get("response"), "curiosity response must be non-empty"
+        assert session.current_idx == 0
+        assert len(session.results) == 0
+        eval_calls = [c for c in fake.calls if c[0] == "evaluation"]
+        assert len(eval_calls) == 0, (
+            "examiner.evaluate() must NOT be called for a QUESTION/TANGENT input"
+        )
+
+    @pytest.mark.asyncio
+    async def test_answer_input_still_reaches_evaluate(self):
+        """REGRESSION TEST (the one that matters most): a genuine content
+        answer during Phase 2 must still reach examiner.evaluate() and
+        behave exactly as before this task — advancement, results append,
+        placement_event write, mastery upsert.
+
+        This confirms Fix 3 didn't break the normal placement path.
+        """
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+                "beast": "SHOULD NOT BE CALLED",
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        result = await run_placer_step(
+            session, "objects resist changes in motion", ctx
+        )
+
+        # Normal placement advancement happened.
+        assert result["concepts_placed"] == 1
+        # current_idx advances to the next concept after a successful evaluate.
+        assert session.current_idx == 1
+        assert len(session.results) == 1
+        assert session.results[0]["concept_id"] == "c1"
+        assert session.results[0]["score"] == 0.9
+        assert session.results[0]["mastery_achieved"] is True
+        # examiner.evaluate() WAS called — the evaluation slot was hit.
+        # Note: the evaluation slot is also used for probe() generation,
+        # so after the evaluate call, the placer generates the NEXT probe
+        # (also evaluation slot). We distinguish by inspecting the system
+        # prompt: evaluate() says "Evaluate the learner's answer".
+        eval_calls = [
+            c for c in fake.calls
+            if c[0] == "evaluation"
+            and "Evaluate the learner's answer" in c[1][0]["content"]
+        ]
+        beast_calls = [c for c in fake.calls if c[0] == "beast"]
+        assert len(eval_calls) == 1, (
+            f"examiner.evaluate() MUST be called for an ANSWER input; "
+            f"got {len(eval_calls)} evaluate call(s)"
+        )
+        assert len(beast_calls) == 0, (
+            f"_step_curiosity should NOT be called for an ANSWER input; "
+            f"beast slot was called {len(beast_calls)} time(s)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_input_does_not_advance_or_call_evaluate(self):
+        """A CHAT input ('got it') during Phase 2 routes to _step_chat,
+        not examiner.evaluate(). Same non-advancing behavior as QUESTION."""
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Great — let's continue!",
+                "evaluation": "SHOULD NOT BE CALLED",
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        result = await run_placer_step(session, "got it", ctx)
+
+        assert result["state"] == "PROBING"
+        assert result.get("intent_class") == "CHAT"
+        assert result.get("response"), "chat response must be non-empty"
+        assert session.current_idx == 0
+        assert len(session.results) == 0
+        eval_calls = [c for c in fake.calls if c[0] == "evaluation"]
+        assert len(eval_calls) == 0, (
+            "examiner.evaluate() must NOT be called for a CHAT input"
+        )
+
+    @pytest.mark.asyncio
+    async def test_question_then_answer_sequence(self):
+        """End-to-end sequence: Phase 2 with a QUESTION (no advancement),
+        then Phase 2 again with a genuine ANSWER (normal advancement).
+
+        This verifies the non-advancing behavior of the curiosity path
+        leaves the session in a state where the next Phase 2 call with
+        a real answer works correctly — the probe question is still
+        pending, current_idx is unchanged, and evaluate() is reached.
+        """
+        eval_json = json.dumps(
+            {
+                "score": 0.8,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Here's a quick orientation to your plan...",
+                "evaluation": eval_json,
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        ctx = _make_ctx(model_provider=fake, stores=_FakeStores(conn))
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        # Turn 1: student asks a question.
+        result1 = await run_placer_step(
+            session, "give me a rundown on our learning plan", ctx
+        )
+        assert result1["state"] == "PROBING"
+        assert result1.get("intent_class") == "QUESTION"
+        assert session.current_idx == 0
+        assert len(session.results) == 0
+        assert session.question_generated is True
+        # The same probe question is still pending.
+        assert session.current_question == "What is inertia?"
+
+        # Turn 2: student answers the probe with genuine content.
+        result2 = await run_placer_step(
+            session, "objects resist changes in motion", ctx
+        )
+        assert result2["concepts_placed"] == 1
+        assert len(session.results) == 1
+        assert session.results[0]["concept_id"] == "c1"
+        assert session.results[0]["score"] == 0.8
+        # examiner.evaluate() was called exactly once (on turn 2). The
+        # evaluation slot is also used for probe() generation, so we
+        # distinguish by inspecting the system prompt: evaluate() says
+        # "Evaluate the learner's answer", probe() says "Ask the learner".
+        eval_calls = [
+            c for c in fake.calls
+            if c[0] == "evaluation"
+            and "Evaluate the learner's answer" in c[1][0]["content"]
+        ]
+        probe_calls = [
+            c for c in fake.calls
+            if c[0] == "evaluation"
+            and "Ask the learner to explain" in c[1][0]["content"]
+        ]
+        assert len(eval_calls) == 1, (
+            f"examiner.evaluate() should be called once (on turn 2 only); "
+            f"got {len(eval_calls)} call(s)"
+        )
+        # Turn 1 (QUESTION) should NOT have generated a probe — the
+        # curiosity path doesn't advance. The probe for c2 is generated
+        # at the END of turn 2 (after the answer is graded + current_idx
+        # advances). So exactly 1 probe call total.
+        assert len(probe_calls) == 1, (
+            f"examiner.probe() for the next concept should be called once "
+            f"(at end of turn 2); got {len(probe_calls)} call(s)"
+        )
 
 
 class TestPlacerRoutes:
