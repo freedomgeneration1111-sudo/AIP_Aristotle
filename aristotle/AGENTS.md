@@ -285,6 +285,17 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   If you're calling these from a new context that doesn't have a
   `SessionContext`, pass both explicitly. The existing `SessionContext`
   call path needed zero changes.
+- **`placer_step_route` returns `response` + `intent_class` fields (Task 25 Fix 1).**
+  When the student's input during placement is classified as QUESTION,
+  TANGENT, or CHAT (Task 24), the route's HTTP response includes a
+  `"response"` field (the curiosity/chat answer text) and an
+  `"intent_class"` field ("QUESTION" | "TANGENT" | "CHAT"). For normal
+  ANSWER turns, both are `None`. The frontend (`ask.py::_step_placer`)
+  reads `"response"` first and renders it IN PLACE OF the pending probe
+  question — the curiosity response already includes a natural weave-back.
+  If you add a new placement-Phase-2 branch that returns a different
+  field, you MUST also add it to the `placer_step_route` response dict —
+  otherwise it'll be silently dropped (same bug class Task 25 fixed).
 - **COMPLETE-trigger idempotency guard only catches the post-completion
   case, not the in-flight race.** Task 21 Fix 5 added a guard in
   `aristotle/actors/intake.py::run_intake_step` that blocks re-trigger
@@ -299,7 +310,58 @@ per-corpus is simpler and matches the loader's behavior. Revisit at Phase B
   structural fixes that would close the gap.
 
 ## Last Cycle
-- **Task 24 — Wire intent classification into placement (fixes the off-topic-question screenshot)** (this cycle):
+- **Task 25 — Surface curiosity answers through the placement route and frontend** (this cycle):
+  - **Fix 1 — `placer_step_route` passes `response` + `intent_class` through**
+    (`aristotle/api.py::placer_step_route`): the route's HTTP response
+    dict previously built from only `state`, `question`, `concepts_placed`,
+    `session` — it never read the `"response"` or `"intent_class"` keys
+    that `run_placer_step`'s Phase 2 QUESTION/TANGENT/CHAT branch returns
+    (added in Task 24). The curiosity answer was computed successfully and
+    then dropped before the HTTP response was built. Now the response dict
+    includes `result.get("response")` + `result.get("intent_class")`.
+    Both are `None` for the normal ANSWER path (that branch's dict never
+    sets them) — existing behavior unchanged. Updated the route docstring
+    to document the new fields. 2 new integration-level tests in
+    `TestPlacerRoutes`: QUESTION input returns non-empty `response` +
+    `intent_class="QUESTION"`; normal ANSWER input returns `None` for
+    both (regression).
+  - **Fix 2 — `ask.py` renders the curiosity response, not just the
+    question** (AIP_Brain `gui/pages/ask.py::_step_placer`): the frontend
+    previously only checked `data.get("question")` and rendered it via
+    `_render_aristotle_message(question)`. Since `question` is always
+    present for QUESTION/TANGENT/CHAT turns (it echoes the still-pending
+    probe, by design), the `elif question:` branch fired every time —
+    re-rendering the probe question instead of the curiosity answer. Now
+    reads `data.get("response")` and, if present, renders it IN PLACE OF
+    the question (`elif curiosity_response:` before `elif question:`).
+    The curiosity response already includes a natural weave-back
+    ("Want to keep exploring this, or shall we continue where we left
+    off?") so rendering it alone is sufficient — no need to also paste
+    the raw question text underneath (would be redundant and clunky).
+    No test — `ask.py`'s NiceGUI rendering functions are not unit-tested
+    in the Brain suite (the existing `test_ask.py` tests the source-
+    grounded ask pipeline, not the GUI). Manually traced the code path;
+    documented in the task report.
+  - **Weave-back wording decision**: `_step_curiosity`'s `full_response`
+    already appends `"\n\nWant to keep exploring this, or shall we continue
+    where we left off?"` — a natural, generic weave-back that points the
+    student back to "where we left off" (the pending probe). Rendering
+    `curiosity_response` alone is sufficient. No flag-back needed.
+  - **Duplicate-send investigation**: the screenshot shows the same
+    student message sent twice, ~14 seconds apart. Root cause is the bug
+    itself (no visible response → reasonable retry), NOT a separate
+    frontend double-submit. However, `ask.py`'s `_on_aristotle_send`
+    has NO disable-while-pending guard — both the Send button and the
+    Enter key call `asyncio.create_task(_on_aristotle_send())`, each
+    creating a NEW asyncio task with no guard against concurrent sends.
+    A student who hits Enter twice before the first `_step_placer`
+    completes will fire two concurrent sends. This is NOT a one-line
+    obviously-safe fix (needs try/finally to re-enable on error + multiple
+    early-return paths). Flagged back, not fixed per the task's scope.
+  - **Test impact**: 254 passed / 1 skipped / 5 xfailed / 0 failures
+    (was 252/1/5/0 at Task 24 baseline; +2 new tests in
+    `TestPlacerRoutes`). No regressions.
+- **Task 24 — Wire intent classification into placement (fixes the off-topic-question screenshot)** (prior cycle):
   - **Fix 1 — Make `_step_curiosity` and `_log_curiosity_event` session-agnostic**
     (`aristotle/session.py`): both functions now take explicit `concept_id`
     + `session_id` keyword args (defaulting to `None`, falling back to

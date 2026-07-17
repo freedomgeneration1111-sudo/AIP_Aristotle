@@ -1129,3 +1129,29 @@ Stage Summary:
 - Regression test: "give up? no, resins are sticky plant secretions used for protection" → ANSWER (the clause split ensures "give up" doesn't match "give me", and "no, resins are..." doesn't match any trigger).
 - Flagged back: the task spec said "_step_chat() needs no changes — it doesn't touch any SessionContext-specific fields". This is slightly incorrect — _step_chat reads session.concept_id in a log line (line 443 of session.py). Made it defensive with getattr(session, "concept_id", None) so it tolerates a PlacerSession without AttributeError. This is the minimal change; no behavior change for SessionContext callers.
 - _derive_session_id compatibility with PlacerSession: confirmed it would AttributeError (PlacerSession has no student_id or concept_id). Did NOT change _derive_session_id itself — instead made _log_curiosity_event accept an explicit session_id keyword arg (default None, falls back to _derive_session_id). The placement call site passes session_id="placer:{plan_id}:{concept_id}" explicitly, so _derive_session_id is never called on a PlacerSession. This is the trivial change the task spec allowed; no flag-back needed.
+
+---
+Task ID: 25
+Agent: Super Z (main)
+Task: Task 25 — Surface curiosity answers through the placement route and frontend. Two fixes spanning both repos: (1) placer_step_route passes response + intent_class through, (2) ask.py's _step_placer renders the curiosity response instead of re-rendering the pending probe. Plus a duplicate-send investigation.
+
+Work Log:
+- Pulled both repos. AIP_Aristotle at Task 24 commit 71f21e8, AIP_Brain at 5995397 (Task 20).
+- Read aristotle/api.py::placer_step_route (lines 1183-1229) — confirmed the bug: the response dict builds from only state/question/concepts_placed/session, never reads result.get("response") or result.get("intent_class").
+- Read AIP_Brain/gui/pages/ask.py::_step_placer (lines 1979-2017) — confirmed the frontend bug: only checks data.get("question"), which is always present for QUESTION/TANGENT/CHAT turns (echoes the still-pending probe). The elif question: branch fires every time, re-rendering the probe instead of the curiosity answer.
+- Read aristotle/session.py::_step_curiosity (lines 454-458) — confirmed the weave-back already exists: full_response = response_text + "\n\nWant to keep exploring this, or shall we continue where we left off?". This is a natural, generic weave-back that points the student back to "where we left off" (the pending probe). Rendering curiosity_response alone is sufficient — no need to paste the raw question text underneath.
+- Investigated duplicate-send: read _on_aristotle_send (lines 2424-2478) + the Send button / Enter key bindings (lines 2732-2742). Both call asyncio.create_task(_on_aristotle_send()) with NO guard against concurrent sends. The input field is NOT disabled during the async _step_* calls (only during plan picker). A student who hits Enter twice before the first _step_placer completes will fire two concurrent sends. This is NOT a one-line obviously-safe fix — needs try/finally to re-enable on error + multiple early-return paths. Flagged back, not fixed.
+- Captured baselines: AIP_Aristotle 252 passed / 1 skipped / 5 xfailed / 0 failed. AIP_Brain 1369 passed / 1 pre-existing failure (test_cycle_16_2b_startup_runtime, unrelated to this task).
+- Fix 1 (AIP_Aristotle api.py::placer_step_route): added "response": result.get("response") + "intent_class": result.get("intent_class") to the response dict. Updated the docstring to document the new fields. Both are None for the normal ANSWER path — existing behavior unchanged.
+- Fix 2 (AIP_Brain gui/pages/ask.py::_step_placer): added curiosity_response = data.get("response") + an elif curiosity_response: branch BEFORE elif question:. The curiosity response takes priority — rendered alone (no raw question text underneath, since the weave-back is already natural).
+- Wrote 2 new integration-level tests in TestPlacerRoutes: test_placer_step_route_passes_curiosity_response_through (QUESTION input → response is non-empty, intent_class="QUESTION", evaluate not called, no advancement) + test_placer_step_route_response_is_none_for_normal_answer (ANSWER input → response + intent_class are None, normal advancement). These hit the route function directly — the layer that broke.
+- No test for Fix 2: ask.py's NiceGUI rendering functions are not unit-tested in the Brain suite. The existing test_ask.py tests the source-grounded ask pipeline, not the GUI. Manually traced the code path: data.get("response") is read from the HTTP response, and if present, _render_aristotle_message(curiosity_response) is called instead of _render_aristotle_message(question). The logic is correct.
+- Final test run: AIP_Aristotle 254 passed / 1 skipped / 5 xfailed / 0 failures (was 252/1/5/0; +2 new tests, no regressions). AIP_Brain: ask.py parses cleanly (ast.parse), no test changes needed.
+- Updated aristotle/AGENTS.md (Last Cycle + 1 new Known Gotcha for placer_step_route response fields). Updated PLANNED_FEATURES.md Change Log. Appended this worklog entry.
+
+Stage Summary:
+- Both fixes implemented exactly as specified.
+- 2 new integration-level tests, both passing. No regressions.
+- Weave-back wording decision: already handled by _step_curiosity's existing full_response append ("\n\nWant to keep exploring this, or shall we continue where we left off?"). Rendered as-is, no flag-back needed.
+- Duplicate-send investigation: the screenshot's duplicate message is explained by the bug itself (no visible response → reasonable retry). However, ask.py's _on_aristotle_send has NO disable-while-pending guard — both Send button and Enter key call asyncio.create_task(_on_aristotle_send()) with no guard against concurrent sends. NOT a one-line obviously-safe fix. Flagged back, not fixed.
+- AIP_Brain commit needed for Fix 2 (ask.py change). AIP_Aristotle commit needed for Fix 1 (api.py + tests + docs).

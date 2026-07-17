@@ -1193,7 +1193,31 @@ async def placer_step_route(request: Request):
     Returns:
       {
         "state": "PROBING" | "COMPLETE",
-        "question": str | None,         # next probe question, or None
+        "question": str | None,         # next probe question, or None.
+                                         # For QUESTION/TANGENT/CHAT turns
+                                         # (Task 24), this echoes the
+                                         # still-pending probe so the
+                                         # frontend can re-display it if
+                                         # needed. For ANSWER turns, this
+                                         # is the NEXT concept's probe
+                                         # question (generated immediately
+                                         # after advancement).
+        "response": str | None,         # Task 25 Fix 1: the curiosity/chat
+                                         # answer text when the student's
+                                         # input was classified as QUESTION,
+                                         # TANGENT, or CHAT (Task 24). None
+                                         # for normal ANSWER turns. The
+                                         # frontend should render this IN
+                                         # PLACE OF the question when present
+                                         # — the curiosity response already
+                                         # includes a natural weave-back to
+                                         # the pending probe.
+        "intent_class": str | None,     # Task 25 Fix 1: "QUESTION" | "TANGENT"
+                                         # | "CHAT" | None. None for normal
+                                         # ANSWER turns. Lets the frontend
+                                         # distinguish a curiosity answer
+                                         # from a taught/graded response
+                                         # (future: visual provenance label).
         "concepts_placed": int,
         "concepts_known": int | None,   # only at COMPLETE
         "next_concept_id": str | None,  # only at COMPLETE (Task 17) — the
@@ -1217,9 +1241,15 @@ async def placer_step_route(request: Request):
 
     result = await run_placer_step(session, student_input, ctx)
 
+    # Task 25 Fix 1: pass "response" + "intent_class" through so the
+    # frontend can render the curiosity/chat answer. These are None for
+    # the normal ANSWER path (that branch's dict never sets them) —
+    # existing behavior for that path doesn't change.
     response = {
         "state": result.get("state", session.state),
         "question": result.get("question"),
+        "response": result.get("response"),
+        "intent_class": result.get("intent_class"),
         "concepts_placed": result.get("concepts_placed", len(session.results)),
         "session": placer_session_to_dict(session),
     }

@@ -2328,3 +2328,200 @@ class TestPlacerRoutes:
         # c1 was not mastered, so it's the (correct) starting concept —
         # not whatever happened to be first in the global concept table.
         assert result["next_concept_id"] == "c1"
+
+    @pytest.mark.asyncio
+    async def test_placer_step_route_passes_curiosity_response_through(self):
+        """Task 25 Fix 1: POST /placer/step's HTTP response includes the
+        "response" + "intent_class" fields when the student's input was
+        classified as QUESTION/TANGENT/CHAT (Task 24).
+
+        Before this fix, placer_step_route built its response dict from
+        only state/question/concepts_placed — the curiosity answer was
+        computed successfully by run_placer_step's Phase 2 QUESTION branch
+        and then dropped before the HTTP response was built. This is the
+        integration-level test that would have caught the bug the first
+        time — it hits the route function directly, not just run_placer_step.
+        """
+        from aristotle.api import placer_step_route
+        from aristotle.actors.intake import PlacerSession, placer_session_to_dict
+
+        # The beast slot handles the curiosity model call; the evaluation
+        # slot must NOT be called (the QUESTION input shouldn't reach
+        # examiner.evaluate()).
+        fake = _FakeModelProvider(
+            responses={
+                "beast": "Here's a quick rundown of your learning plan...",
+                "evaluation": "SHOULD NOT BE CALLED",
+            }
+        )
+        conn = _FakeConn(rows=[("c1", "Inertia", None, "content", None, None, None, 3)])
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            },
+        )()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
+
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        async def _json():
+            return {
+                "session": placer_session_to_dict(session),
+                "student_input": "give me a rundown on our learning plan",
+            }
+
+        request.json = _json
+
+        result = await placer_step_route(request)
+
+        # Task 25 Fix 1: the "response" field is present + non-empty —
+        # the curiosity answer text from _step_curiosity.
+        assert "response" in result, (
+            "placer_step_route must include 'response' in the HTTP response — "
+            "before Task 25 Fix 1, the curiosity answer was computed by "
+            "run_placer_step but dropped before the HTTP response was built"
+        )
+        assert result["response"], (
+            f"'response' field must be non-empty for a QUESTION input; "
+            f"got: {result['response']!r}"
+        )
+        assert "rundown" in result["response"].lower() or "plan" in result["response"].lower(), (
+            f"response should contain the curiosity answer text; got: {result['response']!r}"
+        )
+        # Task 25 Fix 1: the "intent_class" field is present + "QUESTION".
+        assert "intent_class" in result, (
+            "placer_step_route must include 'intent_class' in the HTTP response"
+        )
+        assert result["intent_class"] == "QUESTION", (
+            f"intent_class should be 'QUESTION' for 'give me a rundown...'; "
+            f"got: {result['intent_class']!r}"
+        )
+        # The placer stayed in PROBING — no advancement.
+        assert result["state"] == "PROBING"
+        # The still-pending probe question is echoed (so the frontend can
+        # re-display it if needed — though Fix 2 renders the curiosity
+        # response instead).
+        assert result["question"] == "What is inertia?"
+        # No concepts placed — the QUESTION didn't advance.
+        assert result["concepts_placed"] == 0
+        # examiner.evaluate() was NOT called.
+        eval_calls = [
+            c for c in fake.calls
+            if c[0] == "evaluation"
+            and "Evaluate the learner's answer" in c[1][0]["content"]
+        ]
+        assert len(eval_calls) == 0, (
+            "examiner.evaluate() must NOT be called for a QUESTION input"
+        )
+
+    @pytest.mark.asyncio
+    async def test_placer_step_route_response_is_none_for_normal_answer(self):
+        """Task 25 Fix 1 regression: for a normal ANSWER turn, the
+        "response" and "intent_class" fields are None (not set by the
+        ANSWER branch's dict). Existing behavior for that path doesn't
+        change — the frontend's `elif curiosity_response:` branch doesn't
+        fire, and `elif question:` renders the next probe as before."""
+        from aristotle.api import placer_step_route
+        from aristotle.actors.intake import PlacerSession, placer_session_to_dict
+
+        eval_json = json.dumps(
+            {
+                "score": 0.9,
+                "mastery_achieved": True,
+                "feedback": "Good",
+                "diagnosis": None,
+            }
+        )
+        fake = _FakeModelProvider(
+            responses={
+                "evaluation": eval_json,
+            }
+        )
+
+        class _RoutingConn:
+            def __init__(self):
+                self._executed = []
+
+            async def execute(self, sql, params=()):
+                self._executed.append((sql, params))
+                if "concept_ids_json" in sql.lower():
+                    return _FakeCursor([('["c1", "c2"]',)])
+                return _FakeCursor(
+                    [("c1", "Inertia", None, "content", None, None, None, 3)]
+                )
+
+            async def commit(self):
+                pass
+
+        conn = _RoutingConn()
+        container = type(
+            "C",
+            (),
+            {
+                "model_provider": fake,
+                "corpus_registry": _FakeRegistry(_FakeStores(conn)),
+            },
+        )()
+        request = type(
+            "R",
+            (),
+            {
+                "app": type(
+                    "A",
+                    (),
+                    {
+                        "state": type("S", (), {"container": container})(),
+                    },
+                )(),
+            },
+        )()
+
+        session = PlacerSession(
+            plan_id="plan-1",
+            concepts_to_assess=["c1", "c2"],
+            current_idx=0,
+            question_generated=True,
+            current_question="What is inertia?",
+        )
+
+        async def _json():
+            return {
+                "session": placer_session_to_dict(session),
+                "student_input": "objects resist changes in motion",
+            }
+
+        request.json = _json
+
+        result = await placer_step_route(request)
+        # Normal ANSWER path: response + intent_class are None.
+        assert result.get("response") is None, (
+            f"'response' should be None for a normal ANSWER turn; "
+            f"got: {result.get('response')!r}"
+        )
+        assert result.get("intent_class") is None, (
+            f"'intent_class' should be None for a normal ANSWER turn; "
+            f"got: {result.get('intent_class')!r}"
+        )
+        # Normal advancement happened.
+        assert result["concepts_placed"] == 1
